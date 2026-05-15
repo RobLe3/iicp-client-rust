@@ -1,0 +1,17 @@
+[package]
+name = "iicp-client"
+version = "0.0.1-pre"
+edition = "2021"
+description = "Official Rust client SDK for IICP (Intent-based Inter-agent Communication Protocol)"
+license = "Apache-2.0"
+authors = ["Roble Mumin"]
+homepage = "https://iicp.network"
+repository = "https://github.com/RobLe3/iicp-client-rust"
+documentation = "https://docs.rs/iicp-client"
+readme = "README.md"
+keywords = ["iicp", "ai", "protocol", "distributed", "inference"]
+categories = ["network-programming", "api-bindings"]
+
+[lib]
+name = "iicp_client"
+path = "src/lib.rs"
