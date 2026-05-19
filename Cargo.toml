@@ -1,17 +1,29 @@
 [package]
 name = "iicp-client"
-version = "0.0.1-pre"
+version = "0.1.0"
 edition = "2021"
-description = "Official Rust client SDK for IICP (Intent-based Inter-agent Communication Protocol)"
+rust-version = "1.75"
+description = "Official Rust client SDK for the IICP protocol (ADR-016)"
 license = "Apache-2.0"
-authors = ["Roble Mumin"]
-homepage = "https://iicp.network"
+keywords = ["iicp", "ai-agents", "protocol", "sdk"]
+categories = ["network-programming", "api-bindings"]
 repository = "https://github.com/RobLe3/iicp-client-rust"
 documentation = "https://docs.rs/iicp-client"
 readme = "README.md"
-keywords = ["iicp", "ai", "protocol", "distributed", "inference"]
-categories = ["network-programming", "api-bindings"]
 
-[lib]
-name = "iicp_client"
-path = "src/lib.rs"
+[dependencies]
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+regex = "1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+uuid = { version = "1.0", features = ["v4"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+mockito = "1.0"
+
+[[example]]
+name = "quickstart"
+path = "examples/quickstart.rs"

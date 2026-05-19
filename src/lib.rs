@@ -1,6 +1,28 @@
-//! Official Rust client SDK for IICP.
+// SPDX-License-Identifier: Apache-2.0
+//! IICP Rust client SDK — ADR-016 §1 (SDK-01..SDK-06)
 //!
-//! Name reservation publication. Functional SDK arrives with IICP v1.5 stable.
-//! See <https://iicp.network> for project status.
+//! # Quickstart
+//! ```rust,no_run
+//! use iicp_client::{IicpClient, ClientConfig, DiscoverOptions};
+//!
+//! #[tokio::main]
+//! async fn main() -> iicp_client::Result<()> {
+//!     let client = IicpClient::new(ClientConfig::default())?;
+//!     let nodes = client.discover("urn:iicp:intent:llm:chat:v1", None).await?;
+//!     println!("Found {} nodes", nodes.nodes.len());
+//!     Ok(())
+//! }
+//! ```
 
-pub const VERSION: &str = "0.0.1-pre";
+mod client;
+mod errors;
+mod http;
+mod types;
+
+pub use client::IicpClient;
+pub use errors::{IicpError, Result};
+pub use types::{
+    ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage,
+    ClientConfig, DiscoverOptions, Node, NodeList, TaskAuth,
+    TaskConstraints, TaskRequest, TaskResponse,
+};

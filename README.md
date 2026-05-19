@@ -1,37 +1,46 @@
-# iicp-client (Rust)
+# iicp-client — Rust SDK
 
-Official client SDK for the **Intent-based Inter-agent Communication Protocol (IICP)**.
+Official Rust client library for the [IICP protocol](https://iicp.network) (Intent-based Inter-agent Communication Protocol).
 
-> **This is a name reservation publication.** The functional client SDK will be published
-> as version `0.1.0` alongside IICP specification v1.5 stable.
-> See [iicp.network](https://iicp.network) for project status and roadmap.
+> **Status: deferred** — Rust SDK development is on hold until the Python and TypeScript SDKs reach stable v1.0. The scaffolding is complete; implementation will follow when the protocol spec is frozen.
 
-## What is IICP?
+Implements **ADR-016 §1** — SDK conformance rules SDK-01 through SDK-06.
 
-An open protocol for AI agents to discover each other and route tasks across a distributed
-network. No central broker. No vendor lock-in.
+---
 
-- Protocol specification: [github.com/RobLe3/IICP](https://github.com/RobLe3/IICP)
-- Reference implementation: [github.com/RobLe3/iicp.network](https://github.com/RobLe3/iicp.network)
-- Project home: [iicp.network](https://iicp.network)
+## Planned quickstart
 
-## Status
+```rust
+use iicp_client::{IicpClient, ClientConfig, DiscoverOptions};
 
-This crate is at version `0.0.1-pre`. It contains no functional code, only the crate
-structure that will host the SDK. Do not use in production yet.
+#[tokio::main]
+async fn main() -> iicp_client::Result<()> {
+    let client = IicpClient::new(ClientConfig::default())?;
 
-## Installation (future)
+    let nodes = client.discover("urn:iicp:intent:llm:chat:v1", None).await?;
+    println!("Found {} nodes", nodes.nodes.len());
 
-```toml
-[dependencies]
-iicp-client = "0.1"
+    let response = client.chat(
+        &nodes.nodes[0],
+        vec![serde_json::json!({"role": "user", "content": "Hello!"})
+            .try_into()
+            .unwrap()],
+        None,
+    ).await?;
+    println!("{}", response.choices[0].message.content);
+    Ok(())
+}
 ```
 
-## Contributing
+---
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md). Issues are tracked at
-[github.com/RobLe3/IICP/issues](https://github.com/RobLe3/IICP/issues).
+## Links
 
-## License
+- Protocol spec: [iicp.network/spec](https://iicp.network/spec)
+- Python SDK: [github.com/RobLe3/iicp-client-python](https://github.com/RobLe3/iicp-client-python)
+- TypeScript SDK: [github.com/RobLe3/iicp-client-typescript](https://github.com/RobLe3/iicp-client-typescript)
+- Conformance: [iicp.network/conformance](https://iicp.network/conformance)
 
-Apache-2.0 — see [LICENSE](./LICENSE).
+---
+
+**License**: Apache 2.0 · © IICP Working Group
