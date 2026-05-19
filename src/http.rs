@@ -4,8 +4,17 @@ use std::time::Duration;
 use reqwest::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use uuid::Uuid;
 
 use crate::errors::{IicpError, Result};
+
+/// Generate a W3C traceparent header value (SDK-06).
+/// Format: `00-<32hex>-<16hex>-01`
+pub fn make_traceparent() -> String {
+    let trace_id = Uuid::new_v4().simple().to_string();       // 32 hex chars
+    let parent_id = &Uuid::new_v4().simple().to_string()[..16]; // 16 hex chars
+    format!("00-{trace_id}-{parent_id}-01")
+}
 
 pub(crate) struct HttpClient {
     inner: Client,
@@ -29,8 +38,16 @@ impl HttpClient {
         }
     }
 
-    pub(crate) async fn get_json<T: DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let resp = self.auth(self.inner.get(url)).send().await?;
+    pub(crate) async fn get_json<T: DeserializeOwned>(
+        &self,
+        url: &str,
+        traceparent: Option<&str>,
+    ) -> Result<T> {
+        let tp = traceparent.map(|s| s.to_owned()).unwrap_or_else(make_traceparent);
+        let resp = self.auth(self.inner.get(url))
+            .header("traceparent", &tp)
+            .send()
+            .await?;
         let status = resp.status().as_u16();
         let body: Value = resp.json().await?;
         if status >= 400 {
@@ -48,8 +65,10 @@ impl HttpClient {
         url: &str,
         body: &B,
         auth_override: Option<&str>,
+        traceparent: Option<&str>,
     ) -> Result<T> {
-        let rb = self.inner.post(url).json(body);
+        let tp = traceparent.map(|s| s.to_owned()).unwrap_or_else(make_traceparent);
+        let rb = self.inner.post(url).json(body).header("traceparent", &tp);
         let rb = match auth_override {
             Some(t) => rb.bearer_auth(t),
             None => self.auth(rb),

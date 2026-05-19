@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use iicp_client::{ClientConfig, IicpClient, IicpError};
+use iicp_client::{ClientConfig, IicpClient, IicpError, make_traceparent};
 
 // is_transient() — used by retry logic (SDK-05)
 #[test]
@@ -41,10 +41,32 @@ fn sdk04_accepts_max_timeout() {
     assert!(IicpClient::new(cfg).is_ok());
 }
 
+// SDK-06: W3C traceparent format validation
+#[test]
+fn sdk06_traceparent_format() {
+    let tp = make_traceparent();
+    let parts: Vec<&str> = tp.split('-').collect();
+    assert_eq!(parts.len(), 4, "expected 4 dash-separated parts: {tp}");
+    assert_eq!(parts[0], "00");
+    assert_eq!(parts[1].len(), 32, "trace-id must be 32 hex chars: {tp}");
+    assert_eq!(parts[2].len(), 16, "parent-id must be 16 hex chars: {tp}");
+    assert_eq!(parts[3], "01");
+    // verify hex chars only
+    assert!(parts[1].chars().all(|c| c.is_ascii_hexdigit()));
+    assert!(parts[2].chars().all(|c| c.is_ascii_hexdigit()));
+}
+
+#[test]
+fn sdk06_traceparent_unique() {
+    let tp1 = make_traceparent();
+    let tp2 = make_traceparent();
+    assert_ne!(tp1, tp2, "consecutive traceparents must differ");
+}
+
 #[tokio::test]
 async fn sdk03_rejects_invalid_intent() {
     let client = IicpClient::new(ClientConfig::default()).unwrap();
-    let err = client.discover("not-a-urn", None).await.unwrap_err();
+    let err = client.discover("not-a-urn", None, None).await.unwrap_err();
     assert!(matches!(err, IicpError::InvalidIntent(_)));
 }
 
@@ -58,7 +80,7 @@ async fn sdk03_accepts_valid_intent() {
     })
     .unwrap();
     let err = client
-        .discover("urn:iicp:intent:llm:chat:v1", None)
+        .discover("urn:iicp:intent:llm:chat:v1", None, None)
         .await
         .unwrap_err();
     assert!(!matches!(err, IicpError::InvalidIntent(_)));

@@ -5,7 +5,7 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::errors::{IicpError, Result};
-use crate::http::HttpClient;
+use crate::http::{make_traceparent, HttpClient};
 use crate::types::*;
 
 // Compiled once at first use — avoid per-call allocation (fix: rust#3).
@@ -31,8 +31,13 @@ impl IicpClient {
         Ok(Self { config, http })
     }
 
-    /// Discover nodes for *intent* (SDK-01).
-    pub async fn discover(&self, intent: &str, opts: Option<DiscoverOptions>) -> Result<NodeList> {
+    /// Discover nodes for *intent* (SDK-01). Accepts an optional traceparent for propagation.
+    pub async fn discover(
+        &self,
+        intent: &str,
+        opts: Option<DiscoverOptions>,
+        traceparent: Option<&str>,
+    ) -> Result<NodeList> {
         self.validate_intent(intent)?;
         let opts = opts.unwrap_or_default();
         let mut url = format!(
@@ -49,18 +54,20 @@ impl IicpClient {
             url.push_str(&format!("&min_reputation={rep}"));
         }
         url.push_str(&format!("&limit={}", opts.limit.unwrap_or(10)));
-        self.http.get_json(&url).await
+        self.http.get_json(&url, traceparent).await
     }
 
     /// Discover → select best node → submit task (SDK-01/02).
     /// Retries up to MAX_RETRIES on transient errors (SDK-05).
+    /// Generates one W3C traceparent shared across discover + POST (SDK-06).
     pub async fn submit(&self, mut request: TaskRequest) -> Result<TaskResponse> {
         self.validate_intent(&request.intent)?;
         if request.task_id.is_empty() {
             request.task_id = uuid::Uuid::new_v4().to_string();
         }
 
-        let nodes = self.discover(&request.intent, None).await?;
+        let tp = make_traceparent(); // SDK-06: shared across discover + node POST
+        let nodes = self.discover(&request.intent, None, Some(&tp)).await?;
         let node = nodes
             .nodes
             .into_iter()
@@ -71,7 +78,7 @@ impl IicpClient {
         for attempt in 0..MAX_RETRIES {
             match self
                 .http
-                .post_json(&format!("{}/v1/task", node.endpoint), &request, None)
+                .post_json(&format!("{}/v1/task", node.endpoint), &request, None, Some(&tp))
                 .await
             {
                 Ok(resp) => return Ok(resp),
