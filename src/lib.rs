@@ -3,13 +3,16 @@
 //!
 //! # Quickstart
 //! ```rust,no_run
-//! use iicp_client::{IicpClient, ClientConfig, DiscoverOptions};
+//! use iicp_client::{ChatMessage, ChatOptions, ClientConfig, IicpClient};
 //!
 //! #[tokio::main]
 //! async fn main() -> iicp_client::Result<()> {
 //!     let client = IicpClient::new(ClientConfig::default())?;
-//!     let nodes = client.discover("urn:iicp:intent:llm:chat:v1", None).await?;
-//!     println!("Found {} nodes", nodes.nodes.len());
+//!     let reply = client.chat(
+//!         vec![ChatMessage { role: "user".into(), content: "What is IICP?".into() }],
+//!         None,
+//!     ).await?;
+//!     println!("{}", reply.choices[0].message.content);
 //!     Ok(())
 //! }
 //! ```

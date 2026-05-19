@@ -1,6 +1,31 @@
 // SPDX-License-Identifier: Apache-2.0
 use iicp_client::{ClientConfig, IicpClient, IicpError};
 
+// is_transient() — used by retry logic (SDK-05)
+#[test]
+fn is_transient_on_429() {
+    let e = IicpError::Protocol { code: "capacity_exceeded".into(), message: "".into(), status: 429 };
+    assert!(e.is_transient());
+}
+
+#[test]
+fn is_transient_on_503() {
+    let e = IicpError::Protocol { code: "backend_unreachable".into(), message: "".into(), status: 503 };
+    assert!(e.is_transient());
+}
+
+#[test]
+fn is_not_transient_on_401() {
+    let e = IicpError::Protocol { code: "token_invalid".into(), message: "".into(), status: 401 };
+    assert!(!e.is_transient());
+}
+
+#[test]
+fn is_not_transient_on_422() {
+    let e = IicpError::Protocol { code: "validation_error".into(), message: "".into(), status: 422 };
+    assert!(!e.is_transient());
+}
+
 #[test]
 fn sdk04_rejects_oversized_timeout() {
     let cfg = ClientConfig { timeout_ms: 120_001, ..Default::default() };

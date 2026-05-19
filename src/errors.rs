@@ -29,4 +29,14 @@ pub enum IicpError {
     Serde(#[from] serde_json::Error),
 }
 
+impl IicpError {
+    /// True for errors where retrying a different attempt may succeed (SDK-05).
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            IicpError::Protocol { status: 429 | 502 | 503 | 504, .. } | IicpError::Http(_)
+        )
+    }
+}
+
 pub type Result<T> = std::result::Result<T, IicpError>;
