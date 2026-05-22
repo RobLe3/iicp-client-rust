@@ -26,7 +26,6 @@ pub use client::IicpClient;
 pub use errors::{IicpError, Result};
 pub use http::make_traceparent;
 pub use types::{
-    ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage,
-    ClientConfig, DiscoverOptions, Node, NodeList, TaskAuth,
-    TaskConstraints, TaskRequest, TaskResponse,
+    ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage, ClientConfig, DiscoverOptions,
+    Node, NodeList, TaskAuth, TaskConstraints, TaskRequest, TaskResponse,
 };

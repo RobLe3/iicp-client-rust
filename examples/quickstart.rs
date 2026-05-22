@@ -10,10 +10,19 @@ async fn main() -> iicp_client::Result<()> {
     let reply = client
         .chat(
             vec![
-                ChatMessage { role: "system".into(), content: "You are a helpful assistant.".into() },
-                ChatMessage { role: "user".into(),   content: "What is IICP?".into() },
+                ChatMessage {
+                    role: "system".into(),
+                    content: "You are a helpful assistant.".into(),
+                },
+                ChatMessage {
+                    role: "user".into(),
+                    content: "What is IICP?".into(),
+                },
             ],
-            Some(ChatOptions { timeout_ms: Some(30_000), ..Default::default() }),
+            Some(ChatOptions {
+                timeout_ms: Some(30_000),
+                ..Default::default()
+            }),
         )
         .await?;
 

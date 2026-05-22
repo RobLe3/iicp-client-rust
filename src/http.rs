@@ -11,7 +11,7 @@ use crate::errors::{IicpError, Result};
 /// Generate a W3C traceparent header value (SDK-06).
 /// Format: `00-<32hex>-<16hex>-01`
 pub fn make_traceparent() -> String {
-    let trace_id = Uuid::new_v4().simple().to_string();       // 32 hex chars
+    let trace_id = Uuid::new_v4().simple().to_string(); // 32 hex chars
     let parent_id = &Uuid::new_v4().simple().to_string()[..16]; // 16 hex chars
     format!("00-{trace_id}-{parent_id}-01")
 }
@@ -28,7 +28,11 @@ impl HttpClient {
             .timeout(Duration::from_millis(timeout_ms))
             .use_rustls_tls()
             .build()?;
-        Ok(Self { inner, timeout: Duration::from_millis(timeout_ms), token })
+        Ok(Self {
+            inner,
+            timeout: Duration::from_millis(timeout_ms),
+            token,
+        })
     }
 
     fn auth(&self, rb: RequestBuilder) -> RequestBuilder {
@@ -43,8 +47,11 @@ impl HttpClient {
         url: &str,
         traceparent: Option<&str>,
     ) -> Result<T> {
-        let tp = traceparent.map(|s| s.to_owned()).unwrap_or_else(make_traceparent);
-        let resp = self.auth(self.inner.get(url))
+        let tp = traceparent
+            .map(|s| s.to_owned())
+            .unwrap_or_else(make_traceparent);
+        let resp = self
+            .auth(self.inner.get(url))
             .header("traceparent", &tp)
             .send()
             .await?;
@@ -67,7 +74,9 @@ impl HttpClient {
         auth_override: Option<&str>,
         traceparent: Option<&str>,
     ) -> Result<T> {
-        let tp = traceparent.map(|s| s.to_owned()).unwrap_or_else(make_traceparent);
+        let tp = traceparent
+            .map(|s| s.to_owned())
+            .unwrap_or_else(make_traceparent);
         let rb = self.inner.post(url).json(body).header("traceparent", &tp);
         let rb = match auth_override {
             Some(t) => rb.bearer_auth(t),
@@ -78,7 +87,10 @@ impl HttpClient {
         let resp_body: Value = resp.json().await?;
         if status >= 400 {
             return Err(IicpError::Protocol {
-                code: resp_body["error"]["code"].as_str().unwrap_or("unknown").into(),
+                code: resp_body["error"]["code"]
+                    .as_str()
+                    .unwrap_or("unknown")
+                    .into(),
                 message: resp_body["error"]["message"].as_str().unwrap_or("").into(),
                 status,
             });

@@ -1,34 +1,53 @@
 // SPDX-License-Identifier: Apache-2.0
-use iicp_client::{ClientConfig, IicpClient, IicpError, make_traceparent};
+use iicp_client::{make_traceparent, ClientConfig, IicpClient, IicpError};
 
 // is_transient() — used by retry logic (SDK-05)
 #[test]
 fn is_transient_on_429() {
-    let e = IicpError::Protocol { code: "capacity_exceeded".into(), message: "".into(), status: 429 };
+    let e = IicpError::Protocol {
+        code: "capacity_exceeded".into(),
+        message: "".into(),
+        status: 429,
+    };
     assert!(e.is_transient());
 }
 
 #[test]
 fn is_transient_on_503() {
-    let e = IicpError::Protocol { code: "backend_unreachable".into(), message: "".into(), status: 503 };
+    let e = IicpError::Protocol {
+        code: "backend_unreachable".into(),
+        message: "".into(),
+        status: 503,
+    };
     assert!(e.is_transient());
 }
 
 #[test]
 fn is_not_transient_on_401() {
-    let e = IicpError::Protocol { code: "token_invalid".into(), message: "".into(), status: 401 };
+    let e = IicpError::Protocol {
+        code: "token_invalid".into(),
+        message: "".into(),
+        status: 401,
+    };
     assert!(!e.is_transient());
 }
 
 #[test]
 fn is_not_transient_on_422() {
-    let e = IicpError::Protocol { code: "validation_error".into(), message: "".into(), status: 422 };
+    let e = IicpError::Protocol {
+        code: "validation_error".into(),
+        message: "".into(),
+        status: 422,
+    };
     assert!(!e.is_transient());
 }
 
 #[test]
 fn sdk04_rejects_oversized_timeout() {
-    let cfg = ClientConfig { timeout_ms: 120_001, ..Default::default() };
+    let cfg = ClientConfig {
+        timeout_ms: 120_001,
+        ..Default::default()
+    };
     assert!(matches!(
         IicpClient::new(cfg),
         Err(IicpError::TimeoutTooLarge(120_001))
@@ -37,7 +56,10 @@ fn sdk04_rejects_oversized_timeout() {
 
 #[test]
 fn sdk04_accepts_max_timeout() {
-    let cfg = ClientConfig { timeout_ms: 120_000, ..Default::default() };
+    let cfg = ClientConfig {
+        timeout_ms: 120_000,
+        ..Default::default()
+    };
     assert!(IicpClient::new(cfg).is_ok());
 }
 

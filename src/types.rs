@@ -99,6 +99,7 @@ pub struct TaskResponse {
 pub struct TaskMetrics {
     pub latency_ms: Option<f64>,
     pub tokens_used: Option<u32>,
+    pub node_id: Option<String>,
 }
 
 /// A single chat message (role + content).
@@ -114,13 +115,20 @@ pub struct ChatOptions {
     pub model: Option<String>,
     pub max_tokens: Option<u32>,
     pub timeout_ms: Option<u64>,
+    pub temperature: Option<f64>,
 }
 
 /// OpenAI-compatible chat completion response.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct ChatResponse {
     pub choices: Vec<ChatChoice>,
     pub usage: Option<ChatUsage>,
+    /// Task ID from the IICP task response (correlation handle).
+    #[serde(default)]
+    pub task_id: String,
+    /// IICP node that served this request — from task metrics.
+    #[serde(default)]
+    pub node_id: Option<String>,
 }
 
 /// A single choice in a chat response.

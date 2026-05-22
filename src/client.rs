@@ -72,13 +72,20 @@ impl IicpClient {
             .nodes
             .into_iter()
             .find(|n| n.available)
-            .ok_or_else(|| IicpError::NoNodes { intent: request.intent.clone() })?;
+            .ok_or_else(|| IicpError::NoNodes {
+                intent: request.intent.clone(),
+            })?;
 
         let mut last_err: Option<IicpError> = None;
         for attempt in 0..MAX_RETRIES {
             match self
                 .http
-                .post_json(&format!("{}/v1/task", node.endpoint), &request, None, Some(&tp))
+                .post_json(
+                    &format!("{}/v1/task", node.endpoint),
+                    &request,
+                    None,
+                    Some(&tp),
+                )
                 .await
             {
                 Ok(resp) => return Ok(resp),
@@ -99,13 +106,17 @@ impl IicpClient {
         opts: Option<ChatOptions>,
     ) -> Result<ChatResponse> {
         let opts = opts.unwrap_or_default();
+        let mut payload = serde_json::json!({ "messages": messages });
+        if let Some(ref model) = opts.model {
+            payload["model"] = serde_json::Value::String(model.clone());
+        }
+        if let Some(temp) = opts.temperature {
+            payload["temperature"] = serde_json::json!(temp);
+        }
         let request = TaskRequest {
             task_id: uuid::Uuid::new_v4().to_string(),
             intent: "urn:iicp:intent:llm:chat:v1".into(),
-            payload: serde_json::json!({
-                "messages": messages,
-                "model": opts.model.as_deref().unwrap_or(""),
-            }),
+            payload,
             constraints: Some(TaskConstraints {
                 timeout_ms: opts.timeout_ms,
                 max_tokens: opts.max_tokens,
@@ -114,12 +125,17 @@ impl IicpClient {
             auth: None,
         };
         let task_resp = self.submit(request).await?;
+        let node_id = task_resp.metrics.as_ref().and_then(|m| m.node_id.clone());
+        let task_id = task_resp.task_id.clone();
         let result = task_resp.result.ok_or_else(|| IicpError::Protocol {
             code: "no_result".into(),
             message: "Node returned task without a result payload".into(),
             status: 200,
         })?;
-        Ok(serde_json::from_value(result)?)
+        let mut resp: ChatResponse = serde_json::from_value(result)?;
+        resp.task_id = task_id;
+        resp.node_id = node_id;
+        Ok(resp)
     }
 
     fn validate_intent(&self, intent: &str) -> Result<()> {

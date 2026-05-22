@@ -10,7 +10,11 @@ pub enum IicpError {
 
     /// Directory or node returned an IICP error response.
     #[error("[{code}] {message} (HTTP {status})")]
-    Protocol { code: String, message: String, status: u16 },
+    Protocol {
+        code: String,
+        message: String,
+        status: u16,
+    },
 
     /// SDK-03: intent URN does not match the required pattern.
     #[error("SDK-03: invalid intent URN: {0}")]
@@ -34,7 +38,10 @@ impl IicpError {
     pub fn is_transient(&self) -> bool {
         matches!(
             self,
-            IicpError::Protocol { status: 429 | 502 | 503 | 504, .. } | IicpError::Http(_)
+            IicpError::Protocol {
+                status: 429 | 502 | 503 | 504,
+                ..
+            } | IicpError::Http(_)
         )
     }
 }
