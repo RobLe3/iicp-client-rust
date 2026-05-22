@@ -18,7 +18,6 @@ pub fn make_traceparent() -> String {
 
 pub(crate) struct HttpClient {
     inner: Client,
-    timeout: Duration,
     token: Option<String>,
 }
 
@@ -28,11 +27,7 @@ impl HttpClient {
             .timeout(Duration::from_millis(timeout_ms))
             .use_rustls_tls()
             .build()?;
-        Ok(Self {
-            inner,
-            timeout: Duration::from_millis(timeout_ms),
-            token,
-        })
+        Ok(Self { inner, token })
     }
 
     fn auth(&self, rb: RequestBuilder) -> RequestBuilder {
