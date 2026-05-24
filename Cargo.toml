@@ -1,6 +1,6 @@
 [package]
 name = "iicp-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Official Rust client SDK for the IICP protocol (ADR-016)"
@@ -11,19 +11,36 @@ repository = "https://github.com/RobLe3/iicp-client-rust"
 documentation = "https://docs.rs/iicp-client"
 readme = "README.md"
 
+[lib]
+name = "iicp_client"
+path = "src/lib.rs"
+
+[[example]]
+name = "quickstart"
+path = "examples/quickstart.rs"
+
+[[example]]
+name = "node"
+path = "examples/node.rs"
+
+[features]
+metrics = ["dep:prometheus"]
+
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "sync", "net"] }
 uuid = { version = "1.0", features = ["v4"] }
 thiserror = "1.0"
+axum = "0.7"
+tracing = "0.1"
+prometheus = { version = "0.13", optional = true }
 
 [dev-dependencies]
-tokio = { version = "1.0", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
 mockito = "1.0"
-
-[[example]]
-name = "quickstart"
-path = "examples/quickstart.rs"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+tracing-subscriber = "0.3"
+serde_json = "1.0"

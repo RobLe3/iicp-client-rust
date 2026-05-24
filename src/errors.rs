@@ -31,6 +31,10 @@ pub enum IicpError {
     /// JSON serialization / deserialization failure.
     #[error("serialization error: {0}")]
     Serde(#[from] serde_json::Error),
+
+    /// Node registration, heartbeat, or server bind failure.
+    #[error("node error: {0}")]
+    Node(String),
 }
 
 impl IicpError {

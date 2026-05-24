@@ -20,11 +20,13 @@
 mod client;
 mod errors;
 mod http;
+pub mod node;
 mod types;
 
 pub use client::IicpClient;
 pub use errors::{IicpError, Result};
 pub use http::make_traceparent;
+pub use node::{IicpNode, NodeConfig};
 pub use types::{
     ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage, ClientConfig, DiscoverOptions,
     Node, NodeList, TaskAuth, TaskConstraints, TaskRequest, TaskResponse,
