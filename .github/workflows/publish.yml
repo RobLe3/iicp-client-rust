@@ -8,6 +8,12 @@ on:
       version:
         description: "Version to publish (must match Cargo.toml)"
         required: true
+      fast_mode:
+        description: "Skip clippy/fmt — run cargo test only (patch/doc-only releases)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
 
 jobs:
   test:
@@ -18,8 +24,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - name: Format check
+        if: inputs.fast_mode != 'true'
+        run: cargo fmt --check
+      - name: Clippy
+        if: inputs.fast_mode != 'true'
+        run: cargo clippy -- -D warnings
       - run: cargo test
 
   publish:
