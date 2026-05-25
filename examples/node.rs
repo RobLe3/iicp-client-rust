@@ -19,8 +19,7 @@ async fn main() -> iicp_client::Result<()> {
     let node_id = std::env::var("NODE_ID").unwrap_or_else(|_| "rust-node-001".into());
     let endpoint =
         std::env::var("NODE_ENDPOINT").unwrap_or_else(|_| "http://localhost:8020".into());
-    let intent = std::env::var("INTENT")
-        .unwrap_or_else(|_| "urn:iicp:intent:llm:chat:v1".into());
+    let intent = std::env::var("INTENT").unwrap_or_else(|_| "urn:iicp:intent:llm:chat:v1".into());
     let listen = std::env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:8020".into());
 
     let mut cfg = NodeConfig::new(&node_id, &endpoint, &intent);

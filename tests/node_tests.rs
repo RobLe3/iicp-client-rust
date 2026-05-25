@@ -226,7 +226,7 @@ async fn test_traceparent_propagated_to_handler() {
 
 #[tokio::test]
 async fn test_node_register_returns_token() {
-    use mockito::{Server, Matcher};
+    use mockito::{Matcher, Server};
 
     let mut server = Server::new_async().await;
     let _m = server
@@ -237,8 +237,11 @@ async fn test_node_register_returns_token() {
         .create_async()
         .await;
 
-    let mut cfg =
-        NodeConfig::new("n-001", "https://my-host.example.com", "urn:iicp:intent:llm:chat:v1");
+    let mut cfg = NodeConfig::new(
+        "n-001",
+        "https://my-host.example.com",
+        "urn:iicp:intent:llm:chat:v1",
+    );
     cfg.directory_url = server.url();
     let node = IicpNode::new(cfg);
     let token = node.register().await.unwrap();
@@ -258,8 +261,11 @@ async fn test_node_register_no_token_fails() {
         .create_async()
         .await;
 
-    let mut cfg =
-        NodeConfig::new("n-001", "https://my-host.example.com", "urn:iicp:intent:llm:chat:v1");
+    let mut cfg = NodeConfig::new(
+        "n-001",
+        "https://my-host.example.com",
+        "urn:iicp:intent:llm:chat:v1",
+    );
     cfg.directory_url = server.url();
     let node = IicpNode::new(cfg);
     assert!(node.register().await.is_err());
@@ -278,8 +284,11 @@ async fn test_node_heartbeat_ok() {
         .create_async()
         .await;
 
-    let mut cfg =
-        NodeConfig::new("n-001", "https://my-host.example.com", "urn:iicp:intent:llm:chat:v1");
+    let mut cfg = NodeConfig::new(
+        "n-001",
+        "https://my-host.example.com",
+        "urn:iicp:intent:llm:chat:v1",
+    );
     cfg.directory_url = server.url();
     let node = IicpNode::new(cfg);
     assert!(node.heartbeat("tok-abc123").await.is_ok());

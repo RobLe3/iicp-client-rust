@@ -11,11 +11,14 @@ Official Rust client library for the [IICP protocol](https://iicp.network) — r
 urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
 ```
 
-> **Private beta:** The crate is not yet on crates.io. Add as a git dependency or build from source.
-
----
-
 ## Add to Cargo.toml
+
+```toml
+[dependencies]
+iicp-client = "0.2"
+```
+
+Or for the latest unreleased code:
 
 ```toml
 [dependencies]
@@ -127,7 +130,7 @@ Conformance tier: `iicp:sdk:v1` (spec S.14) · [Request a badge](https://iicp.ne
 ## Development
 
 ```bash
-cargo test          # 4 unit tests + 1 doc-test
+cargo test          # 19 tests + 1 doc-test
 cargo clippy        # lint
 cargo build --release
 cargo run --example quickstart

@@ -5,8 +5,7 @@
 //! - `GET  /iicp/health`   — liveness / capacity (always 200)
 //! - `GET  /metrics`       — Prometheus text (503 if `metrics` feature absent)
 //! - `POST /v1/task`       — task handler with concurrency gate (IICP-E021),
-//!                           nonce replay protection (IICP-E011), and
-//!                           W3C traceparent propagation.
+//!   nonce replay protection (IICP-E011), and W3C traceparent propagation.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -92,7 +91,9 @@ pub struct TaskResponse {
 }
 
 pub type TaskHandlerFn = Arc<
-    dyn Fn(TaskRequest) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>>
+    dyn Fn(
+            TaskRequest,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value>> + Send>>
         + Send
         + Sync,
 >;
@@ -137,13 +138,20 @@ async fn metrics_endpoint() -> Response {
         if encoder.encode(&mf, &mut buf).is_ok() {
             return (
                 StatusCode::OK,
-                [(axum::http::header::CONTENT_TYPE, "text/plain; version=0.0.4")],
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4",
+                )],
                 buf,
             )
                 .into_response();
         }
     }
-    (StatusCode::SERVICE_UNAVAILABLE, "metrics feature not enabled").into_response()
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "metrics feature not enabled",
+    )
+        .into_response()
 }
 
 // ── POST /v1/task ─────────────────────────────────────────────────────────────
@@ -159,10 +167,7 @@ async fn task_endpoint(
         state.active_jobs.fetch_sub(1, Ordering::Relaxed);
         return (
             StatusCode::TOO_MANY_REQUESTS,
-            [
-                ("Retry-After", "2"),
-                ("Content-Type", "application/json"),
-            ],
+            [("Retry-After", "2"), ("Content-Type", "application/json")],
             Json(json!({
                 "error": {
                     "code": "IICP-E021",
