@@ -45,6 +45,15 @@ pub struct NodeConfig {
     pub timeout_ms: u64,
     /// Maximum concurrent tasks; excess requests receive 429 IICP-E021.
     pub max_concurrent: usize,
+    /// Tokens-per-minute capacity declared to directory (`limits.tokens_per_min`).
+    pub tokens_per_min: u32,
+    /// Per-request token cap declared on the capability object (`capabilities[].max_tokens`).
+    pub max_tokens: u32,
+    /// Optional native IICP binary endpoint (spec/iicp-dir.md v0.7.0).
+    /// Scheme MUST be `iicp://` (plaintext) or `iicpsec://` (TLS).
+    /// Default IICP port is 9484 (ADR-040). When set, the directory persists it
+    /// and clients SHOULD prefer it over `endpoint` for task CALLs.
+    pub transport_endpoint: Option<String>,
 }
 
 impl NodeConfig {
@@ -63,6 +72,9 @@ impl NodeConfig {
             directory_url: DEFAULT_DIRECTORY.into(),
             timeout_ms: 5_000,
             max_concurrent: 4,
+            tokens_per_min: 10_000,
+            max_tokens: 8_192,
+            transport_endpoint: None,
         }
     }
 }
@@ -245,20 +257,48 @@ impl IicpNode {
     }
 
     /// Register with the directory and return the assigned `node_token`.
+    ///
+    /// Payload conforms to spec/iicp-dir.md §3.1 REGISTER plus the v0.7.0
+    /// dual-endpoint extension (`transport_endpoint`). Pre-iter-1413
+    /// builds sent a non-spec flat-`intent` shape that the production
+    /// directory rejects with 422; fixed here.
     pub async fn register(&self) -> Result<String> {
+        // Build the spec-compliant capability object. Legacy
+        // `capabilities: Vec<String>` is folded into the models array.
+        let mut models: Vec<String> = match &self.cfg.model {
+            Some(m) => vec![m.clone()],
+            None => Vec::new(),
+        };
+        for cap in &self.cfg.capabilities {
+            if !models.contains(cap) {
+                models.push(cap.clone());
+            }
+        }
+        let region = self
+            .cfg
+            .region
+            .clone()
+            .unwrap_or_else(|| "eu-central".to_string());
+
         let mut payload = json!({
-            "node_id": self.cfg.node_id,
             "endpoint": self.cfg.endpoint,
-            "intent": self.cfg.intent,
+            "region": region,
+            "capabilities": [{
+                "intent": self.cfg.intent,
+                "models": models,
+                "max_tokens": self.cfg.max_tokens,
+            }],
+            "limits": {
+                "max_concurrent": self.cfg.max_concurrent,
+                "tokens_per_min": self.cfg.tokens_per_min,
+            },
         });
-        if let Some(model) = &self.cfg.model {
-            payload["model"] = json!(model);
+        if !self.cfg.node_id.is_empty() {
+            payload["node_id"] = json!(self.cfg.node_id);
         }
-        if let Some(region) = &self.cfg.region {
-            payload["region"] = json!(region);
-        }
-        if !self.cfg.capabilities.is_empty() {
-            payload["capabilities"] = json!(self.cfg.capabilities);
+        // spec v0.7.0 — native IICP binary endpoint
+        if let Some(t) = &self.cfg.transport_endpoint {
+            payload["transport_endpoint"] = json!(t);
         }
 
         let resp = self

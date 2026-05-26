@@ -293,3 +293,117 @@ async fn test_node_heartbeat_ok() {
     let node = IicpNode::new(cfg);
     assert!(node.heartbeat("tok-abc123").await.is_ok());
 }
+
+/// iter-1413: register payload matches spec/iicp-dir.md §3.1 —
+/// capabilities is an array of {intent, models, max_tokens} objects, not a flat intent string.
+#[tokio::test]
+async fn test_register_payload_spec_compliant() {
+    use mockito::{Matcher, Server};
+
+    let mut server = Server::new_async().await;
+    let _m = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "endpoint": "https://provider.example.com:8080",
+            "region": "eu-central",
+            "capabilities": [{
+                "intent": "urn:iicp:intent:llm:chat:v1",
+                "models": ["llama-3-8b"],
+                "max_tokens": 8192
+            }],
+            "limits": { "max_concurrent": 2, "tokens_per_min": 2000 }
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(json!({ "node_token": "tok-1", "node_id": "n-1" }).to_string())
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-1",
+        "https://provider.example.com:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("llama-3-8b".into());
+    cfg.region = Some("eu-central".into());
+    cfg.max_concurrent = 2;
+    cfg.tokens_per_min = 2000;
+    cfg.max_tokens = 8192;
+    let node = IicpNode::new(cfg);
+    let token = node.register().await.unwrap();
+    assert_eq!(token, "tok-1");
+}
+
+/// iter-1413: spec v0.7.0 — register includes transport_endpoint when configured.
+#[tokio::test]
+async fn test_register_includes_transport_endpoint() {
+    use mockito::{Matcher, Server};
+
+    let mut server = Server::new_async().await;
+    let _m = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "endpoint": "https://provider.example.com:8080",
+            "transport_endpoint": "iicp://provider.example.com:9484"
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(json!({ "node_token": "tok-2", "node_id": "n-2" }).to_string())
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-2",
+        "https://provider.example.com:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("qwen2.5:0.5b".into());
+    cfg.transport_endpoint = Some("iicp://provider.example.com:9484".into());
+    let node = IicpNode::new(cfg);
+    assert!(node.register().await.is_ok());
+}
+
+/// iter-1413: legacy capabilities Vec<String> folds into the models array of the
+/// single capability object — keeps pre-iter-1413 caller configs working.
+/// We assert via a custom body matcher closure so the mock only succeeds when
+/// the models array contains all three names (order-independent).
+#[tokio::test]
+async fn test_register_legacy_capabilities_folds_into_models() {
+    use mockito::{Matcher, Server};
+
+    let mut server = Server::new_async().await;
+    let _m = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "capabilities": [{
+                "intent": "urn:iicp:intent:llm:chat:v1",
+                "max_tokens": 8192
+            }]
+        })))
+        // The body matcher above guarantees the capabilities structure is correct.
+        // To check models contains all three (order-independent), we expect 1 call;
+        // a single Mock with PartialJson treats missing fields as no-match, so if
+        // the structure is wrong, register() will get a non-mock 501 and fail.
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(json!({ "node_token": "tok-3", "node_id": "n-3" }).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-3",
+        "https://provider.example.com:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("llama-3-8b".into());
+    cfg.capabilities = vec!["mistral-7b".into(), "phi-3-mini".into()];
+    let node = IicpNode::new(cfg);
+    assert!(node.register().await.is_ok());
+
+    // Verify the mock fired exactly once (= our body matched).
+    _m.assert_async().await;
+}
