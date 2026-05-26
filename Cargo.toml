@@ -1,6 +1,6 @@
 [package]
 name = "iicp-client"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Official Rust client SDK for the IICP protocol (ADR-016)"
@@ -28,6 +28,10 @@ metrics = ["dep:prometheus"]
 # Native IICP binary transport (port 9484, spec/iicp-framing.md) — opt-in
 # because ciborium adds ~50KB to release binaries; HTTP-only nodes don't need it.
 iicp-tcp = ["dep:ciborium"]
+# ADR-041 UPnP NAT detection — auto-discover the public endpoint on operator
+# networks behind a UPnP-capable router. Opt-in because igd-next pulls in
+# SSDP discovery + XML parsing that headless deployments don't need.
+nat = ["dep:igd-next"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -41,6 +45,7 @@ axum = "0.7"
 tracing = "0.1"
 prometheus = { version = "0.13", optional = true }
 ciborium = { version = "0.2", optional = true }
+igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "sync"] }

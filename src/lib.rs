@@ -26,6 +26,9 @@ mod types;
 #[cfg(feature = "iicp-tcp")]
 pub mod iicp_tcp;
 
+#[cfg(feature = "nat")]
+pub mod nat_detection;
+
 pub use client::IicpClient;
 pub use errors::{IicpError, Result};
 pub use http::make_traceparent;
