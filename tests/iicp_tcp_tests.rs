@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use ciborium::value::Value as CborValue;
 use iicp_client::iicp_tcp::{
-    decode_cbor, encode_frame, IicpTcpServer, MsgType, FRAMING_VERSION, FRAME_HEADER_LEN,
-    IICP_MAGIC,
+    decode_cbor, encode_frame, IicpTcpClient, IicpTcpClientError, IicpTcpServer, MsgType,
+    FRAMING_VERSION, FRAME_HEADER_LEN, IICP_MAGIC,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -327,4 +327,99 @@ async fn test_payload_bearing_frame_does_not_close_session() {
     let (mt2, _) = read_frame(&mut sock).await.unwrap();
     assert_eq!(mt1, MsgType::Ack as u8);
     assert_eq!(mt2, MsgType::Pong as u8);
+}
+
+// ── IicpTcpClient round-trip tests against the server fixture ───────────────
+
+#[tokio::test]
+async fn test_client_handshake_populates_peer_node_id() {
+    let port = start_server().await;
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    assert_eq!(client.framing_version, Some(FRAMING_VERSION));
+    assert_eq!(client.peer_node_id.as_deref(), Some("test-node-id"));
+}
+
+#[tokio::test]
+async fn test_client_ping_with_echo() {
+    let port = start_server().await;
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    let echo = b"rust-client-ping-2026";
+    let got = client.ping(Some(echo)).await.unwrap();
+    assert_eq!(got.as_deref(), Some(&echo[..]));
+}
+
+#[tokio::test]
+async fn test_client_ping_empty_returns_none() {
+    let port = start_server().await;
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    let got = client.ping(None).await.unwrap();
+    assert_eq!(got, None);
+}
+
+#[tokio::test]
+async fn test_client_discover_returns_nodes() {
+    let port = start_server().await;
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    let nodes = client.discover("urn:iicp:intent:llm:chat:v1").await.unwrap();
+    assert_eq!(nodes.len(), 2);
+}
+
+#[tokio::test]
+async fn test_client_call_returns_handler_result() {
+    let port = start_server().await;
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    let payload = serde_json::json!({"messages": [{"role":"user","content":"hi from rust client"}]});
+    let result = client
+        .call("urn:iicp:intent:llm:chat:v1", payload.clone(), Some("call-rust-1"))
+        .await
+        .unwrap();
+    // The server-side handler returns { "result": { "echo": <payload> } }; the
+    // server then sends only the inner result (the "result" wrapper is stripped),
+    // so the client sees { "echo": <payload> } directly.
+    let echo = result.get("echo").expect("echo missing");
+    assert_eq!(echo, &payload);
+}
+
+#[tokio::test]
+async fn test_client_call_raises_on_server_error() {
+    // Server with no handler returns error_code 503.
+    let server = IicpTcpServer::new("127.0.0.1", 0).with_node_id("no-handler");
+    let listener = server.bind().await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move { let _ = server.serve_on(listener).await; });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    match client.call("urn:iicp:intent:llm:chat:v1", serde_json::json!({}), None).await {
+        Err(IicpTcpClientError::Server { code, .. }) => {
+            assert_eq!(code, 503);
+        }
+        other => panic!("expected Server error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_full_session_init_ping_discover_call_close() {
+    let port = start_server().await;
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    assert_eq!(client.ping(Some(b"x")).await.unwrap().as_deref(), Some(&b"x"[..]));
+    let nodes = client.discover("urn:iicp:intent:llm:chat:v1").await.unwrap();
+    assert_eq!(nodes.len(), 2);
+    let result = client
+        .call(
+            "urn:iicp:intent:llm:chat:v1",
+            serde_json::json!({"k": "v"}),
+            Some("c1"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.get("echo").and_then(|e| e.get("k")), Some(&serde_json::json!("v")));
+    client.close().await.unwrap();
 }

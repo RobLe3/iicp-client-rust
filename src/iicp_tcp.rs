@@ -580,3 +580,331 @@ fn json_to_cbor(v: &serde_json::Value) -> CborValue {
         }
     }
 }
+
+// ── Client ────────────────────────────────────────────────────────────────────
+
+/// Error returned by IicpTcpClient RPC methods.
+#[derive(Debug, thiserror::Error)]
+pub enum IicpTcpClientError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("protocol error: {0}")]
+    Protocol(String),
+    #[error("server error {code}: {message}")]
+    Server { code: i64, message: String },
+    #[error("operation timed out after {ms}ms")]
+    Timeout { ms: u64 },
+}
+
+/// Native IICP TCP client (consumer side). Symmetric counterpart to
+/// IicpTcpServer: connect, handshake, then issue PING/DISCOVER/CALL requests.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use iicp_client::iicp_tcp::IicpTcpClient;
+/// let mut client = IicpTcpClient::connect("203.0.113.5", 9484).await?;
+/// client.handshake().await?;
+/// let nodes = client.discover("urn:iicp:intent:llm:chat:v1").await?;
+/// let result = client.call(
+///     "urn:iicp:intent:llm:chat:v1",
+///     serde_json::json!({"messages": [{"role":"user","content":"hi"}]}),
+///     None,
+/// ).await?;
+/// client.close().await?;
+/// ```
+pub struct IicpTcpClient {
+    sock: TcpStream,
+    timeout: std::time::Duration,
+    /// node_id from the server's ACK (populated by handshake).
+    pub peer_node_id: Option<String>,
+    /// framing_version negotiated in INIT/ACK (populated by handshake).
+    pub framing_version: Option<u8>,
+}
+
+impl IicpTcpClient {
+    /// Connect to host:port. Default 10s timeout for connect + each subsequent RPC.
+    pub async fn connect(host: &str, port: u16) -> Result<Self, IicpTcpClientError> {
+        Self::connect_with_timeout(host, port, std::time::Duration::from_secs(10)).await
+    }
+
+    pub async fn connect_with_timeout(
+        host: &str,
+        port: u16,
+        timeout: std::time::Duration,
+    ) -> Result<Self, IicpTcpClientError> {
+        let addr = format!("{host}:{port}");
+        let sock = tokio::time::timeout(timeout, TcpStream::connect(&addr))
+            .await
+            .map_err(|_| IicpTcpClientError::Timeout { ms: timeout.as_millis() as u64 })??;
+        Ok(Self {
+            sock,
+            timeout,
+            peer_node_id: None,
+            framing_version: None,
+        })
+    }
+
+    /// Send INIT, await ACK, populate peer_node_id + framing_version.
+    pub async fn handshake(&mut self) -> Result<(), IicpTcpClientError> {
+        let init_payload = encode_cbor(&CborValue::Map(vec![(
+            CborValue::Integer(1.into()),
+            CborValue::Integer((FRAMING_VERSION as i64).into()),
+        )]));
+        let frame = encode_frame(MsgType::Init as u8, &init_payload, 0);
+        self.write_all(&frame).await?;
+        let (mt, payload) = self.read_frame().await?;
+        if mt != MsgType::Ack as u8 {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "expected ACK (0x02), got 0x{mt:02x}"
+            )));
+        }
+        if let Ok(body) = decode_cbor(&payload) {
+            if let Some(v) = cbor_map_get(&body, 1) {
+                if let CborValue::Integer(i) = v {
+                    let n: i128 = i.clone().into();
+                    self.framing_version = Some(n as u8);
+                }
+            }
+            if let Some(v) = cbor_map_get(&body, 2) {
+                self.peer_node_id = cbor_to_str(v);
+            }
+        }
+        Ok(())
+    }
+
+    /// Send PING; return echoed bytes from PONG (or None if not echoed).
+    pub async fn ping(&mut self, echo: Option<&[u8]>) -> Result<Option<Vec<u8>>, IicpTcpClientError> {
+        let body = if let Some(b) = echo {
+            CborValue::Map(vec![(CborValue::Integer(1.into()), CborValue::Bytes(b.to_vec()))])
+        } else {
+            CborValue::Map(vec![])
+        };
+        let frame = encode_frame(MsgType::Ping as u8, &encode_cbor(&body), 0);
+        self.write_all(&frame).await?;
+        let (mt, payload) = self.read_frame().await?;
+        if mt != MsgType::Pong as u8 {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "expected PONG (0x0a), got 0x{mt:02x}"
+            )));
+        }
+        if payload.is_empty() {
+            return Ok(None);
+        }
+        if let Ok(body) = decode_cbor(&payload) {
+            if let Some(v) = cbor_map_get(&body, 1) {
+                return Ok(cbor_to_bytes(v));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Send DISCOVER for `intent`; return the nodes list as CBOR Values.
+    pub async fn discover(&mut self, intent: &str) -> Result<Vec<CborValue>, IicpTcpClientError> {
+        self.discover_with_session(intent, "discover-1").await
+    }
+
+    pub async fn discover_with_session(
+        &mut self,
+        intent: &str,
+        session_id: &str,
+    ) -> Result<Vec<CborValue>, IicpTcpClientError> {
+        let payload = encode_cbor(&CborValue::Map(vec![
+            (CborValue::Integer(2.into()), CborValue::Text(session_id.into())),
+            (CborValue::Integer(3.into()), CborValue::Text(intent.into())),
+        ]));
+        let frame = encode_frame(MsgType::Discover as u8, &payload, 0);
+        self.write_all(&frame).await?;
+        let (mt, body_bytes) = self.read_frame().await?;
+        if mt != MsgType::Response as u8 {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "expected RESPONSE (0x06), got 0x{mt:02x}"
+            )));
+        }
+        let body = decode_cbor(&body_bytes).map_err(IicpTcpClientError::Protocol)?;
+        if let Some(v) = cbor_map_get(&body, 20) {
+            if let CborValue::Array(items) = v {
+                return Ok(items.clone());
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    /// Send CALL with JSON payload; return the CBOR-decoded result as serde_json::Value.
+    /// Returns IicpTcpClientError::Server when the server includes error_code (key 100).
+    pub async fn call(
+        &mut self,
+        intent: &str,
+        payload: serde_json::Value,
+        call_id: Option<&str>,
+    ) -> Result<serde_json::Value, IicpTcpClientError> {
+        self.call_with_session(intent, payload, call_id, "call-1").await
+    }
+
+    pub async fn call_with_session(
+        &mut self,
+        intent: &str,
+        payload: serde_json::Value,
+        call_id: Option<&str>,
+        session_id: &str,
+    ) -> Result<serde_json::Value, IicpTcpClientError> {
+        let payload_bytes = serde_json::to_vec(&payload)
+            .map_err(|e| IicpTcpClientError::Protocol(format!("JSON encode: {e}")))?;
+        let mut entries: Vec<(CborValue, CborValue)> = vec![
+            (CborValue::Integer(2.into()), CborValue::Text(session_id.into())),
+            (CborValue::Integer(3.into()), CborValue::Text(intent.into())),
+            (CborValue::Integer(5.into()), CborValue::Bytes(payload_bytes)),
+        ];
+        if let Some(cid) = call_id {
+            entries.push((CborValue::Integer(15.into()), CborValue::Text(cid.into())));
+        }
+        let frame = encode_frame(MsgType::Call as u8, &encode_cbor(&CborValue::Map(entries)), 0);
+        self.write_all(&frame).await?;
+        let (mt, body_bytes) = self.read_frame().await?;
+        if mt != MsgType::Response as u8 {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "expected RESPONSE (0x06), got 0x{mt:02x}"
+            )));
+        }
+        let body = decode_cbor(&body_bytes).map_err(IicpTcpClientError::Protocol)?;
+        if let Some(v) = cbor_map_get(&body, 100) {
+            if let CborValue::Integer(i) = v {
+                let code: i128 = i.clone().into();
+                let message = cbor_map_get(&body, 101)
+                    .and_then(cbor_to_str)
+                    .unwrap_or_default();
+                return Err(IicpTcpClientError::Server {
+                    code: code as i64,
+                    message,
+                });
+            }
+        }
+        let result_v = cbor_map_get(&body, 5);
+        match result_v {
+            Some(CborValue::Bytes(bytes)) => {
+                // Result body is CBOR-encoded server-side. Decode and convert
+                // to serde_json::Value via roundtrip.
+                let inner = decode_cbor(bytes).map_err(IicpTcpClientError::Protocol)?;
+                Ok(cbor_to_json(&inner))
+            }
+            Some(other) => Ok(cbor_to_json(other)),
+            None => Ok(serde_json::Value::Object(Default::default())),
+        }
+    }
+
+    /// Send CLOSE — server hangs up cleanly. Subsequent RPCs on this client will fail.
+    pub async fn close(&mut self) -> Result<(), IicpTcpClientError> {
+        let frame = encode_frame(MsgType::Close as u8, &[], 0);
+        self.write_all(&frame).await?;
+        Ok(())
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    async fn write_all(&mut self, data: &[u8]) -> Result<(), IicpTcpClientError> {
+        tokio::time::timeout(self.timeout, self.sock.write_all(data))
+            .await
+            .map_err(|_| IicpTcpClientError::Timeout {
+                ms: self.timeout.as_millis() as u64,
+            })??;
+        Ok(())
+    }
+
+    async fn read_frame(&mut self) -> Result<(u8, Vec<u8>), IicpTcpClientError> {
+        let mut head = [0u8; FRAME_HEADER_LEN];
+        tokio::time::timeout(self.timeout, self.sock.read_exact(&mut head))
+            .await
+            .map_err(|_| IicpTcpClientError::Timeout {
+                ms: self.timeout.as_millis() as u64,
+            })??;
+        if &head[0..4] != IICP_MAGIC {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "bad magic in response: {:?}",
+                &head[0..4]
+            )));
+        }
+        let mt = head[5];
+        let payload_len = u32::from_be_bytes(head[8..12].try_into().unwrap()) as usize;
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            tokio::time::timeout(self.timeout, self.sock.read_exact(&mut payload))
+                .await
+                .map_err(|_| IicpTcpClientError::Timeout {
+                    ms: self.timeout.as_millis() as u64,
+                })??;
+        }
+        Ok((mt, payload))
+    }
+}
+
+/// Reverse of json_to_cbor — convert a ciborium Value into serde_json::Value
+/// for ergonomic return types on the client side.
+fn cbor_to_json(v: &CborValue) -> serde_json::Value {
+    match v {
+        CborValue::Null => serde_json::Value::Null,
+        CborValue::Bool(b) => serde_json::Value::Bool(*b),
+        CborValue::Integer(i) => {
+            let n: i128 = i.clone().into();
+            if let Ok(j) = i64::try_from(n) {
+                serde_json::Value::Number(j.into())
+            } else {
+                serde_json::Value::String(n.to_string())
+            }
+        }
+        CborValue::Float(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        CborValue::Text(s) => serde_json::Value::String(s.clone()),
+        CborValue::Bytes(b) => serde_json::Value::String(base64_encode(b)),
+        CborValue::Array(items) => {
+            serde_json::Value::Array(items.iter().map(cbor_to_json).collect())
+        }
+        CborValue::Map(entries) => {
+            let mut obj = serde_json::Map::new();
+            for (k, v) in entries {
+                let key = match k {
+                    CborValue::Text(s) => s.clone(),
+                    CborValue::Integer(i) => {
+                        let n: i128 = i.clone().into();
+                        n.to_string()
+                    }
+                    _ => continue,
+                };
+                obj.insert(key, cbor_to_json(v));
+            }
+            serde_json::Value::Object(obj)
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+/// Minimal base64 encode for byte values in JSON output (avoid adding a base64 dep).
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut chunks = bytes.chunks_exact(3);
+    for chunk in &mut chunks {
+        let v = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+        out.push(ALPHA[(v >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHA[(v >> 12 & 0x3f) as usize] as char);
+        out.push(ALPHA[(v >> 6 & 0x3f) as usize] as char);
+        out.push(ALPHA[(v & 0x3f) as usize] as char);
+    }
+    let rem = chunks.remainder();
+    if !rem.is_empty() {
+        let v = match rem.len() {
+            1 => (rem[0] as u32) << 16,
+            2 => ((rem[0] as u32) << 16) | ((rem[1] as u32) << 8),
+            _ => 0,
+        };
+        out.push(ALPHA[(v >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHA[(v >> 12 & 0x3f) as usize] as char);
+        if rem.len() == 2 {
+            out.push(ALPHA[(v >> 6 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        out.push('=');
+    }
+    out
+}
