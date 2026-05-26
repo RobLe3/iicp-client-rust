@@ -23,6 +23,9 @@ mod http;
 pub mod node;
 mod types;
 
+#[cfg(feature = "iicp-tcp")]
+pub mod iicp_tcp;
+
 pub use client::IicpClient;
 pub use errors::{IicpError, Result};
 pub use http::make_traceparent;
