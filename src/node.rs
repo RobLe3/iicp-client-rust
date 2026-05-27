@@ -67,6 +67,11 @@ pub struct NodeConfig {
     pub nat_type: Option<String>,
     /// Forward-compat slot for ADR-041 transport_candidates[] + relay_endpoint.
     pub transport_metadata: Option<serde_json::Value>,
+    /// S.12 §2.1 CIP policy block surfaced to the directory register payload.
+    /// When `None`, register() falls back to the module-level
+    /// [`crate::cip_policy::get_cip_policy`] — operators can configure once
+    /// and have it apply to all nodes that don't override.
+    pub cip_policy: Option<std::sync::Arc<crate::cip_policy::CooperativeInferencePolicy>>,
 }
 
 impl NodeConfig {
@@ -91,6 +96,7 @@ impl NodeConfig {
             transport_method: None,
             nat_type: None,
             transport_metadata: None,
+            cip_policy: None,
         }
     }
 }
@@ -373,6 +379,17 @@ impl IicpNode {
         }
         if let Some(md) = &self.cfg.transport_metadata {
             payload["transport_metadata"] = md.clone();
+        }
+
+        // S.12 §2.1 CIP-D1 policy block. Use the per-config policy if set,
+        // otherwise fall back to the module-level cip_policy::get_cip_policy().
+        let policy_arc = self
+            .cfg
+            .cip_policy
+            .clone()
+            .unwrap_or_else(crate::cip_policy::get_cip_policy);
+        if let Some(block) = policy_arc.as_register_policy_block() {
+            payload["policy"] = block;
         }
 
         let resp = self
