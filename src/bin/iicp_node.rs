@@ -497,6 +497,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     cfg.region = Some(opts.region.clone());
     cfg.directory_url = opts.directory_url.clone();
     cfg.max_concurrent = opts.max_concurrent;
+    #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
     let mut node = IicpNode::new(cfg);
 
     // ADR-041 / #343 — optional NAT auto-detection prior to register.

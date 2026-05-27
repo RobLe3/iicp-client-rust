@@ -281,7 +281,9 @@ pub struct IicpNode {
     /// directory-issued key.
     runtime_hmac_key: std::sync::RwLock<String>,
     /// #343 — UPnP IPv6 pinhole UID captured by `apply_nat_profile`, revoked
-    /// on shutdown via [`Self::revoke_pinhole`].
+    /// on shutdown via [`Self::revoke_pinhole`]. Only read under the `nat`
+    /// feature; allowed dead_code so non-nat builds compile cleanly.
+    #[allow(dead_code)]
     pinhole_uid: std::sync::RwLock<Option<u32>>,
 }
 
