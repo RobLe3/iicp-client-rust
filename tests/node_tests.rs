@@ -294,7 +294,9 @@ async fn test_node_heartbeat_ok() {
     );
     cfg.directory_url = server.url();
     let node = IicpNode::new(cfg);
-    node.heartbeat("tok-abc123").await.expect("heartbeat should succeed against mock server");
+    node.heartbeat("tok-abc123")
+        .await
+        .expect("heartbeat should succeed against mock server");
 }
 
 /// iter-1413: register payload matches spec/iicp-dir.md §3.1 —
