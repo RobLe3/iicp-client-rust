@@ -21,7 +21,9 @@ use iicp_client::backends::openai_compat::{invoke, OpenAiCompatOptions};
 use iicp_client::node::{IicpNode, NodeConfig};
 
 fn env_or(name: &str, fallback: Option<&str>) -> Option<String> {
-    env::var(name).ok().or_else(|| fallback.map(|s| s.to_string()))
+    env::var(name)
+        .ok()
+        .or_else(|| fallback.map(|s| s.to_string()))
 }
 
 fn env_int(name: &str, fallback: u64) -> u64 {
@@ -164,9 +166,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 Some(t)
             }
             Err(e) => {
-                eprintln!(
-                    "[iicp-node] registration failed: {e} — continuing without heartbeat"
-                );
+                eprintln!("[iicp-node] registration failed: {e} — continuing without heartbeat");
                 None
             }
         }
