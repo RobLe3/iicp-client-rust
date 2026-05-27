@@ -276,8 +276,11 @@ async fn test_node_heartbeat_ok() {
     use mockito::Server;
 
     let mut server = Server::new_async().await;
+    // #346 — heartbeat path is now /v1/heartbeat (NOT /api/v1/heartbeat).
+    // directory_url already carries the /api prefix in production; previous
+    // double-/api/ path caused all heartbeats to 404 in the field.
     let _m = server
-        .mock("POST", "/api/v1/heartbeat")
+        .mock("POST", "/v1/heartbeat")
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(json!({ "status": "ok" }).to_string())

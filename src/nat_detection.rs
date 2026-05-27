@@ -231,23 +231,34 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
                 return profile;
             }
 
-            let public_url = format!("http://{ip}:{}", opts.bind_port);
+            // ADR-041 §3 — advertise the EXTERNAL ports the IGD actually
+            // assigned. With add_any_port fallback the external may differ
+            // from the internal (typical when another LAN host owns 9484).
+            let ext_bind = u
+                .port_mapping
+                .get(&opts.bind_port)
+                .copied()
+                .unwrap_or(opts.bind_port);
+            let public_url = format!("http://{ip}:{ext_bind}");
             let transport_url = match opts.transport_port {
                 Some(tp) if tp != opts.bind_port && u.mapped_ports.contains(&tp) => {
-                    Some(format!("iicp://{ip}:{tp}"))
+                    let ext_tp = u.port_mapping.get(&tp).copied().unwrap_or(tp);
+                    Some(format!("iicp://{ip}:{ext_tp}"))
                 }
                 _ => None,
             };
 
             if let Some(tu) = &transport_url {
+                let tp = opts.transport_port.unwrap();
+                let ext_tp = u.port_mapping.get(&tp).copied().unwrap_or(tp);
                 profile.detection_log.push(format!(
-                    "tier-1: UPnP mapped {} → {public_url} AND {} → {tu} (spec v0.7.0 dual-endpoint)",
-                    opts.bind_port,
-                    opts.transport_port.unwrap()
+                    "tier-1: UPnP mapped {}→{ext_bind} ({public_url}) AND {tp}→{ext_tp} ({tu}) \
+                     (spec v0.7.0 dual-endpoint; add_any_port used if ext≠internal)",
+                    opts.bind_port
                 ));
             } else {
                 profile.detection_log.push(format!(
-                    "tier-1: UPnP mapped {} → {public_url}",
+                    "tier-1: UPnP mapped {}→{ext_bind} ({public_url})",
                     opts.bind_port
                 ));
             }
@@ -301,8 +312,15 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
 pub struct UpnpResult {
     pub success: bool,
     pub external_ip: Option<String>,
+    /// Primary external port — what the IGD actually assigned. May differ
+    /// from the internal port when AddAnyPortMapping was used after a 1:1
+    /// AddPortMapping conflict.
     pub external_port: Option<u16>,
+    /// All internal ports we successfully mapped to SOME external port.
     pub mapped_ports: Vec<u16>,
+    /// internal_port → assigned_external_port (often identity; differs
+    /// when AddAnyPortMapping picked a non-canonical port due to conflict).
+    pub port_mapping: std::collections::HashMap<u16, u16>,
     pub igd_device: Option<String>,
     pub error: Option<String>,
 }
@@ -348,53 +366,92 @@ pub async fn try_upnp_mapping(internal_ports: Vec<u16>, lease_seconds: u32) -> O
     let local_v4 =
         pick_local_ip_for_gateway(gateway.addr.ip()).unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
 
-    let primary_socket = SocketAddr::V4(SocketAddrV4::new(local_v4, primary));
-    if let Err(e) = gateway
-        .add_port(
-            PortMappingProtocol::TCP,
-            primary,
-            primary_socket,
-            lease_seconds,
-            &format!("iicp-client (ADR-041 tier-1) {primary}"),
-        )
-        .await
-    {
-        return Some(UpnpResult {
-            success: false,
-            external_ip,
-            error: Some(format!(
-                "add_port failed for primary port {primary}: {e} (internal={local_v4})"
-            )),
-            igd_device: Some(format!("{:?}", gateway.addr)),
-            ..Default::default()
-        });
+    // Map a single port — try 1:1 first, fall back to add_any_port (IGDv2
+    // §2.5.13) on conflict. Closures inside async are awkward, so this is
+    // inlined per call site to share the imported PortMappingProtocol.
+    async fn map_one(
+        gw: &igd_next::aio::Gateway<igd_next::aio::tokio::Tokio>,
+        internal_port: u16,
+        local_v4: Ipv4Addr,
+        lease_seconds: u32,
+    ) -> Option<u16> {
+        let internal_socket = SocketAddr::V4(SocketAddrV4::new(local_v4, internal_port));
+        let desc = format!("iicp-client (ADR-041 tier-1) {internal_port}");
+        match gw
+            .add_port(
+                PortMappingProtocol::TCP,
+                internal_port,
+                internal_socket,
+                lease_seconds,
+                &desc,
+            )
+            .await
+        {
+            Ok(()) => return Some(internal_port),
+            Err(e) => {
+                tracing::info!(
+                    "UPnP: add_port {internal_port} failed ({e}); retrying via add_any_port"
+                );
+            }
+        }
+        match gw
+            .add_any_port(
+                PortMappingProtocol::TCP,
+                internal_socket,
+                lease_seconds,
+                &desc,
+            )
+            .await
+        {
+            Ok(assigned) => {
+                tracing::info!(
+                    "UPnP: add_any_port assigned external {assigned} for internal {internal_port}"
+                );
+                Some(assigned)
+            }
+            Err(e) => {
+                tracing::warn!("UPnP: add_any_port failed for internal {internal_port}: {e}");
+                None
+            }
+        }
     }
+
+    let mut port_mapping: std::collections::HashMap<u16, u16> = std::collections::HashMap::new();
+
+    let assigned_primary = match map_one(&gateway, primary, local_v4, lease_seconds).await {
+        Some(p) => p,
+        None => {
+            return Some(UpnpResult {
+                success: false,
+                external_ip,
+                error: Some(format!(
+                    "add_port + add_any_port both failed for primary port {primary} (internal={local_v4})"
+                )),
+                igd_device: Some(format!("{:?}", gateway.addr)),
+                ..Default::default()
+            });
+        }
+    };
+    port_mapping.insert(primary, assigned_primary);
 
     let mut mapped = vec![primary];
     for &extra in internal_ports.iter().skip(1) {
-        let extra_socket = SocketAddr::V4(SocketAddrV4::new(local_v4, extra));
-        if gateway
-            .add_port(
-                PortMappingProtocol::TCP,
-                extra,
-                extra_socket,
-                lease_seconds,
-                &format!("iicp-client (ADR-041 tier-1) {extra}"),
-            )
-            .await
-            .is_ok()
-        {
+        if let Some(assigned) = map_one(&gateway, extra, local_v4, lease_seconds).await {
             mapped.push(extra);
+            port_mapping.insert(extra, assigned);
         } else {
-            tracing::warn!("UPnP: failed to map additional port {extra} (primary {primary} ok)");
+            tracing::warn!(
+                "UPnP: failed to map additional port {extra} (primary {primary} → {assigned_primary} ok)"
+            );
         }
     }
 
     Some(UpnpResult {
         success: true,
         external_ip,
-        external_port: Some(primary),
+        external_port: Some(assigned_primary),
         mapped_ports: mapped,
+        port_mapping,
         igd_device: Some(format!("{:?}", gateway.addr)),
         error: None,
     })
@@ -677,6 +734,61 @@ fn list_global_ipv6_addresses() -> Vec<String> {
     found.sort();
     found.dedup();
     found
+}
+
+/// Enumerate local GUAs ranked by AVM-FRITZ AddPinhole acceptance.
+///
+/// On macOS we parse `ifconfig` for the flags ("temporary", "secured",
+/// "deprecated") — same logic as Python/TS. Linux falls back to first-GUA
+/// per interface since `/proc/net/if_inet6` doesn't surface those flags.
+/// Ranking: current-temporary → secured → deprecated/other.
+pub fn ranked_global_ipv6_candidates() -> Vec<String> {
+    if cfg!(target_os = "macos") {
+        if let Ok(out) = std::process::Command::new("ifconfig").output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut current_temp: Vec<String> = Vec::new();
+            let mut secured: Vec<String> = Vec::new();
+            let mut other: Vec<String> = Vec::new();
+            for line in text.lines() {
+                let line = line.trim();
+                if !line.starts_with("inet6 ") {
+                    continue;
+                }
+                let mut parts = line.split_whitespace();
+                let _ = parts.next();
+                let addr = match parts.next() {
+                    Some(a) => a.split('%').next().unwrap_or("").to_string(),
+                    None => continue,
+                };
+                if addr.is_empty() {
+                    continue;
+                }
+                let first_hex = addr.split(':').next().unwrap_or("0");
+                let first = u32::from_str_radix(first_hex, 16).unwrap_or(0);
+                if (first & 0xe000) != 0x2000 {
+                    continue;
+                }
+                let flags: String = parts.collect::<Vec<_>>().join(" ").to_lowercase();
+                if flags.contains("deprecated") {
+                    other.push(addr);
+                } else if flags.contains("secured") {
+                    secured.push(addr);
+                } else if flags.contains("temporary") || flags.contains("autoconf") {
+                    current_temp.push(addr);
+                } else {
+                    other.push(addr);
+                }
+            }
+            let mut combined: Vec<String> = Vec::new();
+            combined.extend(current_temp);
+            combined.extend(secured);
+            combined.extend(other);
+            let mut seen = std::collections::HashSet::new();
+            combined.retain(|a| seen.insert(a.clone()));
+            return combined;
+        }
+    }
+    list_global_ipv6_addresses()
 }
 
 /// Walk `/proc/net/if_inet6` on Linux, fall back to socket-style on macOS via
@@ -1072,6 +1184,113 @@ pub async fn try_upnp_ipv6_pinhole(
         });
     }
     None
+}
+
+/// Tier-0 helper — given a (possibly bracketed-IPv6) public endpoint URL,
+/// open a UPnP firewall pinhole on the matching IGD with ranked-retry
+/// across the host's local GUAs.
+///
+/// Returns the pinhole result + an optional `rewritten_endpoint` when a
+/// different GUA was the one the router accepted (typical FRITZ!Box case
+/// on macOS — RFC 7217 "secured" address is enumerated first but rejected).
+#[derive(Debug, Clone, Default)]
+pub struct PinholeOpenResult {
+    pub pinhole_active: bool,
+    pub pinhole_unique_id: Option<u32>,
+    pub pinhole_lease_seconds: Option<u32>,
+    pub pinhole_inbound_allowed: Option<bool>,
+    pub rewritten_endpoint: Option<String>,
+    pub detection_log: Vec<String>,
+}
+
+pub async fn try_open_v6_pinhole_for_endpoint(endpoint: &str, bind_port: u16) -> PinholeOpenResult {
+    let mut out = PinholeOpenResult::default();
+    // Parse http[s]://[ipv6]:port — bracketed-form only.
+    let scheme;
+    let rest;
+    if let Some(s) = endpoint.strip_prefix("https://") {
+        scheme = "https";
+        rest = s;
+    } else if let Some(s) = endpoint.strip_prefix("http://") {
+        scheme = "http";
+        rest = s;
+    } else {
+        return out;
+    }
+    if !rest.starts_with('[') {
+        return out;
+    }
+    let end_bracket = match rest.find(']') {
+        Some(i) => i,
+        None => return out,
+    };
+    let v6_host = &rest[1..end_bracket];
+    let port_in_url: u16 = rest[end_bracket + 1..]
+        .strip_prefix(':')
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(bind_port);
+
+    // GUA only (2000::/3) — link-local / ULA / multicast skip.
+    let parsed: std::net::Ipv6Addr = match v6_host.parse() {
+        Ok(a) => a,
+        Err(_) => return out,
+    };
+    if (parsed.segments()[0] & 0xe000) != 0x2000 {
+        out.detection_log.push(format!(
+            "v6 pinhole: skip — {v6_host} is not a GUA (2000::/3 required)"
+        ));
+        return out;
+    }
+
+    let mut candidates: Vec<String> = vec![v6_host.to_string()];
+    for c in ranked_global_ipv6_candidates() {
+        if c != v6_host {
+            candidates.push(c);
+        }
+    }
+
+    let mut chosen: Option<(String, PinholeResult)> = None;
+    for cand in &candidates {
+        out.detection_log.push(format!(
+            "v6 pinhole: attempting AddPinhole for [{cand}]:{port_in_url}"
+        ));
+        if let Some(r) = try_upnp_ipv6_pinhole(cand, port_in_url, 3600).await {
+            chosen = Some((cand.clone(), r));
+            break;
+        }
+    }
+
+    let (chosen_addr, r) = match chosen {
+        Some(v) => v,
+        None => {
+            out.detection_log.push(
+                "v6 pinhole: not opened on any local GUA — if your router is a \
+                 FRITZ!Box, enable 'Internet → Filters → IPv6 → Selbständige \
+                 Portfreigaben durch das Gerät erlauben' (or equivalent). \
+                 Error 606 from the IGD = router-side ACL block."
+                    .to_string(),
+            );
+            return out;
+        }
+    };
+
+    out.detection_log.push(format!(
+        "v6 pinhole: AddPinhole OK — uid={} lease={}s on [{chosen_addr}]",
+        r.unique_id, r.lease_seconds
+    ));
+    if chosen_addr != v6_host {
+        let new_ep = format!("{scheme}://[{chosen_addr}]:{port_in_url}");
+        out.detection_log.push(format!(
+            "v6 pinhole: rewriting public_endpoint {endpoint} → {new_ep} \
+             (original v6 rejected by IGD, pinhole opened on different local GUA)"
+        ));
+        out.rewritten_endpoint = Some(new_ep);
+    }
+    out.pinhole_active = true;
+    out.pinhole_unique_id = Some(r.unique_id);
+    out.pinhole_lease_seconds = Some(r.lease_seconds);
+    out.pinhole_inbound_allowed = Some(r.inbound_allowed);
+    out
 }
 
 /// ADR-043 §5 — close a previously-opened IPv6 pinhole. Best-effort.

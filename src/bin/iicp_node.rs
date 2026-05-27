@@ -464,6 +464,19 @@ fn run_list() -> Result<(), String> {
 }
 
 async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
+    // CIP toggle via env var — safe-off default; operators advertise as a
+    // CIP worker by setting IICP_CIP_ALLOW_WORKER=true. Matches the same
+    // env hook in the Python + TypeScript SDKs.
+    if env_bool("IICP_CIP_ALLOW_WORKER") {
+        use iicp_client::cip_policy::{configure_cip_policy, CooperativeInferencePolicyOptions};
+        configure_cip_policy(CooperativeInferencePolicyOptions {
+            enabled: true,
+            allow_worker: true,
+            allow_coordinator: true,
+            ..Default::default()
+        });
+    }
+
     // Load persisted node config if --node was provided.
     if !opts.node.is_empty() {
         match load_node(&opts.node).map_err(|e| e.to_string())? {
@@ -492,13 +505,82 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         opts.public_endpoint = format!("http://localhost:{}", opts.port);
     }
 
+    // ADR-043 §5 / #343 — Tier-0 IPv6 pinhole attempt. Runs unconditionally
+    // when the operator's public_endpoint is bracketed-IPv6 (even without
+    // --auto-detect-nat). Mirrors Python + TS cli paths.
+    #[cfg(feature = "nat")]
+    let tier0_pinhole = if !opts.auto_detect_nat && opts.public_endpoint.contains('[') {
+        let r = iicp_client::nat_detection::try_open_v6_pinhole_for_endpoint(
+            &opts.public_endpoint,
+            opts.port,
+        )
+        .await;
+        for line in &r.detection_log {
+            eprintln!("[iicp-node] v6: {line}");
+        }
+        if let Some(new_ep) = &r.rewritten_endpoint {
+            opts.public_endpoint = new_ep.clone();
+        }
+        Some(r)
+    } else {
+        None
+    };
+    #[cfg(not(feature = "nat"))]
+    let tier0_pinhole: Option<()> = None;
+
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
     cfg.model = Some(opts.model.clone());
     cfg.region = Some(opts.region.clone());
     cfg.directory_url = opts.directory_url.clone();
     cfg.max_concurrent = opts.max_concurrent;
+    // Surface Tier-0 declaration so the directory accepts public_reachable=true
+    // without dial-back. Mirrors the apply_nat_profile path used after
+    // detect_nat — but without running the full v4 UPnP escalation.
+    #[cfg(feature = "nat")]
+    if tier0_pinhole.is_some() && !opts.auto_detect_nat {
+        cfg.transport_method = Some("direct".to_string());
+        cfg.nat_type = Some("unknown".to_string());
+        cfg.transport_metadata = Some(serde_json::json!({
+            "tier": 0,
+            "detection_log_tail": tier0_pinhole
+                .as_ref()
+                .and_then(|p| p.detection_log.last())
+                .cloned(),
+        }));
+    }
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
     let mut node = IicpNode::new(cfg);
+
+    // If a v6 pinhole was opened, register the UID with the node so
+    // graceful shutdown revokes it.
+    #[cfg(feature = "nat")]
+    if let Some(r) = &tier0_pinhole {
+        if r.pinhole_active {
+            // Synthesize a minimal NatProfile so apply_nat_profile picks up
+            // the pinhole UID into IicpNode::pinhole_uid.
+            let mut synth = iicp_client::nat_detection::NatProfile {
+                tier: 0,
+                transport_method: iicp_client::nat_detection::TransportMethod::Direct,
+                public_endpoint: Some(opts.public_endpoint.clone()),
+                transport_endpoint: None,
+                internal_endpoint: None,
+                operator_guidance: None,
+                detection_log: r.detection_log.clone(),
+                ipv6: Some(iicp_client::nat_detection::Ipv6Profile {
+                    pinhole_active: true,
+                    pinhole_unique_id: r.pinhole_unique_id,
+                    pinhole_lease_seconds: r.pinhole_lease_seconds,
+                    pinhole_inbound_allowed: r.pinhole_inbound_allowed,
+                    ..Default::default()
+                }),
+            };
+            // apply_nat_profile expects a full profile; we don't want it to
+            // overwrite transport_method already set above. Patch only the
+            // pinhole UID tracking path.
+            node.apply_nat_profile(&synth);
+            let _ = &mut synth;
+        }
+    }
 
     // ADR-041 / #343 — optional NAT auto-detection prior to register.
     #[cfg(feature = "nat")]
