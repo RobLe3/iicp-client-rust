@@ -23,6 +23,10 @@ path = "examples/quickstart.rs"
 name = "node"
 path = "examples/node.rs"
 
+[[bin]]
+name = "iicp-node"
+path = "src/bin/iicp_node.rs"
+
 [features]
 metrics = ["dep:prometheus"]
 # Native IICP binary transport (port 9484, spec/iicp-framing.md) — opt-in
