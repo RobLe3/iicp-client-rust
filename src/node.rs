@@ -299,6 +299,13 @@ impl IicpNode {
         self.runtime_hmac_key.read().expect("poisoned").clone()
     }
 
+    /// Borrow this node's configuration. Useful for callers (e.g.
+    /// [`crate::conformance::run_conformance_checks`]) that need to inspect
+    /// `directory_url`, `endpoint`, or `node_id` without owning the config.
+    pub fn cfg(&self) -> &NodeConfig {
+        &self.cfg
+    }
+
     /// Populate `endpoint`, `transport_endpoint`, and the NAT observability
     /// fields from a `NatProfile` produced by [`crate::nat_detection::detect_nat`].
     ///
