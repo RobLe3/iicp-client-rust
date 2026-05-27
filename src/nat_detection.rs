@@ -862,7 +862,10 @@ fn list_local_ipv4_addresses() -> Vec<Ipv4Addr> {
     let mut out: Vec<Ipv4Addr> = Vec::new();
 
     #[cfg(target_os = "linux")]
-    if let Ok(o) = std::process::Command::new("ip").args(["-4", "addr"]).output() {
+    if let Ok(o) = std::process::Command::new("ip")
+        .args(["-4", "addr"])
+        .output()
+    {
         let text = String::from_utf8_lossy(&o.stdout);
         for line in text.lines() {
             let line = line.trim();
