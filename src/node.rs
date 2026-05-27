@@ -54,6 +54,19 @@ pub struct NodeConfig {
     /// Default IICP port is 9484 (ADR-040). When set, the directory persists it
     /// and clients SHOULD prefer it over `endpoint` for task CALLs.
     pub transport_endpoint: Option<String>,
+    /// #331 Phase A.1 / ADR-041 — NAT-traversal observability fields surfaced
+    /// to the directory in the register payload. Populated by
+    /// [`IicpNode::apply_nat_profile`] when an operator runs detect_nat at
+    /// startup, OR set manually if the operator already knows their topology.
+    ///
+    /// `transport_method` is one of `direct` / `upnp_mapped` / `stun_hole_punch`
+    /// / `turn_relay` / `external_tunnel` / `unknown`.
+    pub transport_method: Option<String>,
+    /// One of `full_cone` / `restricted_cone` / `port_restricted` / `symmetric`
+    /// / `unknown` (observability only).
+    pub nat_type: Option<String>,
+    /// Forward-compat slot for ADR-041 transport_candidates[] + relay_endpoint.
+    pub transport_metadata: Option<serde_json::Value>,
 }
 
 impl NodeConfig {
@@ -75,6 +88,9 @@ impl NodeConfig {
             tokens_per_min: 10_000,
             max_tokens: 8_192,
             transport_endpoint: None,
+            transport_method: None,
+            nat_type: None,
+            transport_metadata: None,
         }
     }
 }
@@ -256,6 +272,53 @@ impl IicpNode {
         Self { cfg, http }
     }
 
+    /// Populate `endpoint`, `transport_endpoint`, and the NAT observability
+    /// fields from a `NatProfile` produced by [`crate::nat_detection::detect_nat`].
+    ///
+    /// Operators typically call this right after `detect_nat()` and before
+    /// `register()` so the directory receives the discovered public endpoint
+    /// + transport_method/nat_type/transport_metadata in the same payload.
+    ///
+    /// Defensive: tier-4 (unreachable) profiles do NOT overwrite a manually-
+    /// set endpoint, and `transport_method == "unreachable"` is filtered out
+    /// before register.
+    #[cfg(feature = "nat")]
+    pub fn apply_nat_profile(&mut self, profile: &crate::nat_detection::NatProfile) {
+        if profile.is_reachable() {
+            if let Some(pub_ep) = &profile.public_endpoint {
+                self.cfg.endpoint = pub_ep.clone();
+            }
+        }
+        if let Some(tep) = &profile.transport_endpoint {
+            self.cfg.transport_endpoint = Some(tep.clone());
+        }
+        let tm = match profile.transport_method {
+            crate::nat_detection::TransportMethod::Direct => Some("direct"),
+            crate::nat_detection::TransportMethod::UpnpMapped => Some("upnp_mapped"),
+            crate::nat_detection::TransportMethod::StunHolePunch => Some("stun_hole_punch"),
+            crate::nat_detection::TransportMethod::TurnRelay => Some("turn_relay"),
+            crate::nat_detection::TransportMethod::ExternalTunnel => Some("external_tunnel"),
+            crate::nat_detection::TransportMethod::Unreachable => None,
+        };
+        if let Some(name) = tm {
+            self.cfg.transport_method = Some(name.into());
+        }
+        if self.cfg.nat_type.is_none() {
+            self.cfg.nat_type = Some("unknown".into());
+        }
+        let tail: Vec<&str> = profile
+            .detection_log
+            .iter()
+            .rev()
+            .take(1)
+            .map(|s| s.as_str())
+            .collect();
+        self.cfg.transport_metadata = Some(serde_json::json!({
+            "tier": profile.tier,
+            "detection_log_tail": tail,
+        }));
+    }
+
     /// Register with the directory and return the assigned `node_token`.
     ///
     /// Payload conforms to spec/iicp-dir.md §3.1 REGISTER plus the v0.7.0
@@ -299,6 +362,17 @@ impl IicpNode {
         // spec v0.7.0 — native IICP binary endpoint
         if let Some(t) = &self.cfg.transport_endpoint {
             payload["transport_endpoint"] = json!(t);
+        }
+        // #331 / ADR-041 — NAT-traversal observability (set manually or via
+        // apply_nat_profile after detect_nat)
+        if let Some(m) = &self.cfg.transport_method {
+            payload["transport_method"] = json!(m);
+        }
+        if let Some(n) = &self.cfg.nat_type {
+            payload["nat_type"] = json!(n);
+        }
+        if let Some(md) = &self.cfg.transport_metadata {
+            payload["transport_metadata"] = md.clone();
         }
 
         let resp = self

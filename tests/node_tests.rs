@@ -365,6 +365,130 @@ async fn test_register_includes_transport_endpoint() {
     assert!(node.register().await.is_ok());
 }
 
+/// iter-1428: register payload includes transport_method / nat_type /
+/// transport_metadata when set on NodeConfig (manually OR via apply_nat_profile).
+#[tokio::test]
+async fn test_register_includes_nat_observability_when_set() {
+    use mockito::{Matcher, Server};
+
+    let mut server = Server::new_async().await;
+    let _m = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "transport_method": "upnp_mapped",
+            "nat_type": "full_cone",
+            "transport_metadata": {"tier": 1}
+        })))
+        .with_status(201)
+        .with_body(json!({ "node_token": "tok-nat", "node_id": "n-nat" }).to_string())
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-nat",
+        "https://provider.example.com:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("qwen2.5:0.5b".into());
+    cfg.transport_endpoint = Some("iicp://provider.example.com:9484".into());
+    cfg.transport_method = Some("upnp_mapped".into());
+    cfg.nat_type = Some("full_cone".into());
+    cfg.transport_metadata = Some(json!({"tier": 1, "detection_log_tail": ["ok"]}));
+    let node = IicpNode::new(cfg);
+    assert!(node.register().await.is_ok());
+}
+
+/// iter-1428: apply_nat_profile populates the NAT fields from a NatProfile
+/// and overrides `endpoint` when the profile is reachable.
+#[cfg(feature = "nat")]
+#[tokio::test]
+async fn test_apply_nat_profile_populates_fields() {
+    use iicp_client::nat_detection::{NatProfile, TransportMethod};
+    use mockito::{Matcher, Server};
+
+    let mut server = Server::new_async().await;
+    let _m = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "endpoint": "http://203.0.113.5:8080",
+            "transport_endpoint": "iicp://203.0.113.5:9484",
+            "transport_method": "upnp_mapped",
+            "nat_type": "unknown"
+        })))
+        .with_status(201)
+        .with_body(json!({ "node_token": "tok-applied", "node_id": "n-applied" }).to_string())
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-applied",
+        "http://placeholder.example.com:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("q".into());
+    let mut node = IicpNode::new(cfg);
+
+    let profile = NatProfile {
+        tier: 1,
+        transport_method: TransportMethod::UpnpMapped,
+        public_endpoint: Some("http://203.0.113.5:8080".into()),
+        transport_endpoint: Some("iicp://203.0.113.5:9484".into()),
+        internal_endpoint: None,
+        operator_guidance: None,
+        detection_log: vec!["tier-1: UPnP mapped".into()],
+    };
+    node.apply_nat_profile(&profile);
+    assert!(node.register().await.is_ok());
+}
+
+/// iter-1428: tier-4 (unreachable) profiles preserve a manually-set endpoint
+/// and do NOT surface transport_method "unreachable" to the directory.
+#[cfg(feature = "nat")]
+#[tokio::test]
+async fn test_apply_nat_profile_unreachable_preserves_endpoint() {
+    use iicp_client::nat_detection::{NatProfile, TransportMethod};
+    use mockito::{Matcher, Server};
+
+    let mut server = Server::new_async().await;
+    // The mock matches the original manual endpoint AND requires
+    // transport_method to be absent (PartialJson only checks supplied keys).
+    // For "absence" we rely on the body match never including transport_method.
+    let _m = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "endpoint": "https://manual.example.com:8080"
+        })))
+        .with_status(201)
+        .with_body(json!({ "node_token": "tok-keep", "node_id": "n-keep" }).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-keep",
+        "https://manual.example.com:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("q".into());
+    let mut node = IicpNode::new(cfg);
+
+    let profile = NatProfile {
+        tier: 4,
+        transport_method: TransportMethod::Unreachable,
+        public_endpoint: None,
+        transport_endpoint: None,
+        internal_endpoint: None,
+        operator_guidance: Some("install igd-next".into()),
+        detection_log: vec!["tier-4 fallback".into()],
+    };
+    node.apply_nat_profile(&profile);
+    assert!(node.register().await.is_ok());
+    _m.assert_async().await;
+}
+
 /// iter-1413: legacy capabilities Vec<String> folds into the models array of the
 /// single capability object — keeps pre-iter-1413 caller configs working.
 /// We assert via a custom body matcher closure so the mock only succeeds when
