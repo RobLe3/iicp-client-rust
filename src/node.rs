@@ -280,6 +280,9 @@ pub struct IicpNode {
     /// first register() so subsequent re-registrations sign with the
     /// directory-issued key.
     runtime_hmac_key: std::sync::RwLock<String>,
+    /// #343 — UPnP IPv6 pinhole UID captured by `apply_nat_profile`, revoked
+    /// on shutdown via [`Self::revoke_pinhole`].
+    pinhole_uid: std::sync::RwLock<Option<u32>>,
 }
 
 impl IicpNode {
@@ -294,6 +297,7 @@ impl IicpNode {
             cfg,
             http,
             runtime_hmac_key,
+            pinhole_uid: std::sync::RwLock::new(None),
         }
     }
 
@@ -355,6 +359,53 @@ impl IicpNode {
             "tier": profile.tier,
             "detection_log_tail": tail,
         }));
+        // #343 — capture the IPv6 firewall pinhole UID so we can revoke it on shutdown.
+        if let Some(v6) = &profile.ipv6 {
+            if v6.pinhole_active {
+                if let Some(uid) = v6.pinhole_unique_id {
+                    if let Ok(mut slot) = self.pinhole_uid.write() {
+                        *slot = Some(uid);
+                    }
+                }
+            }
+        }
+    }
+
+    /// #343 — close the UPnP IPv6 firewall pinhole if one is tracked. Best-effort.
+    #[cfg(feature = "nat")]
+    pub async fn revoke_pinhole(&self) -> bool {
+        let uid = match self.pinhole_uid.write() {
+            Ok(mut slot) => slot.take(),
+            Err(_) => None,
+        };
+        match uid {
+            Some(uid) => crate::nat_detection::delete_ipv6_pinhole(uid).await,
+            None => false,
+        }
+    }
+
+    /// Tell the directory this node is going away.
+    ///
+    /// Mirrors `iicp_client.IicpNode.deregister` (Python iter-1471) and
+    /// `IicpNode.deregister` (TS iter-1474). Best-effort: shutdown paths
+    /// swallow failures so a flaky directory connection doesn't block exit.
+    pub async fn deregister(&self, node_token: &str) -> Result<()> {
+        let url = format!(
+            "{}/v1/register",
+            self.cfg.directory_url.trim_end_matches('/')
+        );
+        let body = serde_json::json!({
+            "node_id": self.cfg.node_id,
+            "node_token": node_token,
+        });
+        let resp = self.http.delete(&url).json(&body).send().await?;
+        let status = resp.status();
+        if !status.is_success() && status.as_u16() != 404 {
+            return Err(crate::errors::IicpError::Node(format!(
+                "Deregister failed: {status}"
+            )));
+        }
+        Ok(())
     }
 
     /// Register with the directory and return the assigned `node_token`.

@@ -2,22 +2,31 @@
 //!
 //! ```text
 //! cargo install iicp-client
+//! iicp-node init                                # interactive wizard
+//! iicp-node list                                # list saved node configs
+//! iicp-node serve --node <name>                 # serve a persisted node
 //! iicp-node serve --model qwen2.5:0.5b --backend-url http://localhost:11434
 //! ```
 //!
 //! All flags are also accepted as env vars (IICP_BACKEND_URL,
 //! IICP_BACKEND_MODEL, IICP_PUBLIC_ENDPOINT, IICP_DIRECTORY_URL,
 //! IICP_REGION, IICP_MAX_CONCURRENT, IICP_NODE_ID, IICP_INTENT,
-//! IICP_PORT, IICP_HOST, IICP_SKIP_REGISTRATION).
+//! IICP_PORT, IICP_HOST, IICP_SKIP_REGISTRATION, IICP_NODE_NAME,
+//! IICP_AUTO_DETECT_NAT, IICP_EXTERNAL_IP_PROBE_URL).
 //!
 //! Mirrors the Python (`iicp_client.cli`) and TypeScript (`@iicp/client/cli`)
 //! entry points so operators choosing Rust get the same one-liner setup.
 
 use std::env;
+use std::io::{self, BufRead, Write};
 use std::process;
 use std::time::Duration;
 
 use iicp_client::backends::openai_compat::{invoke, OpenAiCompatOptions};
+use iicp_client::identity::{
+    config_dir, generate_node, list_nodes, load_node, load_operator, save_node, save_operator,
+    NodeIdentity, OperatorIdentity,
+};
 use iicp_client::node::{IicpNode, NodeConfig};
 
 fn env_or(name: &str, fallback: Option<&str>) -> Option<String> {
@@ -33,7 +42,15 @@ fn env_int(name: &str, fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
+fn env_bool(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"))
+        .unwrap_or(false)
+}
+
 struct ServeOpts {
+    node: String,
     backend_url: String,
     model: String,
     public_endpoint: String,
@@ -45,30 +62,39 @@ struct ServeOpts {
     port: u16,
     host: String,
     skip_registration: bool,
+    auto_detect_nat: bool,
+    external_ip_probe_url: String,
 }
 
 fn print_help() {
     print!(
-        "usage: iicp-node serve [options]\n\n\
-         Run an IICP provider node backed by an OpenAI-compatible server.\n\n\
-         Required (flag or env):\n\
-         \x20 --backend-url URL         IICP_BACKEND_URL\n\
-         \x20 --model NAME              IICP_BACKEND_MODEL (e.g. qwen2.5:0.5b)\n\n\
-         Optional:\n\
-         \x20 --public-endpoint URL     IICP_PUBLIC_ENDPOINT — externally reachable URL of this node\n\
-         \x20 --directory-url URL       IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
-         \x20 --region REGION           IICP_REGION (default eu-central)\n\
-         \x20 --intent URN              IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
-         \x20 --max-concurrent N        IICP_MAX_CONCURRENT (default 4)\n\
-         \x20 --node-id ID              IICP_NODE_ID (auto-generated if absent)\n\
-         \x20 --port N                  IICP_PORT (default 8020)\n\
-         \x20 --host HOST               IICP_HOST (default 0.0.0.0)\n\
-         \x20 --skip-registration       IICP_SKIP_REGISTRATION — dev mode\n"
+        "usage: iicp-node <command> [options]\n\n\
+         Commands:\n\
+         \x20 init                       Interactive wizard — set up operator + first node\n\
+         \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
+         \x20 serve                      Register and serve a node\n\n\
+         serve required (flag or env):\n\
+         \x20 --backend-url URL          IICP_BACKEND_URL\n\
+         \x20 --model NAME               IICP_BACKEND_MODEL (e.g. qwen2.5:0.5b)\n\
+         \x20 (or --node NAME            load from ~/.iicp/nodes/<NAME>.json after `iicp-node init`)\n\n\
+         serve optional:\n\
+         \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
+         \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 --region REGION            IICP_REGION (default eu-central)\n\
+         \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
+         \x20 --max-concurrent N         IICP_MAX_CONCURRENT (default 4)\n\
+         \x20 --node-id ID               IICP_NODE_ID (auto-generated if absent)\n\
+         \x20 --port N                   IICP_PORT (default 8020)\n\
+         \x20 --host HOST                IICP_HOST (default 0.0.0.0)\n\
+         \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
+         \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
+         \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n"
     );
 }
 
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
     let mut opts = ServeOpts {
+        node: env_or("IICP_NODE_NAME", None).unwrap_or_default(),
         backend_url: env_or("IICP_BACKEND_URL", None).unwrap_or_default(),
         model: env_or("IICP_BACKEND_MODEL", None).unwrap_or_default(),
         public_endpoint: env_or("IICP_PUBLIC_ENDPOINT", None).unwrap_or_default(),
@@ -79,9 +105,9 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         node_id: env_or("IICP_NODE_ID", None).unwrap_or_default(),
         port: env_int("IICP_PORT", 8020) as u16,
         host: env_or("IICP_HOST", Some("0.0.0.0")).unwrap(),
-        skip_registration: env_or("IICP_SKIP_REGISTRATION", Some("false"))
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false),
+        skip_registration: env_bool("IICP_SKIP_REGISTRATION"),
+        auto_detect_nat: env_bool("IICP_AUTO_DETECT_NAT"),
+        external_ip_probe_url: env_or("IICP_EXTERNAL_IP_PROBE_URL", None).unwrap_or_default(),
     };
 
     let mut i = 0;
@@ -93,12 +119,17 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                 opts.skip_registration = true;
                 i += 1;
             }
+            "--auto-detect-nat" => {
+                opts.auto_detect_nat = true;
+                i += 1;
+            }
             _ => {
                 if i + 1 >= args.len() {
                     return Err(format!("flag {arg} needs a value"));
                 }
                 let v = args[i + 1].clone();
                 match arg.as_str() {
+                    "--node" => opts.node = v,
                     "--backend-url" => opts.backend_url = v,
                     "--model" => opts.model = v,
                     "--public-endpoint" => opts.public_endpoint = v,
@@ -112,6 +143,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     "--node-id" => opts.node_id = v,
                     "--port" => opts.port = v.parse().map_err(|e| format!("--port: {e}"))?,
                     "--host" => opts.host = v,
+                    "--external-ip-probe-url" => opts.external_ip_probe_url = v,
                     _ => return Err(format!("unknown flag: {arg}")),
                 }
                 i += 2;
@@ -121,10 +153,333 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
     Ok(opts)
 }
 
+fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
+    if opts.backend_url.is_empty() {
+        opts.backend_url = saved.backend_url.clone();
+    }
+    if opts.model.is_empty() {
+        opts.model = saved.model.clone();
+    }
+    if opts.public_endpoint.is_empty() {
+        opts.public_endpoint = saved.public_endpoint.clone();
+    }
+    if opts.directory_url == "https://iicp.network/api" {
+        opts.directory_url = saved.directory_url.clone();
+    }
+    if opts.region == "eu-central" {
+        opts.region = saved.region.clone();
+    }
+    if opts.intent == "urn:iicp:intent:llm:chat:v1" {
+        opts.intent = saved.intent.clone();
+    }
+    if opts.node_id.is_empty() {
+        opts.node_id = saved.node_id.clone();
+    }
+    if opts.max_concurrent == 4 {
+        opts.max_concurrent = saved.max_concurrent as usize;
+    }
+    if opts.port == 8020 {
+        opts.port = saved.port;
+    }
+    if opts.host == "0.0.0.0" {
+        opts.host = saved.host.clone();
+    }
+    if !opts.auto_detect_nat {
+        opts.auto_detect_nat = saved.auto_detect_nat;
+    }
+    if opts.external_ip_probe_url.is_empty() {
+        opts.external_ip_probe_url = saved.external_ip_probe_url.clone();
+    }
+}
+
+// ── #346 — dependency checker (no auto-install on Rust — cargo would need a rebuild) ─
+
+struct DepIssue {
+    name: String,
+    severity: &'static str, // "ok" | "warn" | "missing"
+    message: String,
+}
+
+async fn check_dependencies(backend_url: &str) -> Vec<DepIssue> {
+    let mut out: Vec<DepIssue> = Vec::new();
+
+    // Backend reachability
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            out.push(DepIssue {
+                name: "backend".into(),
+                severity: "warn",
+                message: "could not build HTTP client".into(),
+            });
+            return out;
+        }
+    };
+    let probe_url = format!("{}/api/tags", backend_url.trim_end_matches('/'));
+    match client.get(&probe_url).send().await {
+        Ok(r) if r.status().is_success() => out.push(DepIssue {
+            name: "backend".into(),
+            severity: "ok",
+            message: format!("reachable at {backend_url}"),
+        }),
+        Ok(r) => out.push(DepIssue {
+            name: "backend".into(),
+            severity: "warn",
+            message: format!("backend HTTP {}", r.status()),
+        }),
+        Err(e) => out.push(DepIssue {
+            name: "backend".into(),
+            severity: "warn",
+            message: format!("{backend_url} unreachable: {e}"),
+        }),
+    }
+
+    // Feature flag advisory — Rust deps are compile-time, so "ok" means "feature compiled in".
+    #[cfg(feature = "nat")]
+    out.push(DepIssue {
+        name: "nat".into(),
+        severity: "ok",
+        message: "feature nat compiled in (UPnP + IPv6 pinhole)".into(),
+    });
+    #[cfg(not(feature = "nat"))]
+    out.push(DepIssue {
+        name: "nat".into(),
+        severity: "missing",
+        message:
+            "feature nat not compiled — rebuild with `cargo install iicp-client --features nat`"
+                .into(),
+    });
+
+    #[cfg(feature = "iicp-tcp")]
+    out.push(DepIssue {
+        name: "iicp-tcp".into(),
+        severity: "ok",
+        message: "feature iicp-tcp compiled in (native TCP transport)".into(),
+    });
+    #[cfg(not(feature = "iicp-tcp"))]
+    out.push(DepIssue {
+        name: "iicp-tcp".into(),
+        severity: "warn",
+        message: "feature iicp-tcp not compiled — rebuild with --features iicp-tcp".into(),
+    });
+
+    #[cfg(feature = "metrics")]
+    out.push(DepIssue {
+        name: "metrics".into(),
+        severity: "ok",
+        message: "feature metrics compiled in (/metrics endpoint)".into(),
+    });
+    #[cfg(not(feature = "metrics"))]
+    out.push(DepIssue {
+        name: "metrics".into(),
+        severity: "warn",
+        message: "feature metrics not compiled — rebuild with --features metrics".into(),
+    });
+
+    // IPv6 routing surface (advisory)
+    #[cfg(feature = "nat")]
+    {
+        let v6 = iicp_client::nat_detection::detect_ipv6(0, Duration::from_millis(1500)).await;
+        if v6.global_v6_available {
+            let mut msg = format!("{} global IPv6 address(es)", v6.addresses.len());
+            if v6.external_v6_reachable {
+                msg.push_str("; outbound v6 reachable");
+            }
+            out.push(DepIssue {
+                name: "ipv6".into(),
+                severity: "ok",
+                message: msg,
+            });
+        } else {
+            out.push(DepIssue {
+                name: "ipv6".into(),
+                severity: "warn",
+                message: "no global IPv6 — direct hosting will require IPv4 + tunnel".into(),
+            });
+        }
+    }
+
+    out
+}
+
+fn print_dep_status(issues: &[DepIssue]) {
+    for i in issues {
+        let glyph = match i.severity {
+            "ok" => "  ✓",
+            "warn" => "  !",
+            "missing" => "  ✗",
+            _ => "  ?",
+        };
+        println!("{glyph} {:<18}  {}", i.name, i.message);
+    }
+}
+
+fn ask(prompt: &str, fallback: &str) -> String {
+    let suffix = if fallback.is_empty() {
+        String::new()
+    } else {
+        format!(" [{fallback}]")
+    };
+    print!("{prompt}{suffix}: ");
+    let _ = io::stdout().flush();
+    let stdin = io::stdin();
+    let line = stdin.lock().lines().next();
+    match line {
+        Some(Ok(s)) => {
+            let t = s.trim();
+            if t.is_empty() {
+                fallback.to_string()
+            } else {
+                t.to_string()
+            }
+        }
+        _ => fallback.to_string(),
+    }
+}
+
+async fn run_init() -> Result<(), String> {
+    println!("iicp-node init — IICP Rust SDK");
+    let dir = config_dir().map_err(|e| e.to_string())?;
+    println!("Config dir: {}", dir.display());
+    println!();
+
+    // Operator
+    let op = match load_operator().map_err(|e| e.to_string())? {
+        Some(existing) => {
+            println!(
+                "Found existing operator: {} (created {})",
+                existing.operator_id, existing.created_at
+            );
+            existing
+        }
+        None => {
+            println!("No operator identity yet — creating one.");
+            let display = ask("Display name (optional)", "");
+            let contact = ask("Contact email or @handle (optional)", "");
+            let op = OperatorIdentity::generate(&display, &contact);
+            let p = save_operator(&op).map_err(|e| e.to_string())?;
+            println!("  ✓ saved {}", p.display());
+            op
+        }
+    };
+    println!();
+
+    // Node
+    let name = ask("Node name (used as filename stem, lowercase)", "default");
+    if let Ok(Some(_)) = load_node(&name) {
+        print!("  ! ~/.iicp/nodes/{name}.json already exists. ");
+        let yn = ask("Overwrite? [y/N]", "n").to_lowercase();
+        if yn != "y" && yn != "yes" {
+            return Ok(());
+        }
+    }
+    let backend = ask(
+        "Backend URL (Ollama / vLLM / LM Studio)",
+        "http://localhost:11434",
+    );
+    let model = ask("Backend model", "qwen2.5:0.5b");
+    let directory = ask("IICP directory URL", "https://iicp.network/api");
+    let region = ask("Region tag", "eu-central");
+    let intent = ask("Intent URN", "urn:iicp:intent:llm:chat:v1");
+    let port_s = ask("Listen port", "8020");
+    let port: u16 = port_s.parse().unwrap_or(8020);
+    let host = ask("Bind host", "0.0.0.0");
+    let public_endpoint = ask("Public endpoint URL (blank = dev mode)", "");
+    let auto_detect_nat = matches!(
+        ask("Auto-detect NAT via UPnP/STUN? [y/N]", "n")
+            .to_lowercase()
+            .as_str(),
+        "y" | "yes"
+    );
+    let external_ip_probe_url = if auto_detect_nat {
+        ask(
+            "External IPv4 probe URL (optional fallback)",
+            "https://api.ipify.org",
+        )
+    } else {
+        String::new()
+    };
+
+    let node = generate_node(
+        &op.operator_id,
+        &name,
+        &backend,
+        &model,
+        &intent,
+        &region,
+        &directory,
+        port,
+        &host,
+        &public_endpoint,
+        auto_detect_nat,
+        &external_ip_probe_url,
+    )
+    .map_err(|e| e.to_string())?;
+    let p = save_node(&node).map_err(|e| e.to_string())?;
+    println!();
+    println!("  ✓ saved {}  (node_id={})", p.display(), node.node_id);
+    println!();
+
+    // Dependency check (#346 parity — Rust prints status; no in-place install)
+    println!("Checking dependencies …");
+    let issues = check_dependencies(&backend).await;
+    print_dep_status(&issues);
+    let missing = issues.iter().any(|i| i.severity == "missing");
+    if missing {
+        println!();
+        println!("  ! some features are not compiled. Rebuild with the right --features set:");
+        println!("    cargo install iicp-client --features \"nat iicp-tcp metrics\"");
+    }
+
+    println!();
+    println!("Documentation:");
+    println!("  Docs:       https://iicp.network/docs/sdk-quickstart-docker");
+    println!("  Reference:  iicp-node --help");
+    println!("  Spec:       https://iicp.network/spec");
+    println!();
+    println!("Run: iicp-node serve --node {name}");
+    Ok(())
+}
+
+fn run_list() -> Result<(), String> {
+    let nodes = list_nodes().map_err(|e| e.to_string())?;
+    if nodes.is_empty() {
+        println!("No saved node configs. Run `iicp-node init` first.");
+        return Ok(());
+    }
+    let dir = config_dir().map_err(|e| e.to_string())?;
+    println!("Saved nodes ({}/nodes):", dir.display());
+    for n in &nodes {
+        let endpoint = if n.public_endpoint.is_empty() {
+            "(dev)".to_string()
+        } else {
+            n.public_endpoint.clone()
+        };
+        println!("  - {:<20}  {:<24}  {}", n.name, n.model, endpoint);
+    }
+    Ok(())
+}
+
 async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
+    // Load persisted node config if --node was provided.
+    if !opts.node.is_empty() {
+        match load_node(&opts.node).map_err(|e| e.to_string())? {
+            Some(saved) => apply_saved_node(&mut opts, &saved),
+            None => {
+                return Err(format!(
+                    "no saved config at ~/.iicp/nodes/{}.json. Run `iicp-node init` first.",
+                    opts.node
+                ));
+            }
+        }
+    }
+
     if opts.backend_url.is_empty() || opts.model.is_empty() {
         return Err(
-            "--backend-url and --model are required (or IICP_BACKEND_URL / IICP_BACKEND_MODEL)"
+            "--backend-url and --model are required (or IICP_BACKEND_URL / IICP_BACKEND_MODEL, or --node NAME)"
                 .into(),
         );
     }
@@ -142,7 +497,41 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     cfg.region = Some(opts.region.clone());
     cfg.directory_url = opts.directory_url.clone();
     cfg.max_concurrent = opts.max_concurrent;
-    let node = IicpNode::new(cfg);
+    let mut node = IicpNode::new(cfg);
+
+    // ADR-041 / #343 — optional NAT auto-detection prior to register.
+    #[cfg(feature = "nat")]
+    if opts.auto_detect_nat {
+        let detect_opts = iicp_client::nat_detection::DetectNatOptions {
+            bind_host: opts.host.clone(),
+            bind_port: opts.port,
+            operator_public_endpoint: if opts.public_endpoint.is_empty() {
+                None
+            } else {
+                Some(opts.public_endpoint.clone())
+            },
+            external_ip_probe_url: if opts.external_ip_probe_url.is_empty() {
+                None
+            } else {
+                Some(opts.external_ip_probe_url.clone())
+            },
+            ..Default::default()
+        };
+        let profile = iicp_client::nat_detection::detect_nat(detect_opts).await;
+        let v6_pin = profile
+            .ipv6
+            .as_ref()
+            .map(|v| v.pinhole_active)
+            .unwrap_or(false);
+        eprintln!(
+            "[iicp-node] NAT auto-detect: tier={} method={:?} public={} ipv6_pinhole={}",
+            profile.tier,
+            profile.transport_method,
+            profile.public_endpoint.as_deref().unwrap_or("<none>"),
+            v6_pin
+        );
+        node.apply_nat_profile(&profile);
+    }
 
     let backend_url = opts.backend_url.clone();
     let model = opts.model.clone();
@@ -178,17 +567,35 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     );
 
     let opts_handler = openai_opts.clone();
-    node.serve(
-        move |req| {
-            let opts_handler = opts_handler.clone();
-            async move { Ok(invoke(&opts_handler, &req.intent, &req.payload).await) }
-        },
-        &format!("{}:{}", opts.host, opts.port),
-        token,
-    )
-    .await
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    let bind = format!("{}:{}", opts.host, opts.port);
+    let token_for_serve = token.clone();
+    let serve_result = tokio::select! {
+        r = node.serve(
+            move |req| {
+                let opts_handler = opts_handler.clone();
+                async move { Ok(invoke(&opts_handler, &req.intent, &req.payload).await) }
+            },
+            &bind,
+            token_for_serve,
+        ) => r.map_err(|e| e.to_string()),
+        _ = tokio::signal::ctrl_c() => {
+            eprintln!("[iicp-node] SIGINT received — shutting down");
+            Ok(())
+        }
+    };
+
+    // #343 — revoke pinhole + deregister on the way out, best-effort.
+    #[cfg(feature = "nat")]
+    {
+        let _ = node.revoke_pinhole().await;
+    }
+    if let Some(t) = &token {
+        if let Err(e) = node.deregister(t).await {
+            eprintln!("[iicp-node] deregister failed: {e}");
+        }
+    }
+
+    serve_result
 }
 
 #[tokio::main]
@@ -198,8 +605,23 @@ async fn main() {
         print_help();
         process::exit(if args.len() < 2 { 2 } else { 0 });
     }
-    if args[1] != "serve" {
-        eprintln!("unknown command: {}", args[1]);
+    let cmd = &args[1];
+    if cmd == "init" {
+        if let Err(e) = run_init().await {
+            eprintln!("ERROR: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if cmd == "list" {
+        if let Err(e) = run_list() {
+            eprintln!("ERROR: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if cmd != "serve" {
+        eprintln!("unknown command: {cmd}");
         print_help();
         process::exit(2);
     }

@@ -25,7 +25,7 @@ use tokio::net::lookup_host;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
-/// ADR-043 §4 — IPv6 qualification result (#342).
+/// ADR-043 §4 — IPv6 qualification result (#342, #343).
 #[derive(Debug, Clone, Default)]
 pub struct Ipv6Profile {
     pub global_v6_available: bool,
@@ -35,6 +35,14 @@ pub struct Ipv6Profile {
     pub listener_v6_ok: bool,
     /// Outbound v6 connectivity test result (does NOT prove inbound).
     pub external_v6_reachable: bool,
+    /// ADR-043 §5 — true iff router accepted WANIPv6FirewallControl::AddPinhole.
+    pub pinhole_active: bool,
+    /// UPnP UniqueID returned by AddPinhole — pass to delete_ipv6_pinhole on shutdown.
+    pub pinhole_unique_id: Option<u32>,
+    /// Granted lease (seconds). 0 = permanent / refresh required by spec.
+    pub pinhole_lease_seconds: Option<u32>,
+    /// Echoes GetFirewallStatus::InboundPinholeAllowed.
+    pub pinhole_inbound_allowed: Option<bool>,
     pub error: Option<String>,
 }
 
@@ -208,7 +216,7 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
                 profile.detection_log.push(format!("tier-1: {warning}"));
                 // ADR-043 §10 — CGNAT IPv4 unreachable, advertise IPv6 GUA if usable.
                 if let Some(v6_profile) =
-                    try_ipv6_fallback(&profile, opts.bind_port, opts.transport_port)
+                    try_ipv6_fallback(&profile, opts.bind_port, opts.transport_port).await
                 {
                     return v6_profile;
                 }
@@ -271,7 +279,8 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
     }
 
     // ADR-043 §10 — IPv6 fallback when no v4 path is usable.
-    if let Some(v6_profile) = try_ipv6_fallback(&profile, opts.bind_port, opts.transport_port) {
+    if let Some(v6_profile) = try_ipv6_fallback(&profile, opts.bind_port, opts.transport_port).await
+    {
         return v6_profile;
     }
 
@@ -757,7 +766,7 @@ async fn probe_outbound_ipv6(timeout: Duration) -> bool {
 }
 
 /// ADR-043 §10 — advertise IPv6 GUA when the IPv4 path can't expose this node.
-fn try_ipv6_fallback(
+async fn try_ipv6_fallback(
     profile: &NatProfile,
     bind_port: u16,
     transport_port: Option<u16>,
@@ -766,7 +775,7 @@ fn try_ipv6_fallback(
     if !v6.global_v6_available || !v6.external_v6_reachable {
         return None;
     }
-    let v6_addr = v6.addresses.first()?;
+    let v6_addr = v6.addresses.first()?.clone();
     let public_url = format!("http://[{v6_addr}]:{bind_port}");
     let transport_url = match transport_port {
         Some(tp) if tp != bind_port => Some(format!("iicp://[{v6_addr}]:{tp}")),
@@ -775,20 +784,320 @@ fn try_ipv6_fallback(
     let mut detection_log = profile.detection_log.clone();
     detection_log.push(format!(
         "tier-1-ipv6: advertising {public_url} (verified outbound v6; \
-         router firewall pinhole still required — covered by #343)"
+         attempting UPnP IGDv2 pinhole — #343)"
     ));
+
+    // ADR-043 §5 / #343 — attempt UPnP IPv6 firewall pinhole.
+    let mut updated_v6 = v6.clone();
+    match try_upnp_ipv6_pinhole(&v6_addr, bind_port, 3600).await {
+        Some(pin) => {
+            updated_v6.pinhole_active = true;
+            updated_v6.pinhole_unique_id = Some(pin.unique_id);
+            updated_v6.pinhole_lease_seconds = Some(pin.lease_seconds);
+            updated_v6.pinhole_inbound_allowed = Some(pin.inbound_allowed);
+            detection_log.push(format!(
+                "tier-1-ipv6: AddPinhole OK — uid={} lease={}s",
+                pin.unique_id, pin.lease_seconds
+            ));
+        }
+        None => {
+            updated_v6.pinhole_active = false;
+            detection_log.push(format!(
+                "tier-1-ipv6: AddPinhole declined or no WANIPv6FirewallControl IGD found — \
+                 operator must open inbound TCP/{bind_port} manually"
+            ));
+        }
+    }
+
+    let pinhole_note = if updated_v6.pinhole_active {
+        format!(
+            "UPnP IPv6 pinhole opened (uid={}). ",
+            updated_v6.pinhole_unique_id.unwrap_or(0)
+        )
+    } else {
+        "Router firewall pinhole not opened — manual rule may be required. ".to_string()
+    };
+
     let mut result = NatProfile::new(1, TransportMethod::Direct);
     result.public_endpoint = Some(public_url);
     result.transport_endpoint = transport_url;
     result.internal_endpoint = profile.internal_endpoint.clone();
     result.detection_log = detection_log;
-    result.ipv6 = profile.ipv6.clone();
+    result.ipv6 = Some(updated_v6);
     result.operator_guidance = Some(format!(
         "Advertising IPv6 GUA {v6_addr}. Inbound IPv4 isn't available (no UPnP \
-         success / CGNAT), but your IPv6 surface is routable. For external \
-         clients to reach this node over IPv6, ensure your router's firewall \
-         allows inbound TCP on port {bind_port} → {v6_addr}. The directory will \
-         Layer-2 dial-back to verify."
+         success / CGNAT), but your IPv6 surface is routable. {pinhole_note}\
+         The directory will Layer-2 dial-back to verify."
     ));
     Some(result)
+}
+
+// ── #343 / ADR-043 §5 — UPnP IPv6 firewall pinhole (SSDP + SOAP) ───────────
+
+/// Result returned by [`try_upnp_ipv6_pinhole`] on success.
+#[derive(Debug, Clone)]
+pub struct PinholeResult {
+    pub unique_id: u32,
+    pub lease_seconds: u32,
+    pub inbound_allowed: bool,
+}
+
+struct SsdpHit {
+    location: String,
+}
+
+async fn ssdp_discover(service_type: &str, timeout: Duration) -> Vec<SsdpHit> {
+    use tokio::net::UdpSocket;
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let _ = sock.set_broadcast(true);
+    let msg = format!(
+        "M-SEARCH * HTTP/1.1\r\n\
+         HOST: 239.255.255.250:1900\r\n\
+         MAN: \"ssdp:discover\"\r\n\
+         MX: 2\r\n\
+         ST: {service_type}\r\n\r\n"
+    );
+    if sock
+        .send_to(msg.as_bytes(), "239.255.255.250:1900")
+        .await
+        .is_err()
+    {
+        return Vec::new();
+    }
+    let mut hits: Vec<SsdpHit> = Vec::new();
+    let mut buf = vec![0u8; 4096];
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let recv = tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await;
+        match recv {
+            Ok(Ok((n, _))) => {
+                let text = String::from_utf8_lossy(&buf[..n]);
+                if let Some(loc) = text.lines().find_map(|l| {
+                    let l = l.trim();
+                    let lower = l.to_ascii_lowercase();
+                    lower
+                        .strip_prefix("location:")
+                        .map(|rest| l[l.len() - rest.trim().len()..].trim().to_string())
+                }) {
+                    hits.push(SsdpHit { location: loc });
+                }
+            }
+            _ => break,
+        }
+    }
+    hits
+}
+
+struct FirewallService {
+    control_url: String,
+    service_type: String,
+}
+
+async fn fetch_firewall_service(device_url: &str, timeout: Duration) -> Option<FirewallService> {
+    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+    let resp = client.get(device_url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let xml = resp.text().await.ok()?;
+
+    let base_url = reqwest::Url::parse(device_url).ok()?;
+    let mut services: Vec<(String, String)> = Vec::new();
+    let mut rest = xml.as_str();
+    while let Some(start) = rest.find("<service>") {
+        let after = &rest[start + "<service>".len()..];
+        let end = match after.find("</service>") {
+            Some(e) => e,
+            None => break,
+        };
+        let block = &after[..end];
+        let stype = extract_xml_tag(block, "serviceType");
+        let ctrl = extract_xml_tag(block, "controlURL");
+        if let (Some(t), Some(c)) = (stype, ctrl) {
+            services.push((t, c));
+        }
+        rest = &after[end + "</service>".len()..];
+    }
+    let (svc_type, ctrl) = services
+        .into_iter()
+        .find(|(t, _)| t.contains("WANIPv6FirewallControl"))?;
+    let control_url = if ctrl.starts_with("http://") || ctrl.starts_with("https://") {
+        ctrl
+    } else {
+        base_url.join(&ctrl).ok()?.to_string()
+    };
+    Some(FirewallService {
+        control_url,
+        service_type: svc_type,
+    })
+}
+
+fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let s = block.find(&open)? + open.len();
+    let e = block[s..].find(&close)? + s;
+    Some(block[s..e].trim().to_string())
+}
+
+async fn soap_call(
+    control_url: &str,
+    service_type: &str,
+    action: &str,
+    args: &[(&str, String)],
+    timeout: Duration,
+) -> Option<std::collections::HashMap<String, String>> {
+    let arg_xml: String = args
+        .iter()
+        .map(|(k, v)| format!("<{k}>{v}</{k}>"))
+        .collect();
+    let body = format!(
+        "<?xml version=\"1.0\"?>\n\
+         <s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" \
+         s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">\
+         <s:Body><u:{action} xmlns:u=\"{service_type}\">{arg_xml}</u:{action}></s:Body>\
+         </s:Envelope>"
+    );
+    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+    let resp = client
+        .post(control_url)
+        .header("Content-Type", "text/xml; charset=\"utf-8\"")
+        .header("SOAPACTION", format!("\"{service_type}#{action}\""))
+        .body(body)
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let text = resp.text().await.ok()?;
+    let mut out = std::collections::HashMap::new();
+    // Crude tag extractor — matches <NAME>VALUE</NAME>; skip envelope wrappers.
+    let mut rest = text.as_str();
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let tag_end = after.find('>')?;
+        let tag_name = &after[..tag_end];
+        if tag_name.starts_with('/') || tag_name.contains(':') || tag_name.is_empty() {
+            rest = &after[tag_end + 1..];
+            continue;
+        }
+        let close = format!("</{tag_name}>");
+        let content_start = start + 1 + tag_end + 1;
+        let value_end_rel = rest[content_start..].find(&close);
+        match value_end_rel {
+            Some(rel) => {
+                let value = &rest[content_start..content_start + rel];
+                if !value.contains('<') {
+                    out.insert(tag_name.to_string(), value.trim().to_string());
+                }
+                rest = &rest[content_start + rel + close.len()..];
+            }
+            None => break,
+        }
+    }
+    Some(out)
+}
+
+/// ADR-043 §5 (#343) — open an inbound IPv6 firewall pinhole on the IGD.
+///
+/// Returns `Some(PinholeResult)` on success, `None` when:
+///   - no IGD with WANIPv6FirewallControl is discovered
+///   - GetFirewallStatus reports InboundPinholeAllowed=false
+///   - AddPinhole errored
+///
+/// Operators close the pinhole on shutdown via [`delete_ipv6_pinhole`].
+pub async fn try_upnp_ipv6_pinhole(
+    internal_v6: &str,
+    internal_port: u16,
+    lease_seconds: u32,
+) -> Option<PinholeResult> {
+    let timeout = Duration::from_secs(5);
+    let hits = ssdp_discover(
+        "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1",
+        timeout,
+    )
+    .await;
+    for hit in hits {
+        let svc = match fetch_firewall_service(&hit.location, timeout).await {
+            Some(s) => s,
+            None => continue,
+        };
+        let status = soap_call(
+            &svc.control_url,
+            &svc.service_type,
+            "GetFirewallStatus",
+            &[],
+            timeout,
+        )
+        .await;
+        let inbound_allowed = status
+            .as_ref()
+            .and_then(|m| m.get("InboundPinholeAllowed"))
+            .map(|s| s == "1")
+            .unwrap_or(false);
+        if !inbound_allowed {
+            return None;
+        }
+        let result = soap_call(
+            &svc.control_url,
+            &svc.service_type,
+            "AddPinhole",
+            &[
+                ("RemoteHost", String::new()),
+                ("RemotePort", "0".to_string()),
+                ("InternalClient", internal_v6.to_string()),
+                ("InternalPort", internal_port.to_string()),
+                ("Protocol", "6".to_string()), // TCP
+                ("LeaseTime", lease_seconds.to_string()),
+            ],
+            timeout,
+        )
+        .await?;
+        let uid: u32 = result
+            .get("UniqueID")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        return Some(PinholeResult {
+            unique_id: uid,
+            lease_seconds,
+            inbound_allowed: true,
+        });
+    }
+    None
+}
+
+/// ADR-043 §5 — close a previously-opened IPv6 pinhole. Best-effort.
+pub async fn delete_ipv6_pinhole(unique_id: u32) -> bool {
+    let timeout = Duration::from_secs(5);
+    let hits = ssdp_discover(
+        "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1",
+        timeout,
+    )
+    .await;
+    for hit in hits {
+        let svc = match fetch_firewall_service(&hit.location, timeout).await {
+            Some(s) => s,
+            None => continue,
+        };
+        let result = soap_call(
+            &svc.control_url,
+            &svc.service_type,
+            "DeletePinhole",
+            &[("UniqueID", unique_id.to_string())],
+            timeout,
+        )
+        .await;
+        if result.is_some() {
+            return true;
+        }
+    }
+    false
 }
