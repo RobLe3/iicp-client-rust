@@ -273,30 +273,30 @@ async fn test_node_register_no_token_fails() {
 
 #[tokio::test]
 async fn test_node_heartbeat_ok() {
-    use mockito::Server;
+    // #346 — heartbeat path is /v1/heartbeat (NOT /api/v1/heartbeat).
+    // Uses a real axum listener instead of mockito: mockito's async server
+    // returns 501 on Linux CI for requests that include an Authorization
+    // header (bearer_auth), making the heartbeat test unreliable in CI.
+    use axum::{routing::post, Json, Router};
 
-    let mut server = Server::new_async().await;
-    // #346 — heartbeat path is now /v1/heartbeat (NOT /api/v1/heartbeat).
-    // directory_url already carries the /api prefix in production; previous
-    // double-/api/ path caused all heartbeats to 404 in the field.
-    let _m = server
-        .mock("POST", "/v1/heartbeat")
-        .with_status(200)
-        .with_header("content-type", "application/json")
-        .with_body(json!({ "status": "ok" }).to_string())
-        .create_async()
-        .await;
+    let app = Router::new().route(
+        "/v1/heartbeat",
+        post(|| async { Json(json!({ "status": "ok" })) }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let mut cfg = NodeConfig::new(
         "n-001",
         "https://my-host.example.com",
         "urn:iicp:intent:llm:chat:v1",
     );
-    cfg.directory_url = server.url();
+    cfg.directory_url = format!("http://{addr}");
     let node = IicpNode::new(cfg);
     node.heartbeat("tok-abc123")
         .await
-        .expect("heartbeat should succeed against mock server");
+        .expect("heartbeat should succeed against local axum server");
 }
 
 /// iter-1413: register payload matches spec/iicp-dir.md §3.1 —
