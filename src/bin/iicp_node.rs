@@ -526,7 +526,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         None
     };
     #[cfg(not(feature = "nat"))]
-    let tier0_pinhole: Option<()> = None;
+    let _tier0_pinhole: Option<()> = None;
 
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
     cfg.model = Some(opts.model.clone());
