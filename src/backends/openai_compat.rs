@@ -80,9 +80,7 @@ pub const SUPPORTED_INTENTS: &[&str] = &[
 /// is either `{"result": <upstream JSON>}` on success or
 /// `{"error_code": int, "error_message": str}` on failure.
 #[cfg(feature = "iicp-tcp")]
-pub fn openai_compat_handler(
-    opts: OpenAiCompatOptions,
-) -> crate::iicp_tcp::TcpTaskHandler {
+pub fn openai_compat_handler(opts: OpenAiCompatOptions) -> crate::iicp_tcp::TcpTaskHandler {
     let opts = Arc::new(opts);
     Arc::new(move |task| {
         let opts = Arc::clone(&opts);
@@ -93,11 +91,7 @@ pub fn openai_compat_handler(
 /// Stand-alone async function form. Useful for HTTP-only deployments that
 /// don't enable the `iicp-tcp` feature but still want to plug this handler
 /// into their own task pipeline.
-pub async fn invoke(
-    opts: &OpenAiCompatOptions,
-    intent: &str,
-    payload: &Value,
-) -> Value {
+pub async fn invoke(opts: &OpenAiCompatOptions, intent: &str, payload: &Value) -> Value {
     let task = crate::backends::openai_compat::Task {
         task_id: String::new(),
         intent: intent.to_string(),
@@ -165,7 +159,12 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
             body.insert("model".into(), json!(m));
         }
     }
-    if body.get("model").and_then(Value::as_str).unwrap_or("").is_empty() {
+    if body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .is_empty()
+    {
         return json!({
             "error_code": 400,
             "error_message": "openai_compat: no model — either pass `model` to OpenAiCompatOptions \

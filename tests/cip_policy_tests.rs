@@ -103,6 +103,9 @@ fn test_slot_acquire_and_release() {
 
 // ── Register payload integration ───────────────────────────────────────────
 
+// Test serialization mutex is intentionally held across awaits — these
+// integration tests share global policy state and must not interleave.
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn test_cip_disabled_emits_no_policy_block() {
     let _guard = GLOBAL_POLICY_TEST_LOCK.lock().unwrap();
@@ -164,6 +167,7 @@ async fn test_cip_worker_enabled_emits_allow_remote_inference() {
     assert!(node.register().await.is_ok());
 }
 
+#[allow(clippy::await_holding_lock)]
 #[tokio::test]
 async fn test_module_level_policy_used_when_node_config_unset() {
     let _guard = GLOBAL_POLICY_TEST_LOCK.lock().unwrap();

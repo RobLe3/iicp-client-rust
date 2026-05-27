@@ -161,7 +161,11 @@ fn parse_host_port(endpoint: &str) -> (String, u16) {
         let port = port_str.parse::<u16>().unwrap_or(443);
         (host.to_string(), port)
     } else {
-        let port = if endpoint.starts_with("https://") { 443 } else { 80 };
+        let port = if endpoint.starts_with("https://") {
+            443
+        } else {
+            80
+        };
         (authority.to_string(), port)
     }
 }
@@ -339,10 +343,7 @@ async fn check_discover_self(node_id: &str, directory_url: &str) -> ProbeResult 
         ProbeResult {
             test_id: "CONF-DISC-01".into(),
             passed: false,
-            message: format!(
-                "node_id absent from NODELIST (got {} nodes)",
-                nodes.len()
-            ),
+            message: format!("node_id absent from NODELIST (got {} nodes)", nodes.len()),
             latency_ms: Some(latency_ms),
         }
     }

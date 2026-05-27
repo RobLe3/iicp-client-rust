@@ -55,7 +55,8 @@ impl Default for PricingConfig {
 
 /// HMAC-SHA256 hex digest. Matches PHP's `hash_hmac('sha256', $body, $key)`.
 pub fn sign_body(body: &[u8], secret: &str) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("hmac accepts any key length");
     mac.update(body);
     hex_encode(&mac.finalize().into_bytes())
 }
@@ -101,10 +102,7 @@ pub fn php_canonical_sign_body(credit_cost_multiplier: f64, pricing_model: &str)
     };
     // pricing_model: JSON-escape via serde so weird chars don't break the body.
     let model_json = serde_json::to_string(pricing_model).unwrap_or_else(|_| "\"\"".into());
-    format!(
-        "{{\"credit_cost_multiplier\":{num},\"pricing_model\":{model_json}}}"
-    )
-    .into_bytes()
+    format!("{{\"credit_cost_multiplier\":{num},\"pricing_model\":{model_json}}}").into_bytes()
 }
 
 /// Build the `pricing` sub-object the directory accepts in /v1/register.

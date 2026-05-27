@@ -14,7 +14,11 @@ use iicp_client::node::{IicpNode, NodeConfig};
 /// Tiny synchronous HTTP server that returns a configurable JSON body for
 /// /iicp/health. Spawns once per test and shuts down via a flag.
 struct LocalHealth {
+    // Held by the spawned listener thread (via clones); the test fixture
+    // itself never reads them back after `new()` — clippy flags them dead.
+    #[allow(dead_code)]
     body: Arc<Mutex<String>>,
+    #[allow(dead_code)]
     status: Arc<Mutex<u16>>,
     stop: Arc<Mutex<bool>>,
     port: u16,
@@ -103,7 +107,11 @@ async fn test_reg01_passes_with_node_id_and_token() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, Some("tok")).await;
-    let reg = report.tests.iter().find(|t| t.test_id == "CONF-REG-01").unwrap();
+    let reg = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-REG-01")
+        .unwrap();
     assert!(reg.passed, "{}", reg.message);
     assert!(reg.message.contains("Registered"));
 }
@@ -127,7 +135,11 @@ async fn test_reg01_passes_with_node_id_only_when_token_not_tracked() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let reg = report.tests.iter().find(|t| t.test_id == "CONF-REG-01").unwrap();
+    let reg = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-REG-01")
+        .unwrap();
     assert!(reg.passed);
     assert!(reg.message.contains("not tracked"));
 }
@@ -142,7 +154,11 @@ async fn test_reg01_fails_when_node_id_empty() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let reg = report.tests.iter().find(|t| t.test_id == "CONF-REG-01").unwrap();
+    let reg = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-REG-01")
+        .unwrap();
     assert!(!reg.passed);
 }
 
@@ -167,7 +183,11 @@ async fn test_health01_passes_with_complete_schema() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let h = report.tests.iter().find(|t| t.test_id == "CONF-HEALTH-01").unwrap();
+    let h = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-HEALTH-01")
+        .unwrap();
     assert!(h.passed, "{}", h.message);
 }
 
@@ -191,7 +211,11 @@ async fn test_health01_fails_when_required_field_missing() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let h = report.tests.iter().find(|t| t.test_id == "CONF-HEALTH-01").unwrap();
+    let h = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-HEALTH-01")
+        .unwrap();
     assert!(!h.passed);
     assert!(h.message.contains("models"));
 }
@@ -204,11 +228,15 @@ async fn test_reach01_skips_for_non_routable_endpoint() {
     let health = LocalHealth::new(r#"{"status":"ok"}"#, 200);
     let node = make_node(
         "n-test",
-        "http://localhost:8080",  // non-routable
+        "http://localhost:8080", // non-routable
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let reach = report.tests.iter().find(|t| t.test_id == "CONF-REACH-01").unwrap();
+    let reach = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-REACH-01")
+        .unwrap();
     assert!(!reach.passed);
     assert!(reach.message.contains("non-routable"));
 }
@@ -235,7 +263,11 @@ async fn test_reach01_passes_when_directory_reports_reachable() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let reach = report.tests.iter().find(|t| t.test_id == "CONF-REACH-01").unwrap();
+    let reach = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-REACH-01")
+        .unwrap();
     assert!(reach.passed, "{}", reach.message);
 }
 
@@ -261,7 +293,11 @@ async fn test_reach01_fails_when_directory_reports_unreachable() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let reach = report.tests.iter().find(|t| t.test_id == "CONF-REACH-01").unwrap();
+    let reach = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-REACH-01")
+        .unwrap();
     assert!(!reach.passed);
     assert!(reach.message.contains("timeout"));
 }
@@ -290,7 +326,11 @@ async fn test_disc01_passes_when_node_id_in_nodelist() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let disc = report.tests.iter().find(|t| t.test_id == "CONF-DISC-01").unwrap();
+    let disc = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-DISC-01")
+        .unwrap();
     assert!(disc.passed, "{}", disc.message);
     assert!(disc.message.contains("Found"));
 }
@@ -317,7 +357,11 @@ async fn test_disc01_fails_when_node_id_absent() {
         &format!("{}/api", server.url()),
     );
     let report = run_conformance_checks(&node, health.port, None).await;
-    let disc = report.tests.iter().find(|t| t.test_id == "CONF-DISC-01").unwrap();
+    let disc = report
+        .tests
+        .iter()
+        .find(|t| t.test_id == "CONF-DISC-01")
+        .unwrap();
     assert!(!disc.passed);
     assert!(disc.message.contains("absent"));
 }
@@ -330,7 +374,7 @@ async fn test_orchestrator_counts_pass_and_fail() {
     let _ = server
         .mock("GET", mockito::Matcher::Regex("/api/v1/probe.*".into()))
         .with_status(200)
-        .with_body(r#"{"reachable":false,"error":"timeout"}"#)  // FAIL
+        .with_body(r#"{"reachable":false,"error":"timeout"}"#) // FAIL
         .create_async()
         .await;
     let _ = server

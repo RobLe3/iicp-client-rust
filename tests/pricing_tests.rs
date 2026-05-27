@@ -127,11 +127,7 @@ async fn test_register_without_pricing_emits_no_block() {
         .create_async()
         .await;
 
-    let mut cfg = NodeConfig::new(
-        "n",
-        "https://provider:8080",
-        "urn:iicp:intent:llm:chat:v1",
-    );
+    let mut cfg = NodeConfig::new("n", "https://provider:8080", "urn:iicp:intent:llm:chat:v1");
     cfg.directory_url = server.url();
     cfg.model = Some("q".into());
     let node = IicpNode::new(cfg);
@@ -156,11 +152,7 @@ async fn test_register_with_pricing_emits_block() {
         .create_async()
         .await;
 
-    let mut cfg = NodeConfig::new(
-        "n",
-        "https://provider:8080",
-        "urn:iicp:intent:llm:chat:v1",
-    );
+    let mut cfg = NodeConfig::new("n", "https://provider:8080", "urn:iicp:intent:llm:chat:v1");
     cfg.directory_url = server.url();
     cfg.model = Some("q".into());
     cfg.pricing = Some(PricingConfig {
@@ -186,11 +178,7 @@ async fn test_register_signs_with_operator_key() {
         .create_async()
         .await;
 
-    let mut cfg = NodeConfig::new(
-        "n",
-        "https://provider:8080",
-        "urn:iicp:intent:llm:chat:v1",
-    );
+    let mut cfg = NodeConfig::new("n", "https://provider:8080", "urn:iicp:intent:llm:chat:v1");
     cfg.directory_url = server.url();
     cfg.model = Some("q".into());
     cfg.pricing = Some(PricingConfig {
@@ -215,11 +203,7 @@ async fn test_register_captures_directory_issued_hmac_key() {
         .create_async()
         .await;
 
-    let mut cfg = NodeConfig::new(
-        "n",
-        "https://provider:8080",
-        "urn:iicp:intent:llm:chat:v1",
-    );
+    let mut cfg = NodeConfig::new("n", "https://provider:8080", "urn:iicp:intent:llm:chat:v1");
     cfg.directory_url = server.url();
     cfg.model = Some("q".into());
     let node = IicpNode::new(cfg);
@@ -239,11 +223,7 @@ async fn test_operator_key_wins_over_directory_issued() {
         .create_async()
         .await;
 
-    let mut cfg = NodeConfig::new(
-        "n",
-        "https://provider:8080",
-        "urn:iicp:intent:llm:chat:v1",
-    );
+    let mut cfg = NodeConfig::new("n", "https://provider:8080", "urn:iicp:intent:llm:chat:v1");
     cfg.directory_url = server.url();
     cfg.model = Some("q".into());
     cfg.node_hmac_key = "op-set".into();

@@ -290,7 +290,11 @@ impl IicpNode {
             .build()
             .expect("failed to build HTTP client");
         let runtime_hmac_key = std::sync::RwLock::new(cfg.node_hmac_key.clone());
-        Self { cfg, http, runtime_hmac_key }
+        Self {
+            cfg,
+            http,
+            runtime_hmac_key,
+        }
     }
 
     /// Current HMAC key in use for ADR-019 pricing signatures (empty if

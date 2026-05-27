@@ -226,7 +226,7 @@ async fn test_traceparent_propagated_to_handler() {
 
 #[tokio::test]
 async fn test_node_register_returns_token() {
-    use mockito::{Matcher, Server};
+    use mockito::Server;
 
     let mut server = Server::new_async().await;
     let _m = server

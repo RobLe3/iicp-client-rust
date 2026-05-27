@@ -12,9 +12,7 @@
 
 use std::time::Duration;
 
-use iicp_client::nat_detection::{
-    detect_nat, looks_routable, DetectNatOptions, TransportMethod,
-};
+use iicp_client::nat_detection::{detect_nat, looks_routable, DetectNatOptions, TransportMethod};
 
 // ── looks_routable ──────────────────────────────────────────────────────────
 
@@ -97,7 +95,10 @@ async fn test_detect_nat_tier_0_accepts_routable_operator_endpoint() {
     let p = detect_nat(opts).await;
     assert_eq!(p.tier, 0);
     assert_eq!(p.transport_method, TransportMethod::Direct);
-    assert_eq!(p.public_endpoint.as_deref(), Some("http://node.example.com:8080"));
+    assert_eq!(
+        p.public_endpoint.as_deref(),
+        Some("http://node.example.com:8080")
+    );
     assert!(p.is_reachable());
 }
 

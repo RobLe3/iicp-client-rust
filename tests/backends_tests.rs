@@ -33,7 +33,10 @@ async fn test_chat_completion_happy_path() {
         &json!({"messages": [{"role":"user","content":"hi"}]}),
     )
     .await;
-    assert!(result.get("error_code").is_none(), "unexpected error: {result}");
+    assert!(
+        result.get("error_code").is_none(),
+        "unexpected error: {result}"
+    );
     assert_eq!(
         result["result"]["id"].as_str().unwrap_or(""),
         "chatcmpl-test"
@@ -100,7 +103,10 @@ async fn test_completion_intent_routes_to_completions_path() {
         &json!({"prompt":"ping"}),
     )
     .await;
-    assert_eq!(result["result"]["choices"][0]["text"].as_str(), Some("PONG"));
+    assert_eq!(
+        result["result"]["choices"][0]["text"].as_str(),
+        Some("PONG")
+    );
 }
 
 #[tokio::test]
@@ -132,12 +138,10 @@ async fn test_unsupported_intent_returns_400() {
     )
     .await;
     assert_eq!(result["error_code"].as_u64(), Some(400));
-    assert!(
-        result["error_message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("unsupported intent")
-    );
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("unsupported intent"));
 }
 
 #[tokio::test]
@@ -150,12 +154,10 @@ async fn test_no_model_returns_400() {
     )
     .await;
     assert_eq!(result["error_code"].as_u64(), Some(400));
-    assert!(
-        result["error_message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("no model")
-    );
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("no model"));
 }
 
 #[tokio::test]
@@ -168,12 +170,10 @@ async fn test_non_object_payload_returns_400() {
     )
     .await;
     assert_eq!(result["error_code"].as_u64(), Some(400));
-    assert!(
-        result["error_message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("must be a JSON object")
-    );
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("must be a JSON object"));
 }
 
 #[tokio::test]
@@ -193,12 +193,10 @@ async fn test_upstream_500_is_surfaced() {
     )
     .await;
     assert_eq!(result["error_code"].as_u64(), Some(500));
-    assert!(
-        result["error_message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("model not loaded")
-    );
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("model not loaded"));
 }
 
 #[tokio::test]

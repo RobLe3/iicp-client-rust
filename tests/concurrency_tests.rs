@@ -10,7 +10,7 @@ use std::time::Duration;
 use ciborium::value::Value as CborValue;
 use iicp_client::concurrency::{CapacityExceededError, ConcurrencyGate};
 use iicp_client::iicp_tcp::{
-    decode_cbor, encode_frame, IicpTcpServer, MsgType, FRAMING_VERSION, FRAME_HEADER_LEN,
+    decode_cbor, encode_frame, IicpTcpServer, MsgType, FRAME_HEADER_LEN, FRAMING_VERSION,
     IICP_MAGIC,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -111,7 +111,9 @@ async fn start_server_with_gate(gate: Arc<ConcurrencyGate>, hold: Arc<Notify>) -
         .with_concurrency_gate(gate);
     let listener = server.bind().await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { let _ = server.serve_on(listener).await; });
+    tokio::spawn(async move {
+        let _ = server.serve_on(listener).await;
+    });
     tokio::time::sleep(Duration::from_millis(20)).await;
     port
 }
@@ -135,7 +137,10 @@ async fn do_call(port: u16, call_id: &str) -> std::io::Result<(u8, Vec<u8>)> {
             CborValue::Integer(3.into()),
             CborValue::Text("urn:iicp:intent:llm:chat:v1".into()),
         ),
-        (CborValue::Integer(15.into()), CborValue::Text(call_id.into())),
+        (
+            CborValue::Integer(15.into()),
+            CborValue::Text(call_id.into()),
+        ),
         (
             CborValue::Integer(5.into()),
             CborValue::Bytes(serde_json::to_vec(&serde_json::json!({})).unwrap()),
@@ -150,7 +155,7 @@ async fn do_call(port: u16, call_id: &str) -> std::io::Result<(u8, Vec<u8>)> {
 async fn test_under_capacity_call_passes_through() {
     let gate = Arc::new(ConcurrencyGate::new(2));
     let hold = Arc::new(Notify::new());
-    hold.notify_one();  // pre-release so handler returns immediately
+    hold.notify_one(); // pre-release so handler returns immediately
     let port = start_server_with_gate(gate.clone(), hold).await;
     let (mt, payload) = do_call(port, "c1").await.unwrap();
     assert_eq!(mt, MsgType::Response as u8);
@@ -159,7 +164,7 @@ async fn test_under_capacity_call_passes_through() {
     if let CborValue::Map(entries) = body {
         for (k, _) in &entries {
             if let CborValue::Integer(i) = k {
-                let n: i128 = i.clone().into();
+                let n: i128 = (*i).into();
                 assert!(n != 100, "unexpected error_code present");
             }
         }
@@ -183,7 +188,11 @@ async fn test_at_capacity_call_returns_429_iicp_e021() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(gate.active_jobs(), 2, "expected gate full before third call");
+    assert_eq!(
+        gate.active_jobs(),
+        2,
+        "expected gate full before third call"
+    );
 
     // Third CALL hits the gate
     let (mt, payload) = do_call(port, "c3").await.unwrap();
@@ -194,7 +203,7 @@ async fn test_at_capacity_call_returns_429_iicp_e021() {
     if let CborValue::Map(entries) = body {
         for (k, v) in entries {
             if let CborValue::Integer(i) = &k {
-                let n: i128 = i.clone().into();
+                let n: i128 = (*i).into();
                 if n == 100 {
                     if let CborValue::Integer(j) = v {
                         let nn: i128 = j.into();

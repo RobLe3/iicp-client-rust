@@ -101,9 +101,9 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
     // Tier 0
     if let Some(ep) = &opts.operator_public_endpoint {
         if looks_routable(ep) {
-            profile
-                .detection_log
-                .push(format!("tier-0: operator-configured public_endpoint={ep:?}"));
+            profile.detection_log.push(format!(
+                "tier-0: operator-configured public_endpoint={ep:?}"
+            ));
             let mut t0 = NatProfile::new(0, TransportMethod::Direct);
             t0.public_endpoint = Some(ep.clone());
             t0.internal_endpoint = profile.internal_endpoint.clone();
@@ -123,9 +123,11 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
         }
     }
 
-    let upnp_result =
-        tokio::time::timeout(opts.timeout, try_upnp_mapping(ports_to_map.clone(), opts.upnp_lease_seconds))
-            .await;
+    let upnp_result = tokio::time::timeout(
+        opts.timeout,
+        try_upnp_mapping(ports_to_map.clone(), opts.upnp_lease_seconds),
+    )
+    .await;
 
     let upnp = match upnp_result {
         Ok(r) => r,
@@ -143,7 +145,8 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
             // External-IP probe fallback (#331 Phase A)
             if u.external_ip.is_none() || u.external_ip.as_deref() == Some("0.0.0.0") {
                 if let Some(probe_url) = &opts.external_ip_probe_url {
-                    if let Some(probed) = probe_external_ip(probe_url, Duration::from_secs(5)).await {
+                    if let Some(probed) = probe_external_ip(probe_url, Duration::from_secs(5)).await
+                    {
                         profile.detection_log.push(format!(
                             "tier-1: external IP probe {probe_url:?} returned {probed}"
                         ));
@@ -289,10 +292,8 @@ pub async fn try_upnp_mapping(internal_ports: Vec<u16>, lease_seconds: u32) -> O
         }
     };
 
-    let local_ip = pick_local_ip_for_gateway(gateway.addr.ip()).unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
-    let local_v4 = match local_ip {
-        v4 => v4,
-    };
+    let local_v4 =
+        pick_local_ip_for_gateway(gateway.addr.ip()).unwrap_or_else(|| Ipv4Addr::new(127, 0, 0, 1));
 
     let primary_socket = SocketAddr::V4(SocketAddrV4::new(local_v4, primary));
     if let Err(e) = gateway
@@ -332,9 +333,7 @@ pub async fn try_upnp_mapping(internal_ports: Vec<u16>, lease_seconds: u32) -> O
         {
             mapped.push(extra);
         } else {
-            tracing::warn!(
-                "UPnP: failed to map additional port {extra} (primary {primary} ok)"
-            );
+            tracing::warn!("UPnP: failed to map additional port {extra} (primary {primary} ok)");
         }
     }
 
@@ -413,12 +412,12 @@ pub fn looks_routable(url: &str) -> bool {
         None => return false,
     };
     let host_end = after_scheme
-        .find(|c: char| c == '/' || c == '?' || c == '#')
+        .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..host_end];
     // Handle [ipv6]:port
-    let host = if authority.starts_with('[') {
-        match authority[1..].split_once(']') {
+    let host = if let Some(stripped) = authority.strip_prefix('[') {
+        match stripped.split_once(']') {
             Some((h, _)) => h.to_string(),
             None => return false,
         }
@@ -484,7 +483,7 @@ fn is_non_public_ipv4(ip: Ipv4Addr) -> bool {
     if a == 100 && (64..=127).contains(&b) {
         return true;
     } // CGNAT 100.64/10
-    // RFC 5737 documentation
+      // RFC 5737 documentation
     if a == 192 && b == 0 && c == 2 {
         return true;
     }

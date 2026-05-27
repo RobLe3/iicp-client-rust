@@ -5,6 +5,6 @@
 //! `IicpNode::serve()` or as the `TcpTaskHandler` for `IicpTcpServer`.
 //!
 //! - [`openai_compat`] — drives Ollama, vLLM, LM Studio, or any
-//!                       OpenAI-compatible HTTP server.
+//!   OpenAI-compatible HTTP server.
 
 pub mod openai_compat;

@@ -88,12 +88,10 @@ impl CooperativeInferencePolicy {
             if cur >= self.max_concurrent_remote {
                 return false;
             }
-            match self.in_flight.compare_exchange(
-                cur,
-                cur + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
+            match self
+                .in_flight
+                .compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
                 Ok(_) => return true,
                 Err(actual) => cur = actual,
             }

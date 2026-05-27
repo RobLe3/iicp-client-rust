@@ -16,7 +16,7 @@ use std::time::Duration;
 use ciborium::value::Value as CborValue;
 use iicp_client::iicp_tcp::{
     decode_cbor, encode_frame, IicpTcpClient, IicpTcpClientError, IicpTcpServer, MsgType,
-    FRAMING_VERSION, FRAME_HEADER_LEN, IICP_MAGIC,
+    FRAME_HEADER_LEN, FRAMING_VERSION, IICP_MAGIC,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -65,7 +65,10 @@ async fn start_server() -> u16 {
                             CborValue::Text("endpoint".into()),
                             CborValue::Text("http://fake.example:8080".into()),
                         ),
-                        (CborValue::Text("intent".into()), CborValue::Text(intent.clone())),
+                        (
+                            CborValue::Text("intent".into()),
+                            CborValue::Text(intent.clone()),
+                        ),
                     ]),
                     CborValue::Map(vec![
                         (
@@ -178,7 +181,10 @@ async fn test_discover_returns_lookup_result() {
 
     let intent = "urn:iicp:intent:llm:chat:v1";
     let discover_payload = cbor_encode(&CborValue::Map(vec![
-        (CborValue::Integer(2.into()), CborValue::Text("sess-d1".into())),
+        (
+            CborValue::Integer(2.into()),
+            CborValue::Text("sess-d1".into()),
+        ),
         (CborValue::Integer(3.into()), CborValue::Text(intent.into())),
     ]));
     sock.write_all(&encode_frame(MsgType::Discover as u8, &discover_payload, 0))
@@ -219,12 +225,18 @@ async fn test_call_invokes_handler() {
     let json_body = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
     let json_bytes = serde_json::to_vec(&json_body).unwrap();
     let call_payload = cbor_encode(&CborValue::Map(vec![
-        (CborValue::Integer(2.into()), CborValue::Text("sess-c1".into())),
+        (
+            CborValue::Integer(2.into()),
+            CborValue::Text("sess-c1".into()),
+        ),
         (
             CborValue::Integer(3.into()),
             CborValue::Text("urn:iicp:intent:llm:chat:v1".into()),
         ),
-        (CborValue::Integer(15.into()), CborValue::Text("call-0001".into())),
+        (
+            CborValue::Integer(15.into()),
+            CborValue::Text("call-0001".into()),
+        ),
         (CborValue::Integer(5.into()), CborValue::Bytes(json_bytes)),
     ]));
     sock.write_all(&encode_frame(MsgType::Call as u8, &call_payload, 0))
@@ -276,10 +288,15 @@ async fn test_close_results_in_clean_hangup() {
     sock.write_all(&init).await.unwrap();
     read_frame(&mut sock).await.unwrap();
 
-    sock.write_all(&encode_frame(MsgType::Close as u8, &[], 0)).await.unwrap();
+    sock.write_all(&encode_frame(MsgType::Close as u8, &[], 0))
+        .await
+        .unwrap();
     // Server should close — read returns 0
     let mut buf = [0u8; 8];
-    let n = timeout(TIMEOUT, sock.read(&mut buf)).await.unwrap().unwrap();
+    let n = timeout(TIMEOUT, sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(n, 0, "expected EOF after CLOSE, got {n} bytes: {buf:?}");
 }
 
@@ -291,7 +308,10 @@ async fn test_bad_magic_closes_connection() {
     garbage.extend_from_slice(&[0u8; FRAME_HEADER_LEN - 4]);
     sock.write_all(&garbage).await.unwrap();
     let mut buf = [0u8; 8];
-    let n = timeout(TIMEOUT, sock.read(&mut buf)).await.unwrap().unwrap();
+    let n = timeout(TIMEOUT, sock.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(n, 0, "server should close on bad magic");
 }
 
@@ -364,7 +384,10 @@ async fn test_client_discover_returns_nodes() {
     let port = start_server().await;
     let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
     client.handshake().await.unwrap();
-    let nodes = client.discover("urn:iicp:intent:llm:chat:v1").await.unwrap();
+    let nodes = client
+        .discover("urn:iicp:intent:llm:chat:v1")
+        .await
+        .unwrap();
     assert_eq!(nodes.len(), 2);
 }
 
@@ -373,9 +396,14 @@ async fn test_client_call_returns_handler_result() {
     let port = start_server().await;
     let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
     client.handshake().await.unwrap();
-    let payload = serde_json::json!({"messages": [{"role":"user","content":"hi from rust client"}]});
+    let payload =
+        serde_json::json!({"messages": [{"role":"user","content":"hi from rust client"}]});
     let result = client
-        .call("urn:iicp:intent:llm:chat:v1", payload.clone(), Some("call-rust-1"))
+        .call(
+            "urn:iicp:intent:llm:chat:v1",
+            payload.clone(),
+            Some("call-rust-1"),
+        )
         .await
         .unwrap();
     // The server-side handler returns { "result": { "echo": <payload> } }; the
@@ -391,12 +419,17 @@ async fn test_client_call_raises_on_server_error() {
     let server = IicpTcpServer::new("127.0.0.1", 0).with_node_id("no-handler");
     let listener = server.bind().await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { let _ = server.serve_on(listener).await; });
+    tokio::spawn(async move {
+        let _ = server.serve_on(listener).await;
+    });
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
     client.handshake().await.unwrap();
-    match client.call("urn:iicp:intent:llm:chat:v1", serde_json::json!({}), None).await {
+    match client
+        .call("urn:iicp:intent:llm:chat:v1", serde_json::json!({}), None)
+        .await
+    {
         Err(IicpTcpClientError::Server { code, .. }) => {
             assert_eq!(code, 503);
         }
@@ -409,8 +442,14 @@ async fn test_client_full_session_init_ping_discover_call_close() {
     let port = start_server().await;
     let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
     client.handshake().await.unwrap();
-    assert_eq!(client.ping(Some(b"x")).await.unwrap().as_deref(), Some(&b"x"[..]));
-    let nodes = client.discover("urn:iicp:intent:llm:chat:v1").await.unwrap();
+    assert_eq!(
+        client.ping(Some(b"x")).await.unwrap().as_deref(),
+        Some(&b"x"[..])
+    );
+    let nodes = client
+        .discover("urn:iicp:intent:llm:chat:v1")
+        .await
+        .unwrap();
     assert_eq!(nodes.len(), 2);
     let result = client
         .call(
@@ -420,6 +459,9 @@ async fn test_client_full_session_init_ping_discover_call_close() {
         )
         .await
         .unwrap();
-    assert_eq!(result.get("echo").and_then(|e| e.get("k")), Some(&serde_json::json!("v")));
+    assert_eq!(
+        result.get("echo").and_then(|e| e.get("k")),
+        Some(&serde_json::json!("v"))
+    );
     client.close().await.unwrap();
 }

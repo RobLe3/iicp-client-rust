@@ -93,7 +93,10 @@ pub fn encode_frame(msg_type: u8, payload: &[u8], flags: u8) -> Vec<u8> {
 /// Decode one frame from `data`; return (frame, bytes_consumed).
 pub fn decode_frame(data: &[u8]) -> Result<(IicpFrame, usize), String> {
     if data.len() < FRAME_HEADER_LEN {
-        return Err(format!("IICP frame too short: {} < {FRAME_HEADER_LEN}", data.len()));
+        return Err(format!(
+            "IICP frame too short: {} < {FRAME_HEADER_LEN}",
+            data.len()
+        ));
     }
     if &data[0..4] != IICP_MAGIC {
         return Err(format!("Invalid IICP magic: {:?}", &data[0..4]));
@@ -104,7 +107,10 @@ pub fn decode_frame(data: &[u8]) -> Result<(IicpFrame, usize), String> {
     let payload_len = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
     let total = FRAME_HEADER_LEN + payload_len;
     if data.len() < total {
-        return Err(format!("IICP payload truncated: need {total}, have {}", data.len()));
+        return Err(format!(
+            "IICP payload truncated: need {total}, have {}",
+            data.len()
+        ));
     }
     Ok((
         IicpFrame {
@@ -131,11 +137,15 @@ pub fn decode_cbor(data: &[u8]) -> Result<CborValue, String> {
 
 /// Build the CBOR payload for an ACK message (`{1: framing_version, 2: node_id?}`).
 pub fn encode_ack(framing_version: u8, node_id: Option<&str>) -> Vec<u8> {
-    let mut entries: Vec<(CborValue, CborValue)> = vec![
-        (CborValue::Integer(1.into()), CborValue::Integer((framing_version as i64).into())),
-    ];
+    let mut entries: Vec<(CborValue, CborValue)> = vec![(
+        CborValue::Integer(1.into()),
+        CborValue::Integer((framing_version as i64).into()),
+    )];
     if let Some(id) = node_id {
-        entries.push((CborValue::Integer(2.into()), CborValue::Text(id.to_string())));
+        entries.push((
+            CborValue::Integer(2.into()),
+            CborValue::Text(id.to_string()),
+        ));
     }
     encode_cbor(&CborValue::Map(entries))
 }
@@ -155,34 +165,53 @@ pub fn encode_response(
     error_code: Option<i64>,
     error_message: Option<&str>,
 ) -> Vec<u8> {
-    let mut entries: Vec<(CborValue, CborValue)> = vec![
-        (CborValue::Integer(2.into()), CborValue::Text(session_id.to_string())),
-    ];
+    let mut entries: Vec<(CborValue, CborValue)> = vec![(
+        CborValue::Integer(2.into()),
+        CborValue::Text(session_id.to_string()),
+    )];
     if let Some(cid) = call_id {
-        entries.push((CborValue::Integer(15.into()), CborValue::Text(cid.to_string())));
+        entries.push((
+            CborValue::Integer(15.into()),
+            CborValue::Text(cid.to_string()),
+        ));
     }
     if let Some(r) = result {
         entries.push((CborValue::Integer(5.into()), CborValue::Bytes(r.to_vec())));
     }
     if let Some(ec) = error_code {
-        entries.push((CborValue::Integer(100.into()), CborValue::Integer(ec.into())));
+        entries.push((
+            CborValue::Integer(100.into()),
+            CborValue::Integer(ec.into()),
+        ));
     }
     if let Some(em) = error_message {
-        entries.push((CborValue::Integer(101.into()), CborValue::Text(em.to_string())));
+        entries.push((
+            CborValue::Integer(101.into()),
+            CborValue::Text(em.to_string()),
+        ));
     }
     encode_cbor(&CborValue::Map(entries))
 }
 
 pub fn encode_discover_response(session_id: &str, intent: &str, nodes: &[CborValue]) -> Vec<u8> {
     encode_cbor(&CborValue::Map(vec![
-        (CborValue::Integer(2.into()), CborValue::Text(session_id.to_string())),
-        (CborValue::Integer(3.into()), CborValue::Text(intent.to_string())),
-        (CborValue::Integer(20.into()), CborValue::Array(nodes.to_vec())),
+        (
+            CborValue::Integer(2.into()),
+            CborValue::Text(session_id.to_string()),
+        ),
+        (
+            CborValue::Integer(3.into()),
+            CborValue::Text(intent.to_string()),
+        ),
+        (
+            CborValue::Integer(20.into()),
+            CborValue::Array(nodes.to_vec()),
+        ),
     ]))
 }
 
 // Pull an integer key out of a CBOR map. Returns None if not a map or key absent.
-fn cbor_map_get<'a>(map: &'a CborValue, key: i64) -> Option<&'a CborValue> {
+fn cbor_map_get(map: &CborValue, key: i64) -> Option<&CborValue> {
     if let CborValue::Map(entries) = map {
         for (k, v) in entries {
             if let CborValue::Integer(i) = k {
@@ -224,11 +253,8 @@ pub struct TcpTask {
 /// success (result is encoded as CBOR for transport) or
 /// `(None, Some(code), Some(msg))` for error.
 pub type TcpTaskHandler = Arc<
-    dyn Fn(
-            TcpTask,
-        ) -> Pin<
-            Box<dyn std::future::Future<Output = serde_json::Value> + Send>,
-        > + Send
+    dyn Fn(TcpTask) -> Pin<Box<dyn std::future::Future<Output = serde_json::Value> + Send>>
+        + Send
         + Sync,
 >;
 
@@ -434,7 +460,11 @@ impl IicpTcpServer {
         Ok(true)
     }
 
-    async fn on_discover(&self, frame: &IicpFrame, socket: &mut TcpStream) -> std::io::Result<bool> {
+    async fn on_discover(
+        &self,
+        frame: &IicpFrame,
+        socket: &mut TcpStream,
+    ) -> std::io::Result<bool> {
         let mut session_id = "unknown".to_string();
         let mut intent = String::new();
         if let Ok(body) = decode_cbor(&frame.payload) {
@@ -450,13 +480,12 @@ impl IicpTcpServer {
             }
         }
 
-        let nodes: Vec<CborValue> = if let (Some(lookup), false) =
-            (&self.discover_lookup, intent.is_empty())
-        {
-            lookup(intent.clone()).await
-        } else {
-            Vec::new()
-        };
+        let nodes: Vec<CborValue> =
+            if let (Some(lookup), false) = (&self.discover_lookup, intent.is_empty()) {
+                lookup(intent.clone()).await
+            } else {
+                Vec::new()
+            };
 
         let resp = encode_discover_response(&session_id, &intent, &nodes);
         let out = encode_frame(MsgType::Response as u8, &resp, 0);
@@ -503,7 +532,9 @@ impl IicpTcpServer {
                         if let CborValue::Text(key) = k {
                             // Convert value to JSON via roundtrip
                             let bytes = encode_cbor(vv);
-                            if let Ok(jv) = ciborium::de::from_reader::<serde_json::Value, _>(&bytes[..]) {
+                            if let Ok(jv) =
+                                ciborium::de::from_reader::<serde_json::Value, _>(&bytes[..])
+                            {
                                 obj.insert(key.clone(), jv);
                             }
                         }
@@ -612,7 +643,9 @@ fn json_to_cbor(v: &serde_json::Value) -> CborValue {
             }
         }
         serde_json::Value::String(s) => CborValue::Text(s.clone()),
-        serde_json::Value::Array(items) => CborValue::Array(items.iter().map(json_to_cbor).collect()),
+        serde_json::Value::Array(items) => {
+            CborValue::Array(items.iter().map(json_to_cbor).collect())
+        }
         serde_json::Value::Object(map) => {
             let mut entries: Vec<(CborValue, CborValue)> = Vec::with_capacity(map.len());
             // Use BTreeMap to get deterministic ordering
@@ -680,7 +713,9 @@ impl IicpTcpClient {
         let addr = format!("{host}:{port}");
         let sock = tokio::time::timeout(timeout, TcpStream::connect(&addr))
             .await
-            .map_err(|_| IicpTcpClientError::Timeout { ms: timeout.as_millis() as u64 })??;
+            .map_err(|_| IicpTcpClientError::Timeout {
+                ms: timeout.as_millis() as u64,
+            })??;
         Ok(Self {
             sock,
             timeout,
@@ -704,11 +739,9 @@ impl IicpTcpClient {
             )));
         }
         if let Ok(body) = decode_cbor(&payload) {
-            if let Some(v) = cbor_map_get(&body, 1) {
-                if let CborValue::Integer(i) = v {
-                    let n: i128 = i.clone().into();
-                    self.framing_version = Some(n as u8);
-                }
+            if let Some(CborValue::Integer(i)) = cbor_map_get(&body, 1) {
+                let n: i128 = (*i).into();
+                self.framing_version = Some(n as u8);
             }
             if let Some(v) = cbor_map_get(&body, 2) {
                 self.peer_node_id = cbor_to_str(v);
@@ -718,9 +751,15 @@ impl IicpTcpClient {
     }
 
     /// Send PING; return echoed bytes from PONG (or None if not echoed).
-    pub async fn ping(&mut self, echo: Option<&[u8]>) -> Result<Option<Vec<u8>>, IicpTcpClientError> {
+    pub async fn ping(
+        &mut self,
+        echo: Option<&[u8]>,
+    ) -> Result<Option<Vec<u8>>, IicpTcpClientError> {
         let body = if let Some(b) = echo {
-            CborValue::Map(vec![(CborValue::Integer(1.into()), CborValue::Bytes(b.to_vec()))])
+            CborValue::Map(vec![(
+                CborValue::Integer(1.into()),
+                CborValue::Bytes(b.to_vec()),
+            )])
         } else {
             CborValue::Map(vec![])
         };
@@ -754,7 +793,10 @@ impl IicpTcpClient {
         session_id: &str,
     ) -> Result<Vec<CborValue>, IicpTcpClientError> {
         let payload = encode_cbor(&CborValue::Map(vec![
-            (CborValue::Integer(2.into()), CborValue::Text(session_id.into())),
+            (
+                CborValue::Integer(2.into()),
+                CborValue::Text(session_id.into()),
+            ),
             (CborValue::Integer(3.into()), CborValue::Text(intent.into())),
         ]));
         let frame = encode_frame(MsgType::Discover as u8, &payload, 0);
@@ -766,10 +808,8 @@ impl IicpTcpClient {
             )));
         }
         let body = decode_cbor(&body_bytes).map_err(IicpTcpClientError::Protocol)?;
-        if let Some(v) = cbor_map_get(&body, 20) {
-            if let CborValue::Array(items) = v {
-                return Ok(items.clone());
-            }
+        if let Some(CborValue::Array(items)) = cbor_map_get(&body, 20) {
+            return Ok(items.clone());
         }
         Ok(Vec::new())
     }
@@ -782,7 +822,8 @@ impl IicpTcpClient {
         payload: serde_json::Value,
         call_id: Option<&str>,
     ) -> Result<serde_json::Value, IicpTcpClientError> {
-        self.call_with_session(intent, payload, call_id, "call-1").await
+        self.call_with_session(intent, payload, call_id, "call-1")
+            .await
     }
 
     pub async fn call_with_session(
@@ -795,14 +836,24 @@ impl IicpTcpClient {
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| IicpTcpClientError::Protocol(format!("JSON encode: {e}")))?;
         let mut entries: Vec<(CborValue, CborValue)> = vec![
-            (CborValue::Integer(2.into()), CborValue::Text(session_id.into())),
+            (
+                CborValue::Integer(2.into()),
+                CborValue::Text(session_id.into()),
+            ),
             (CborValue::Integer(3.into()), CborValue::Text(intent.into())),
-            (CborValue::Integer(5.into()), CborValue::Bytes(payload_bytes)),
+            (
+                CborValue::Integer(5.into()),
+                CborValue::Bytes(payload_bytes),
+            ),
         ];
         if let Some(cid) = call_id {
             entries.push((CborValue::Integer(15.into()), CborValue::Text(cid.into())));
         }
-        let frame = encode_frame(MsgType::Call as u8, &encode_cbor(&CborValue::Map(entries)), 0);
+        let frame = encode_frame(
+            MsgType::Call as u8,
+            &encode_cbor(&CborValue::Map(entries)),
+            0,
+        );
         self.write_all(&frame).await?;
         let (mt, body_bytes) = self.read_frame().await?;
         if mt != MsgType::Response as u8 {
@@ -811,17 +862,15 @@ impl IicpTcpClient {
             )));
         }
         let body = decode_cbor(&body_bytes).map_err(IicpTcpClientError::Protocol)?;
-        if let Some(v) = cbor_map_get(&body, 100) {
-            if let CborValue::Integer(i) = v {
-                let code: i128 = i.clone().into();
-                let message = cbor_map_get(&body, 101)
-                    .and_then(cbor_to_str)
-                    .unwrap_or_default();
-                return Err(IicpTcpClientError::Server {
-                    code: code as i64,
-                    message,
-                });
-            }
+        if let Some(CborValue::Integer(i)) = cbor_map_get(&body, 100) {
+            let code: i128 = (*i).into();
+            let message = cbor_map_get(&body, 101)
+                .and_then(cbor_to_str)
+                .unwrap_or_default();
+            return Err(IicpTcpClientError::Server {
+                code: code as i64,
+                message,
+            });
         }
         let result_v = cbor_map_get(&body, 5);
         match result_v {
@@ -888,7 +937,7 @@ fn cbor_to_json(v: &CborValue) -> serde_json::Value {
         CborValue::Null => serde_json::Value::Null,
         CborValue::Bool(b) => serde_json::Value::Bool(*b),
         CborValue::Integer(i) => {
-            let n: i128 = i.clone().into();
+            let n: i128 = (*i).into();
             if let Ok(j) = i64::try_from(n) {
                 serde_json::Value::Number(j.into())
             } else {
@@ -909,7 +958,7 @@ fn cbor_to_json(v: &CborValue) -> serde_json::Value {
                 let key = match k {
                     CborValue::Text(s) => s.clone(),
                     CborValue::Integer(i) => {
-                        let n: i128 = i.clone().into();
+                        let n: i128 = (*i).into();
                         n.to_string()
                     }
                     _ => continue,
@@ -925,7 +974,7 @@ fn cbor_to_json(v: &CborValue) -> serde_json::Value {
 /// Minimal base64 encode for byte values in JSON output (avoid adding a base64 dep).
 fn base64_encode(bytes: &[u8]) -> String {
     const ALPHA: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((bytes.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let mut chunks = bytes.chunks_exact(3);
     for chunk in &mut chunks {
         let v = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
