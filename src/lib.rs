@@ -31,6 +31,7 @@ pub mod nat_detection;
 
 pub mod backends;
 pub mod cip_policy;
+pub mod pricing;
 
 pub use client::IicpClient;
 pub use errors::{IicpError, Result};

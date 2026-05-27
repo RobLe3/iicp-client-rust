@@ -1,6 +1,6 @@
 [package]
 name = "iicp-client"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.80"
 description = "Official Rust client SDK for the IICP protocol (ADR-016)"
@@ -46,6 +46,11 @@ tracing = "0.1"
 prometheus = { version = "0.13", optional = true }
 ciborium = { version = "0.2", optional = true }
 igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
+# ADR-019 pricing-block HMAC-SHA256. Pulled in unconditionally — operators
+# who don't use pricing pay only ~30KB in binary size.
+hmac = "0.12"
+sha2 = "0.10"
+subtle = "2"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
@@ -53,3 +58,6 @@ mockito = "1.0"
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
 tracing-subscriber = "0.3"
 serde_json = "1.0"
+hex = "0.4"
+hmac = "0.12"
+sha2 = "0.10"

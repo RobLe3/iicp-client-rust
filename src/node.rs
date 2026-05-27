@@ -72,6 +72,13 @@ pub struct NodeConfig {
     /// [`crate::cip_policy::get_cip_policy`] — operators can configure once
     /// and have it apply to all nodes that don't override.
     pub cip_policy: Option<std::sync::Arc<crate::cip_policy::CooperativeInferencePolicy>>,
+    /// ADR-019 declarative pricing block. When `None`, the SDK does not
+    /// advertise pricing and the directory defaults to a 1.0 multiplier.
+    pub pricing: Option<crate::pricing::PricingConfig>,
+    /// Operator-provisioned HMAC key for ADR-019 pricing signatures. When
+    /// empty, the SDK captures the directory-issued key from the register
+    /// response and uses it for subsequent signing.
+    pub node_hmac_key: String,
 }
 
 impl NodeConfig {
@@ -97,6 +104,8 @@ impl NodeConfig {
             nat_type: None,
             transport_metadata: None,
             cip_policy: None,
+            pricing: None,
+            node_hmac_key: String::new(),
         }
     }
 }
@@ -266,6 +275,11 @@ async fn task_endpoint(
 pub struct IicpNode {
     cfg: NodeConfig,
     http: Client,
+    /// ADR-019 HMAC key used for signing pricing declarations. Initialized
+    /// from `cfg.node_hmac_key`; populated from the directory's response on
+    /// first register() so subsequent re-registrations sign with the
+    /// directory-issued key.
+    runtime_hmac_key: std::sync::RwLock<String>,
 }
 
 impl IicpNode {
@@ -275,7 +289,14 @@ impl IicpNode {
             .use_rustls_tls()
             .build()
             .expect("failed to build HTTP client");
-        Self { cfg, http }
+        let runtime_hmac_key = std::sync::RwLock::new(cfg.node_hmac_key.clone());
+        Self { cfg, http, runtime_hmac_key }
+    }
+
+    /// Current HMAC key in use for ADR-019 pricing signatures (empty if
+    /// unregistered AND no operator-provisioned key).
+    pub fn node_hmac_key(&self) -> String {
+        self.runtime_hmac_key.read().expect("poisoned").clone()
     }
 
     /// Populate `endpoint`, `transport_endpoint`, and the NAT observability
@@ -392,6 +413,15 @@ impl IicpNode {
             payload["policy"] = block;
         }
 
+        // ADR-019 — declarative pricing block. Operator opt-in.
+        if let Some(pricing) = &self.cfg.pricing {
+            let hmac_key = self.runtime_hmac_key.read().expect("poisoned").clone();
+            payload["pricing"] = crate::pricing::build_pricing_block(pricing, &hmac_key);
+        }
+        if !self.cfg.node_hmac_key.is_empty() {
+            payload["node_hmac_key"] = json!(self.cfg.node_hmac_key);
+        }
+
         let resp = self
             .http
             .post(format!(
@@ -417,6 +447,17 @@ impl IicpNode {
             .as_str()
             .or_else(|| data["token"].as_str())
             .ok_or_else(|| IicpError::Node(format!("no node_token in response: {data}")))?;
+        // ADR-019: capture directory-issued HMAC key for subsequent signing.
+        // Operator-provisioned key (cfg.node_hmac_key) wins — we only set the
+        // runtime key from the response when the operator hasn't set one.
+        if self.cfg.node_hmac_key.is_empty() {
+            if let Some(dir_key) = data["node_hmac_key"].as_str() {
+                if !dir_key.is_empty() {
+                    let mut guard = self.runtime_hmac_key.write().expect("poisoned");
+                    *guard = dir_key.to_string();
+                }
+            }
+        }
         Ok(token.to_string())
     }
 
