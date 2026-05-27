@@ -156,6 +156,20 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
         ));
     }
 
+    // Tier 0 auto-detect — cloud VM with a public IPv4 directly on a local interface.
+    if let Some(public_v4) = detect_public_v4_on_interfaces() {
+        let auto_url = format!("http://{}:{}", public_v4, opts.bind_port);
+        profile.detection_log.push(format!(
+            "tier-0: auto-detected public IPv4 on local interface → {auto_url:?}"
+        ));
+        let mut t0 = NatProfile::new(0, TransportMethod::Direct);
+        t0.public_endpoint = Some(auto_url);
+        t0.internal_endpoint = profile.internal_endpoint;
+        t0.detection_log = profile.detection_log;
+        t0.ipv6 = profile.ipv6;
+        return t0;
+    }
+
     // Tier 1 — UPnP
     let mut ports_to_map: Vec<u16> = vec![opts.bind_port];
     if let Some(tp) = opts.transport_port {
@@ -714,6 +728,70 @@ pub async fn detect_ipv6(bind_port: u16, timeout: Duration) -> Ipv6Profile {
     }
 
     out
+}
+
+/// Enumerate all local IPv4 addresses across network interfaces.
+///
+/// Linux: parses `ip -4 addr` output.
+/// macOS: parses `ifconfig` output.
+/// Fallback: UDP-socket trick (OS-chosen source IP for default gateway route).
+fn list_local_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let mut out: Vec<Ipv4Addr> = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    if let Ok(o) = std::process::Command::new("ip").args(["-4", "addr"]).output() {
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("inet ") {
+                continue;
+            }
+            if let Some(addr_cidr) = line.split_whitespace().nth(1) {
+                let addr_str = addr_cidr.split('/').next().unwrap_or("");
+                if let Ok(ip) = addr_str.parse::<Ipv4Addr>() {
+                    out.push(ip);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Ok(o) = std::process::Command::new("ifconfig").output() {
+        let text = String::from_utf8_lossy(&o.stdout);
+        for line in text.lines() {
+            let line = line.trim();
+            if !line.starts_with("inet ") || line.starts_with("inet6 ") {
+                continue;
+            }
+            if let Some(addr_str) = line.split_whitespace().nth(1) {
+                if let Ok(ip) = addr_str.parse::<Ipv4Addr>() {
+                    out.push(ip);
+                }
+            }
+        }
+    }
+
+    // Universal fallback: OS routes toward 8.8.8.8 — reveals default-route source IP.
+    if out.is_empty() {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            let _ = sock.connect("8.8.8.8:80");
+            if let Ok(local) = sock.local_addr() {
+                if let SocketAddr::V4(a) = local {
+                    out.push(*a.ip());
+                }
+            }
+        }
+    }
+
+    out
+}
+
+/// Returns the first public-routable IPv4 on a local interface, or None.
+/// Used for cloud-VM Tier 0 auto-detect before attempting UPnP IGD discovery.
+fn detect_public_v4_on_interfaces() -> Option<Ipv4Addr> {
+    list_local_ipv4_addresses()
+        .into_iter()
+        .find(|ip| !is_non_public_ipv4(*ip))
 }
 
 fn list_global_ipv6_addresses() -> Vec<String> {
