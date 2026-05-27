@@ -260,7 +260,19 @@ async fn task_endpoint(
     }
 
     let task_id = req.task_id.clone();
-    let result = (state.handler)(req).await;
+    // ADR-014 TRACE-02 — iicp.task.execute span via `tracing` crate.
+    // `tracing-opentelemetry` bridge propagates this to an OTLP collector when
+    // OTEL_EXPORTER_OTLP_ENDPOINT is set and the operator configures the bridge
+    // at startup (e.g. via opentelemetry-otlp + tracing-opentelemetry).
+    let result = {
+        let span = tracing::info_span!(
+            "iicp.task.execute",
+            "iicp.task_id" = %task_id,
+            "iicp.intent" = %req.intent,
+        );
+        let _guard = span.enter();
+        (state.handler)(req).await
+    };
     state.active_jobs.fetch_sub(1, Ordering::Relaxed);
 
     match result {
