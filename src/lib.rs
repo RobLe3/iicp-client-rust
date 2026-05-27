@@ -31,6 +31,7 @@ pub mod nat_detection;
 
 pub mod backends;
 pub mod cip_policy;
+pub mod concurrency;
 pub mod conformance;
 pub mod pricing;
 

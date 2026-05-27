@@ -247,6 +247,9 @@ pub struct IicpTcpServer {
     node_id: Option<String>,
     handler: Option<TcpTaskHandler>,
     discover_lookup: Option<DiscoverLookup>,
+    /// Optional ConcurrencyGate; when set, every CALL acquires a slot
+    /// first. CapacityExceededError → RESPONSE error_code=429 IICP-E021.
+    concurrency_gate: Option<std::sync::Arc<crate::concurrency::ConcurrencyGate>>,
 }
 
 impl IicpTcpServer {
@@ -257,6 +260,7 @@ impl IicpTcpServer {
             node_id: None,
             handler: None,
             discover_lookup: None,
+            concurrency_gate: None,
         }
     }
 
@@ -272,6 +276,14 @@ impl IicpTcpServer {
 
     pub fn with_discover_lookup(mut self, d: DiscoverLookup) -> Self {
         self.discover_lookup = Some(d);
+        self
+    }
+
+    pub fn with_concurrency_gate(
+        mut self,
+        gate: std::sync::Arc<crate::concurrency::ConcurrencyGate>,
+    ) -> Self {
+        self.concurrency_gate = Some(gate);
         self
     }
 
@@ -511,27 +523,59 @@ impl IicpTcpServer {
                 intent: intent.clone(),
                 payload: payload_json,
             };
-            let user_result = handler(task).await;
-            // Handler may return {"error_code": N, "error_message": "..."} or the
-            // result body directly. Inspect for error_code key.
-            if let serde_json::Value::Object(map) = &user_result {
-                if let Some(ec) = map.get("error_code").and_then(|v| v.as_i64()) {
-                    error_code = Some(ec);
-                    error_message = map
-                        .get("error_message")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                        .or(Some("handler error".to_string()));
-                } else {
-                    // CBOR-encode the result for transport. If the handler
-                    // returned a {"result": ...} wrapper, unwrap it.
+
+            // Tier 2 Item 5: optional ConcurrencyGate. CapacityExceededError →
+            // RESPONSE error_code=429 IICP-E021 so the directory's NodeScorer
+            // sees back-pressure consistently across HTTP and native IICP.
+            let gate = self.concurrency_gate.clone();
+            let run_handler = async {
+                let user_result = handler(task).await;
+                if let serde_json::Value::Object(map) = &user_result {
+                    if let Some(ec) = map.get("error_code").and_then(|v| v.as_i64()) {
+                        return Err((
+                            ec,
+                            map.get("error_message")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| "handler error".to_string()),
+                        ));
+                    }
                     let inner = map.get("result").unwrap_or(&user_result);
-                    let cbor_value = json_to_cbor(inner);
-                    result_bytes = Some(encode_cbor(&cbor_value));
+                    Ok(encode_cbor(&json_to_cbor(inner)))
+                } else {
+                    Ok(encode_cbor(&json_to_cbor(&user_result)))
+                }
+            };
+
+            if let Some(g) = gate {
+                match g.acquire() {
+                    Ok(()) => {
+                        let outcome = run_handler.await;
+                        g.release();
+                        match outcome {
+                            Ok(bytes) => result_bytes = Some(bytes),
+                            Err((code, msg)) => {
+                                error_code = Some(code);
+                                error_message = Some(msg);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error_code = Some(429);
+                        error_message = Some(format!(
+                            "IICP-E021: max_concurrent={} reached",
+                            e.max_concurrent
+                        ));
+                    }
                 }
             } else {
-                let cbor_value = json_to_cbor(&user_result);
-                result_bytes = Some(encode_cbor(&cbor_value));
+                match run_handler.await {
+                    Ok(bytes) => result_bytes = Some(bytes),
+                    Err((code, msg)) => {
+                        error_code = Some(code);
+                        error_message = Some(msg);
+                    }
+                }
             }
         } else {
             error_code = Some(503);
