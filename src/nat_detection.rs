@@ -25,6 +25,19 @@ use tokio::net::lookup_host;
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
+/// ADR-043 §4 — IPv6 qualification result (#342).
+#[derive(Debug, Clone, Default)]
+pub struct Ipv6Profile {
+    pub global_v6_available: bool,
+    pub stable_v6_available: bool,
+    pub addresses: Vec<String>,
+    /// Can the SDK bind a v6 socket on the requested port?
+    pub listener_v6_ok: bool,
+    /// Outbound v6 connectivity test result (does NOT prove inbound).
+    pub external_v6_reachable: bool,
+    pub error: Option<String>,
+}
+
 /// Result of [`detect_nat`] — describes what the SDK can advertise.
 #[derive(Debug, Clone)]
 pub struct NatProfile {
@@ -35,6 +48,8 @@ pub struct NatProfile {
     pub internal_endpoint: Option<String>,
     pub operator_guidance: Option<String>,
     pub detection_log: Vec<String>,
+    /// ADR-043 §4 — populated when detect_nat runs with detect_v6=true.
+    pub ipv6: Option<Ipv6Profile>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +76,7 @@ impl NatProfile {
             internal_endpoint: None,
             operator_guidance: None,
             detection_log: Vec::new(),
+            ipv6: None,
         }
     }
 }
@@ -76,6 +92,8 @@ pub struct DetectNatOptions {
     pub external_ip_probe_url: Option<String>,
     /// spec/iicp-dir.md v0.7.0 — native IICP TCP port (default 9484).
     pub transport_port: Option<u16>,
+    /// ADR-043 §4 — run detect_ipv6() in parallel to the v4 path. Default true.
+    pub detect_v6: bool,
 }
 
 impl Default for DetectNatOptions {
@@ -88,6 +106,7 @@ impl Default for DetectNatOptions {
             timeout: Duration::from_secs(5),
             external_ip_probe_url: None,
             transport_port: Some(9484),
+            detect_v6: true,
         }
     }
 }
@@ -97,6 +116,20 @@ impl Default for DetectNatOptions {
 pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
     let mut profile = NatProfile::new(4, TransportMethod::Unreachable);
     profile.internal_endpoint = Some(format!("http://{}:{}", opts.bind_host, opts.bind_port));
+
+    // ADR-043 §4 — IPv6 qualification runs in parallel to the v4 path.
+    if opts.detect_v6 {
+        let v6_timeout = std::cmp::min(opts.timeout, Duration::from_secs(3));
+        let v6 = detect_ipv6(opts.bind_port, v6_timeout).await;
+        profile.detection_log.push(format!(
+            "ipv6: global={} stable={} listener={} reachable_out={}",
+            v6.global_v6_available,
+            v6.stable_v6_available,
+            v6.listener_v6_ok,
+            v6.external_v6_reachable
+        ));
+        profile.ipv6 = Some(v6);
+    }
 
     // Tier 0
     if let Some(ep) = &opts.operator_public_endpoint {
@@ -173,6 +206,12 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
             // #339 — CGNAT reverse-DNS heuristic
             if let Some(warning) = detect_cgnat(ip).await {
                 profile.detection_log.push(format!("tier-1: {warning}"));
+                // ADR-043 §10 — CGNAT IPv4 unreachable, advertise IPv6 GUA if usable.
+                if let Some(v6_profile) =
+                    try_ipv6_fallback(&profile, opts.bind_port, opts.transport_port)
+                {
+                    return v6_profile;
+                }
                 profile.operator_guidance = Some(format!(
                     "WARNING: your WAN IP {ip} appears to be inside a carrier-grade NAT \
                      pool (reverse-DNS suggests CGNAT). UPnP-mapped ports are typically \
@@ -229,6 +268,11 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
             "tier-1: UPnP discovery returned nothing (SSDP broadcast filtered? feature flag off?)"
                 .into(),
         );
+    }
+
+    // ADR-043 §10 — IPv6 fallback when no v4 path is usable.
+    if let Some(v6_profile) = try_ipv6_fallback(&profile, opts.bind_port, opts.transport_port) {
+        return v6_profile;
     }
 
     profile.operator_guidance = Some(
@@ -568,4 +612,183 @@ pub(crate) async fn _unused_lookup_marker() {
     // Keep tokio::net::lookup_host imported so the module compiles even when
     // reverse_dns above doesn't use it directly.
     let _ = lookup_host("localhost:0").await;
+}
+
+// ── ADR-043 §4 — IPv6 qualification (iter-1469, #342) ───────────────────────
+
+/// Probe the IPv6 surface of the local host per ADR-043 §4.
+///
+/// Three orthogonal checks:
+///   1. Any local interface has a global IPv6 address (2000::/3 GUA)?
+///   2. Can the SDK bind an IPv6 socket on `bind_port`?
+///   3. Outbound connectivity to a known IPv6-only probe target?
+///
+/// Result is advisory — the directory's Layer-2 dial-back is the source of
+/// truth for inbound reachability. Router firewall pinholes (#343) are not
+/// requested here.
+pub async fn detect_ipv6(bind_port: u16, timeout: Duration) -> Ipv6Profile {
+    let mut out = Ipv6Profile::default();
+    out.addresses = list_global_ipv6_addresses();
+    out.global_v6_available = !out.addresses.is_empty();
+    out.stable_v6_available = out.addresses.iter().any(|a| !is_privacy_v6(a));
+
+    // Bind test — can a v6 socket take this port?
+    let bind_addr = std::net::SocketAddrV6::new(std::net::Ipv6Addr::UNSPECIFIED, bind_port, 0, 0);
+    match tokio::net::TcpListener::bind(bind_addr).await {
+        Ok(_) => out.listener_v6_ok = true,
+        Err(e) => {
+            out.listener_v6_ok = false;
+            out.error = Some(format!("v6 bind failed: {e}"));
+        }
+    }
+
+    // Outbound v6 reachability test.
+    if out.global_v6_available {
+        out.external_v6_reachable = probe_outbound_ipv6(timeout).await;
+    }
+
+    out
+}
+
+fn list_global_ipv6_addresses() -> Vec<String> {
+    // Best-effort: enumerate interface addresses via the OS. We use
+    // std::net::SocketAddr's debug-introspection via env-agnostic
+    // `if-addrs`-style logic — but to avoid pulling in a new crate the
+    // implementation here uses getifaddrs equivalents from std.
+    let mut found: Vec<String> = Vec::new();
+    if let Ok(iter) = local_v6_addresses() {
+        for ip in iter {
+            // GUA = 2000::/3 (first 3 bits 001)
+            let segments = ip.segments();
+            if (segments[0] & 0xe000) == 0x2000 {
+                found.push(ip.to_string());
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Walk `/proc/net/if_inet6` on Linux, fall back to socket-style on macOS via
+/// scanning bound addresses. Best-effort — returns empty when neither works.
+fn local_v6_addresses() -> std::io::Result<Vec<std::net::Ipv6Addr>> {
+    // Linux: /proc/net/if_inet6 is the canonical source.
+    if let Ok(text) = std::fs::read_to_string("/proc/net/if_inet6") {
+        let mut out = Vec::new();
+        for line in text.lines() {
+            // Format: 16-hex addr  ifx scope flags ifname
+            let mut parts = line.split_whitespace();
+            if let Some(hex) = parts.next() {
+                if hex.len() == 32 {
+                    if let Ok(addr) = parse_ifaddr_hex(hex) {
+                        out.push(addr);
+                    }
+                }
+            }
+        }
+        return Ok(out);
+    }
+    // macOS / BSD: getifaddrs via libc. To stay dep-light, fall back to
+    // resolving the host's own hostname and pick v6 entries.
+    use std::net::ToSocketAddrs;
+    let host = match std::env::var("HOSTNAME") {
+        Ok(h) if !h.is_empty() => h,
+        _ => match hostname_via_uname() {
+            Some(h) => h,
+            None => return Ok(Vec::new()),
+        },
+    };
+    let mut out = Vec::new();
+    if let Ok(iter) = format!("{host}:0").to_socket_addrs() {
+        for sa in iter {
+            if let std::net::SocketAddr::V6(a) = sa {
+                out.push(*a.ip());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn parse_ifaddr_hex(hex: &str) -> Result<std::net::Ipv6Addr, std::num::ParseIntError> {
+    // 32 hex chars → 8 hextets
+    let mut segs = [0u16; 8];
+    for (i, seg) in segs.iter_mut().enumerate() {
+        *seg = u16::from_str_radix(&hex[i * 4..i * 4 + 4], 16)?;
+    }
+    Ok(std::net::Ipv6Addr::new(
+        segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
+    ))
+}
+
+fn hostname_via_uname() -> Option<String> {
+    // POSIX: gethostname via libc. Avoid a libc dep — use the `whoami`-style
+    // approach via std env. macOS sets `HOSTNAME` only sporadically; fall
+    // back to the OS-level via `uname -n` shell-out (rare path, best-effort).
+    use std::process::Command;
+    let out = Command::new("uname").arg("-n").output().ok()?;
+    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn is_privacy_v6(addr: &str) -> bool {
+    // RFC 4941 privacy addresses lack the EUI-64 `ff:fe` middle marker.
+    // Heuristic, not proof — operators may also have manual stable addresses
+    // without `ff:fe`. The qualification result lists raw addresses; this
+    // helper is a hint for the wizard.
+    !addr.to_lowercase().contains("ff:fe")
+}
+
+async fn probe_outbound_ipv6(timeout: Duration) -> bool {
+    // Use reqwest with a hard timeout. api6.ipify.org is IPv6-only, so a
+    // successful response confirms outbound v6 routing.
+    let client = match reqwest::Client::builder().timeout(timeout).build() {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    match client.get("https://api6.ipify.org").send().await {
+        Ok(resp) => resp.status().is_success(),
+        Err(_) => false,
+    }
+}
+
+/// ADR-043 §10 — advertise IPv6 GUA when the IPv4 path can't expose this node.
+fn try_ipv6_fallback(
+    profile: &NatProfile,
+    bind_port: u16,
+    transport_port: Option<u16>,
+) -> Option<NatProfile> {
+    let v6 = profile.ipv6.as_ref()?;
+    if !v6.global_v6_available || !v6.external_v6_reachable {
+        return None;
+    }
+    let v6_addr = v6.addresses.first()?;
+    let public_url = format!("http://[{v6_addr}]:{bind_port}");
+    let transport_url = match transport_port {
+        Some(tp) if tp != bind_port => Some(format!("iicp://[{v6_addr}]:{tp}")),
+        _ => None,
+    };
+    let mut detection_log = profile.detection_log.clone();
+    detection_log.push(format!(
+        "tier-1-ipv6: advertising {public_url} (verified outbound v6; \
+         router firewall pinhole still required — covered by #343)"
+    ));
+    let mut result = NatProfile::new(1, TransportMethod::Direct);
+    result.public_endpoint = Some(public_url);
+    result.transport_endpoint = transport_url;
+    result.internal_endpoint = profile.internal_endpoint.clone();
+    result.detection_log = detection_log;
+    result.ipv6 = profile.ipv6.clone();
+    result.operator_guidance = Some(format!(
+        "Advertising IPv6 GUA {v6_addr}. Inbound IPv4 isn't available (no UPnP \
+         success / CGNAT), but your IPv6 surface is routable. For external \
+         clients to reach this node over IPv6, ensure your router's firewall \
+         allows inbound TCP on port {bind_port} → {v6_addr}. The directory will \
+         Layer-2 dial-back to verify."
+    ));
+    Some(result)
 }

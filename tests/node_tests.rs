@@ -438,6 +438,7 @@ async fn test_apply_nat_profile_populates_fields() {
         internal_endpoint: None,
         operator_guidance: None,
         detection_log: vec!["tier-1: UPnP mapped".into()],
+        ipv6: None,
     };
     node.apply_nat_profile(&profile);
     assert!(node.register().await.is_ok());
@@ -483,6 +484,7 @@ async fn test_apply_nat_profile_unreachable_preserves_endpoint() {
         internal_endpoint: None,
         operator_guidance: Some("install igd-next".into()),
         detection_log: vec!["tier-4 fallback".into()],
+        ipv6: None,
     };
     node.apply_nat_profile(&profile);
     assert!(node.register().await.is_ok());
