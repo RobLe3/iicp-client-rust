@@ -309,11 +309,24 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
         return v6_profile;
     }
 
+    // Tier 4 external tunnel auto-detect: ngrok, tailscale funnel, env-var override.
+    if let Some(tunnel_url) = detect_external_tunnel(opts.bind_port, opts.timeout).await {
+        profile.detection_log.push(format!(
+            "tier-4: external tunnel auto-detected → {tunnel_url:?}"
+        ));
+        let mut t4 = NatProfile::new(1, TransportMethod::ExternalTunnel);
+        t4.public_endpoint = Some(tunnel_url);
+        t4.internal_endpoint = profile.internal_endpoint;
+        t4.detection_log = profile.detection_log;
+        return t4;
+    }
+
     profile.operator_guidance = Some(
         "No automatic port mapping available. Options:\n\
            1. Configure your router to forward an external port to this host\n\
            2. Set operator_public_endpoint to your real external URL\n\
-           3. Use an external tunnel (Cloudflare Tunnel, ngrok, tailscale funnel)\n\
+           3. Run `ngrok http <port>` or `cloudflared tunnel --url http://localhost:<port>` \
+              and export IICP_TUNNEL_URL=<the https URL>\n\
          See iicp.network/docs/nat-aware-adapter-setup.md for the details."
             .into(),
     );
@@ -728,6 +741,116 @@ pub async fn detect_ipv6(bind_port: u16, timeout: Duration) -> Ipv6Profile {
     }
 
     out
+}
+
+// ── External tunnel auto-detect ──────────────────────────────────────────────
+
+/// Detect a running external tunnel daemon and return its public HTTPS URL.
+///
+/// Checks in order:
+///   1. `IICP_TUNNEL_URL` / `TUNNEL_URL` / `CLOUDFLARE_TUNNEL_URL` env vars
+///   2. ngrok local REST API at `http://127.0.0.1:4040/api/tunnels`
+///   3. tailscale funnel via `tailscale serve status --json` CLI
+async fn detect_external_tunnel(bind_port: u16, timeout: Duration) -> Option<String> {
+    for var in &["IICP_TUNNEL_URL", "TUNNEL_URL", "CLOUDFLARE_TUNNEL_URL"] {
+        if let Ok(url) = std::env::var(var) {
+            if url.starts_with("https://") {
+                return Some(url);
+            }
+        }
+    }
+
+    if let Some(url) = detect_ngrok_tunnel(bind_port, timeout).await {
+        return Some(url);
+    }
+    detect_tailscale_funnel(bind_port, timeout).await
+}
+
+async fn detect_ngrok_tunnel(bind_port: u16, timeout: Duration) -> Option<String> {
+    let client = reqwest::Client::builder()
+        .timeout(timeout.min(Duration::from_secs(2)))
+        .build()
+        .ok()?;
+
+    let resp = client
+        .get("http://127.0.0.1:4040/api/tunnels")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+    let tunnels = body.get("tunnels")?.as_array()?;
+    let mut first_https: Option<String> = None;
+    for tunnel in tunnels {
+        let pub_url = tunnel.get("public_url")?.as_str()?.to_string();
+        if !pub_url.starts_with("https://") {
+            continue;
+        }
+        let cfg_addr = tunnel
+            .get("config")
+            .and_then(|c| c.get("addr"))
+            .and_then(|a| a.as_str())
+            .unwrap_or("");
+        if cfg_addr.contains(&format!(":{bind_port}")) {
+            return Some(pub_url);
+        }
+        if first_https.is_none() {
+            first_https = Some(pub_url);
+        }
+    }
+    first_https
+}
+
+async fn detect_tailscale_funnel(bind_port: u16, timeout: Duration) -> Option<String> {
+    let run = |args: &[&str]| {
+        let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        async move {
+            tokio::time::timeout(timeout, async move {
+                tokio::process::Command::new("tailscale")
+                    .args(&args)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output()
+                    .await
+            })
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+        }
+    };
+
+    let status_out = run(&["status", "--json"]).await?;
+    let status: serde_json::Value = serde_json::from_slice(&status_out.stdout).ok()?;
+    let dns_name = status
+        .get("Self")?
+        .get("DNSName")?
+        .as_str()?
+        .trim_end_matches('.')
+        .to_string();
+    if dns_name.is_empty() {
+        return None;
+    }
+
+    let serve_out = run(&["serve", "status", "--json"]).await?;
+    let serve: serde_json::Value = serde_json::from_slice(&serve_out.stdout).ok()?;
+    if let Some(tcp) = serve.get("TCP").and_then(|t| t.as_object()) {
+        for (src, cfg) in tcp {
+            if cfg.get("Funnel").and_then(|f| f.as_bool()).unwrap_or(false)
+                && src.contains(&format!(":{bind_port}"))
+            {
+                let port_sfx = if bind_port == 443 || bind_port == 80 {
+                    String::new()
+                } else {
+                    format!(":{bind_port}")
+                };
+                return Some(format!("https://{dns_name}{port_sfx}"));
+            }
+        }
+    }
+    None
 }
 
 /// Enumerate all local IPv4 addresses across network interfaces.
