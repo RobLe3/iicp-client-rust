@@ -1524,3 +1524,36 @@ pub async fn delete_ipv6_pinhole(unique_id: u32) -> bool {
     }
     false
 }
+
+/// Extend a previously-opened IPv6 pinhole via WANIPv6FirewallControl::UpdatePinhole (#343).
+/// Returns true on success; silently returns false when the IGD is unreachable or does not
+/// support UpdatePinhole — existing lease runs to expiry and the renewal loop retries.
+pub async fn renew_ipv6_pinhole(unique_id: u32, new_lease_seconds: u32) -> bool {
+    let timeout = Duration::from_secs(5);
+    let hits = ssdp_discover(
+        "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1",
+        timeout,
+    )
+    .await;
+    for hit in hits {
+        let svc = match fetch_firewall_service(&hit.location, timeout).await {
+            Some(s) => s,
+            None => continue,
+        };
+        let result = soap_call(
+            &svc.control_url,
+            &svc.service_type,
+            "UpdatePinhole",
+            &[
+                ("UniqueID", unique_id.to_string()),
+                ("NewLeaseTime", new_lease_seconds.to_string()),
+            ],
+            timeout,
+        )
+        .await;
+        if result.is_some() {
+            return true;
+        }
+    }
+    false
+}

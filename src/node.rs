@@ -150,12 +150,26 @@ struct AppState {
     active_jobs: Arc<AtomicUsize>,
     max_concurrent: usize,
     nonce_cache: Arc<Mutex<HashMap<String, Instant>>>,
+    /// #343 — shared pinhole state for /iicp/health surface.
+    pinhole_uid: Arc<std::sync::RwLock<Option<u32>>>,
+    pinhole_lease_seconds: Arc<std::sync::RwLock<u32>>,
 }
 
 // ── GET /iicp/health ─────────────────────────────────────────────────────────
 
 async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let active = state.active_jobs.load(Ordering::Relaxed);
+    let uid = state.pinhole_uid.read().ok().and_then(|g| *g);
+    let lease = state
+        .pinhole_lease_seconds
+        .read()
+        .map(|g| *g)
+        .unwrap_or(3600);
+    let pinhole_state = if let Some(uid) = uid {
+        json!({ "active": true, "unique_id": uid, "lease_seconds": lease })
+    } else {
+        json!({ "active": false })
+    };
     Json(json!({
         "status": "ok",
         "node_id": state.node_id,
@@ -166,6 +180,7 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "available": active < state.max_concurrent,
         "model": state.model,
         "intent": state.intent,
+        "pinhole_state": pinhole_state,
     }))
 }
 
@@ -285,6 +300,8 @@ pub struct IicpNode {
     /// feature; allowed dead_code so non-nat builds compile cleanly.
     #[allow(dead_code)]
     pinhole_uid: std::sync::RwLock<Option<u32>>,
+    #[allow(dead_code)]
+    pinhole_lease_seconds: std::sync::RwLock<u32>,
 }
 
 impl IicpNode {
@@ -300,6 +317,7 @@ impl IicpNode {
             http,
             runtime_hmac_key,
             pinhole_uid: std::sync::RwLock::new(None),
+            pinhole_lease_seconds: std::sync::RwLock::new(3600),
         }
     }
 
@@ -361,12 +379,17 @@ impl IicpNode {
             "tier": profile.tier,
             "detection_log_tail": tail,
         }));
-        // #343 — capture the IPv6 firewall pinhole UID so we can revoke it on shutdown.
+        // #343 — capture the IPv6 firewall pinhole UID and lease so we can renew and revoke.
         if let Some(v6) = &profile.ipv6 {
             if v6.pinhole_active {
                 if let Some(uid) = v6.pinhole_unique_id {
                     if let Ok(mut slot) = self.pinhole_uid.write() {
                         *slot = Some(uid);
+                    }
+                }
+                if let Some(lease) = v6.pinhole_lease_seconds {
+                    if let Ok(mut slot) = self.pinhole_lease_seconds.write() {
+                        *slot = lease;
                     }
                 }
             }
@@ -535,10 +558,16 @@ impl IicpNode {
     pub async fn heartbeat(&self, node_token: &str) -> Result<()> {
         let resp = self
             .http
+            // /v1/heartbeat — default directory_url already ends in /api;
+            // the prior /api/v1/heartbeat path doubled the prefix and 404'd,
+            // so last_seen never updated and nodes vanished from /v1/stats.
             .post(format!(
-                "{}/api/v1/heartbeat",
+                "{}/v1/heartbeat",
                 self.cfg.directory_url.trim_end_matches('/')
             ))
+            // NodeTokenAuth middleware requires Bearer auth; the body
+            // token is retained for back-compat with older directory builds.
+            .bearer_auth(node_token)
             .json(&json!({
                 "node_id": self.cfg.node_id,
                 "node_token": node_token,
@@ -574,6 +603,16 @@ impl IicpNode {
         let handler: TaskHandlerFn = Arc::new(move |req| Box::pin(handler(req)));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let nonce_cache = Arc::new(Mutex::new(HashMap::new()));
+        // #343 — shared pinhole state: pass to AppState (health endpoint) and renewal task.
+        let shared_pinhole_uid: Arc<std::sync::RwLock<Option<u32>>> = Arc::new(
+            std::sync::RwLock::new(self.pinhole_uid.read().ok().and_then(|g| *g)),
+        );
+        let shared_pinhole_lease: Arc<std::sync::RwLock<u32>> = Arc::new(std::sync::RwLock::new(
+            self.pinhole_lease_seconds
+                .read()
+                .map(|g| *g)
+                .unwrap_or(3600),
+        ));
 
         let state = Arc::new(AppState {
             handler,
@@ -584,6 +623,8 @@ impl IicpNode {
             active_jobs,
             max_concurrent: self.cfg.max_concurrent,
             nonce_cache,
+            pinhole_uid: Arc::clone(&shared_pinhole_uid),
+            pinhole_lease_seconds: Arc::clone(&shared_pinhole_lease),
         });
 
         let app = Router::new()
@@ -609,7 +650,10 @@ impl IicpNode {
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
                     if let Err(e) = http
-                        .post(format!("{}/api/v1/heartbeat", dir.trim_end_matches('/')))
+                        // /v1/heartbeat — see heartbeat() above for the doubled-prefix
+                        // history. Same fix applied here in the background loop.
+                        .post(format!("{}/v1/heartbeat", dir.trim_end_matches('/')))
+                        .bearer_auth(&token)
                         .json(&json!({
                             "node_id": &node_id,
                             "node_token": &token,
@@ -619,6 +663,34 @@ impl IicpNode {
                         .await
                     {
                         tracing::warn!("heartbeat failed: {e}");
+                    }
+                }
+            });
+        }
+
+        // #343 — pinhole renewal task: extends the UPnP IPv6 firewall pinhole at lease/2.
+        #[cfg(feature = "nat")]
+        {
+            let uid_arc = Arc::clone(&shared_pinhole_uid);
+            let lease_arc = Arc::clone(&shared_pinhole_lease);
+            tokio::spawn(async move {
+                loop {
+                    let (uid, lease) = {
+                        let u = uid_arc.read().ok().and_then(|g| *g);
+                        let l = lease_arc.read().map(|g| *g).unwrap_or(3600);
+                        (u, l)
+                    };
+                    let delay = Duration::from_secs(u64::from((lease / 2).max(60)));
+                    tokio::time::sleep(delay).await;
+                    let uid = match uid_arc.read().ok().and_then(|g| *g) {
+                        Some(u) => u,
+                        None => return,
+                    };
+                    let ok = crate::nat_detection::renew_ipv6_pinhole(uid, lease).await;
+                    if ok {
+                        tracing::debug!("UPnP IPv6 pinhole uid={uid} renewed (lease={lease}s)");
+                    } else {
+                        tracing::warn!("UPnP IPv6 pinhole uid={uid} renewal failed — will retry");
                     }
                 }
             });
