@@ -45,7 +45,10 @@ fn make_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
 
 fn cbor_encode_int_map(entries: &[(i64, CborVal)]) -> Vec<u8> {
     let map = CborVal::Map(
-        entries.iter().map(|(k, v)| (CborVal::Integer((*k).into()), v.clone())).collect(),
+        entries
+            .iter()
+            .map(|(k, v)| (CborVal::Integer((*k).into()), v.clone()))
+            .collect(),
     );
     let mut buf = Vec::new();
     let _ = ciborium::ser::into_writer(&map, &mut buf);
@@ -54,11 +57,16 @@ fn cbor_encode_int_map(entries: &[(i64, CborVal)]) -> Vec<u8> {
 
 fn cbor_decode_int_map(data: &[u8]) -> Option<std::collections::HashMap<i64, CborVal>> {
     let v: CborVal = ciborium::de::from_reader(data).ok()?;
-    let map = match v { CborVal::Map(m) => m, _ => return None };
+    let map = match v {
+        CborVal::Map(m) => m,
+        _ => return None,
+    };
     let mut out = std::collections::HashMap::new();
     for (k, val) in map {
         if let CborVal::Integer(n) = k {
-            if let Ok(key) = i64::try_from(n) { out.insert(key, val); }
+            if let Ok(key) = i64::try_from(n) {
+                out.insert(key, val);
+            }
         }
     }
     Some(out)
@@ -83,12 +91,18 @@ fn cbor_text(v: Option<&CborVal>) -> String {
 async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec<u8>)> {
     let mut header = [0u8; FRAME_HEADER_LEN];
     reader.read_exact(&mut header).await.ok()?;
-    if &header[..4] != IICP_MAGIC { return None; }
+    if &header[..4] != IICP_MAGIC {
+        return None;
+    }
     let msg_type = header[5];
     let payload_len = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as usize;
-    if payload_len > 16 * 1024 * 1024 { return None; }
+    if payload_len > 16 * 1024 * 1024 {
+        return None;
+    }
     let mut payload = vec![0u8; payload_len];
-    if payload_len > 0 { reader.read_exact(&mut payload).await.ok()?; }
+    if payload_len > 0 {
+        reader.read_exact(&mut payload).await.ok()?;
+    }
     Some((msg_type, payload))
 }
 
@@ -98,9 +112,7 @@ pub type RelayHandlerFn =
 
 /// Callback invoked after a successful RELAY_ACK — use to re-register with the directory (#358).
 pub type OnBindFn = Arc<
-    dyn Fn(String, u16, String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
-        + Send
-        + Sync,
+    dyn Fn(String, u16, String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
 /// Relay worker client — connects outbound to a relay, handles CALL frames.
@@ -144,11 +156,14 @@ impl RelayWorkerClient {
         let mut delay = Duration::from_secs(2);
         loop {
             match self.session().await {
-                Ok(()) => { delay = Duration::from_secs(2); }
+                Ok(()) => {
+                    delay = Duration::from_secs(2);
+                }
                 Err(e) => {
                     tracing::warn!(
                         "Relay worker {}: session error: {e} — reconnecting in {:?}",
-                        self.worker_id, delay,
+                        self.worker_id,
+                        delay,
                     );
                 }
             }
@@ -163,25 +178,47 @@ impl RelayWorkerClient {
             .map_err(|e| e.to_string())?;
         tracing::debug!(
             "Relay worker {}: connected to {}:{}",
-            self.worker_id, self.relay_host, self.relay_port
+            self.worker_id,
+            self.relay_host,
+            self.relay_port
         );
         let (mut reader, mut writer) = stream.into_split();
 
         // Step 1: INIT → ACK
         let init = cbor_encode_int_map(&[(1, CborVal::Integer((FRAMING_VERSION as i64).into()))]);
-        writer.write_all(&make_frame(MT_INIT, &init)).await.map_err(|e| e.to_string())?;
+        writer
+            .write_all(&make_frame(MT_INIT, &init))
+            .await
+            .map_err(|e| e.to_string())?;
         let (mt, _) = read_frame(&mut reader).await.ok_or("EOF after INIT")?;
-        if mt != MT_ACK { return Err(format!("expected ACK, got 0x{mt:02x}")); }
+        if mt != MT_ACK {
+            return Err(format!("expected ACK, got 0x{mt:02x}"));
+        }
 
         // Step 2: RELAY_BIND → RELAY_ACK
         let bind = cbor_encode_int_map(&[
             (1, CborVal::Text(self.worker_id.clone())),
             (2, CborVal::Text(self.intent.clone())),
-            (3, CborVal::Array(self.models.iter().map(|m| CborVal::Text(m.clone())).collect())),
+            (
+                3,
+                CborVal::Array(
+                    self.models
+                        .iter()
+                        .map(|m| CborVal::Text(m.clone()))
+                        .collect(),
+                ),
+            ),
         ]);
-        writer.write_all(&make_frame(MT_RELAY_BIND, &bind)).await.map_err(|e| e.to_string())?;
-        let (mt, payload) = read_frame(&mut reader).await.ok_or("EOF after RELAY_BIND")?;
-        if mt != MT_RELAY_ACK { return Err(format!("expected RELAY_ACK, got 0x{mt:02x}")); }
+        writer
+            .write_all(&make_frame(MT_RELAY_BIND, &bind))
+            .await
+            .map_err(|e| e.to_string())?;
+        let (mt, payload) = read_frame(&mut reader)
+            .await
+            .ok_or("EOF after RELAY_BIND")?;
+        if mt != MT_RELAY_ACK {
+            return Err(format!("expected RELAY_ACK, got 0x{mt:02x}"));
+        }
         let ack_body = cbor_decode_int_map(&payload).ok_or("RELAY_ACK decode failed")?;
         if cbor_text(ack_body.get(&1)) != "ok" {
             return Err(format!("RELAY_ACK not ok: {:?}", ack_body.get(&1)));
@@ -189,10 +226,17 @@ impl RelayWorkerClient {
 
         tracing::info!(
             "Relay worker {}: bound to relay {}:{}",
-            self.worker_id, self.relay_host, self.relay_port
+            self.worker_id,
+            self.relay_host,
+            self.relay_port
         );
         if let Some(cb) = &self.on_bind {
-            cb(self.relay_host.clone(), self.relay_port, self.worker_id.clone()).await;
+            cb(
+                self.relay_host.clone(),
+                self.relay_port,
+                self.worker_id.clone(),
+            )
+            .await;
         }
 
         // Step 3: session loop
@@ -208,7 +252,9 @@ impl RelayWorkerClient {
                 let pong = cbor_encode_int_map(&[(1, CborVal::Bytes(vec![]))]);
                 let frame = make_frame(MT_PING, &pong);
                 let mut w = writer_ping.lock().await;
-                if w.write_all(&frame).await.is_err() { break; }
+                if w.write_all(&frame).await.is_err() {
+                    break;
+                }
             }
         });
 
@@ -221,10 +267,14 @@ impl RelayWorkerClient {
                     let wid = worker_id.clone();
                     tokio::spawn(async move {
                         let body = cbor_decode_int_map(&payload);
-                        let call_id = body.as_ref()
+                        let call_id = body
+                            .as_ref()
                             .map(|b| cbor_text(b.get(&15)))
                             .unwrap_or_default();
-                        let raw5 = body.as_ref().map(|b| cbor_bytes(b.get(&5))).unwrap_or_default();
+                        let raw5 = body
+                            .as_ref()
+                            .map(|b| cbor_bytes(b.get(&5)))
+                            .unwrap_or_default();
                         let task: Value = serde_json::from_slice(&raw5).unwrap_or(Value::Null);
                         let result = handler(task).await;
                         let resp_body = serde_json::to_string(&result).unwrap_or_default();
@@ -261,7 +311,10 @@ mod tests {
         let frame = make_frame(0x09, b"payload");
         assert_eq!(&frame[..4], b"IICP");
         assert_eq!(frame[5], 0x09);
-        assert_eq!(u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]), 7);
+        assert_eq!(
+            u32::from_be_bytes([frame[8], frame[9], frame[10], frame[11]]),
+            7
+        );
     }
 
     #[test]

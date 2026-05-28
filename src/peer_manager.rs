@@ -12,8 +12,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 const GOSSIP_INTERVAL: Duration = Duration::from_secs(30);
 const PEER_EXPIRY: Duration = Duration::from_secs(90);
@@ -48,7 +48,10 @@ pub struct PeerManagerOpts {
 
 impl Default for PeerManagerOpts {
     fn default() -> Self {
-        Self { relay_capable: false, relay_accept_port: 9485 }
+        Self {
+            relay_capable: false,
+            relay_accept_port: 9485,
+        }
     }
 }
 
@@ -141,10 +144,7 @@ impl PeerManager {
                         .get("relay_accept_port")
                         .and_then(Value::as_u64)
                         .unwrap_or(9485) as u16,
-                    relay_load: p
-                        .get("relay_load")
-                        .and_then(Value::as_f64)
-                        .unwrap_or(0.0),
+                    relay_load: p.get("relay_load").and_then(Value::as_f64).unwrap_or(0.0),
                 },
             );
         }
@@ -187,7 +187,11 @@ impl PeerManager {
         // Derive relay host from endpoint URL (same host, relay_accept_port)
         let relay_host = Self::extract_host(&elected.endpoint);
         let relay_port = elected.relay_accept_port;
-        Some(ElectedRelay { relay_host, relay_port, peer: elected })
+        Some(ElectedRelay {
+            relay_host,
+            relay_port,
+            peer: elected,
+        })
     }
 
     fn extract_host(endpoint: &str) -> String {
@@ -283,14 +287,16 @@ impl PeerManager {
             .lock()
             .expect("peers lock")
             .values()
-            .map(|p| serde_json::json!({
-                "node_id": p.node_id,
-                "endpoint": p.endpoint,
-                "region": p.region,
-                "relay_capable": p.relay_capable,
-                "relay_accept_port": p.relay_accept_port,
-                "relay_load": p.relay_load,
-            }))
+            .map(|p| {
+                serde_json::json!({
+                    "node_id": p.node_id,
+                    "endpoint": p.endpoint,
+                    "region": p.region,
+                    "relay_capable": p.relay_capable,
+                    "relay_accept_port": p.relay_accept_port,
+                    "relay_load": p.relay_load,
+                })
+            })
             .collect();
         if !own_id.is_empty() {
             known.push(serde_json::json!({
@@ -414,7 +420,11 @@ mod tests {
     #[test]
     fn get_relay_candidates_excludes_non_relay() {
         let m = pm_with_relays();
-        let ids: Vec<_> = m.get_relay_candidates().into_iter().map(|p| p.node_id).collect();
+        let ids: Vec<_> = m
+            .get_relay_candidates()
+            .into_iter()
+            .map(|p| p.node_id)
+            .collect();
         assert!(!ids.contains(&"non-relay".to_string()));
         assert!(ids.contains(&"relay-a".to_string()));
         assert!(ids.contains(&"relay-b".to_string()));
@@ -448,14 +458,19 @@ mod tests {
     #[test]
     fn elect_relay_none_when_no_relays() {
         let m = pm("");
-        m.merge_peers(&[json!({"node_id": "nr", "endpoint": "http://nr:8020", "relay_capable": false})]);
+        m.merge_peers(&[
+            json!({"node_id": "nr", "endpoint": "http://nr:8020", "relay_capable": false}),
+        ]);
         assert!(m.elect_relay("worker").is_none());
     }
 
     #[test]
     fn extract_host_variants() {
         assert_eq!(PeerManager::extract_host("http://relay-a:8020"), "relay-a");
-        assert_eq!(PeerManager::extract_host("https://relay.example.com:9485/"), "relay.example.com");
+        assert_eq!(
+            PeerManager::extract_host("https://relay.example.com:9485/"),
+            "relay.example.com"
+        );
         assert_eq!(PeerManager::extract_host("relay.host"), "relay.host");
     }
 }

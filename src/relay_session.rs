@@ -244,11 +244,12 @@ impl RelayAcceptServer {
     }
 }
 
-async fn read_frame(
-    reader: &mut (impl AsyncReadExt + Unpin),
-) -> Result<(u8, Vec<u8>), String> {
+async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<(u8, Vec<u8>), String> {
     let mut header = [0u8; FRAME_HEADER_LEN];
-    reader.read_exact(&mut header).await.map_err(|e| e.to_string())?;
+    reader
+        .read_exact(&mut header)
+        .await
+        .map_err(|e| e.to_string())?;
     if &header[..4] != IICP_MAGIC {
         return Err(format!("bad magic {:?}", &header[..4]));
     }
@@ -259,7 +260,10 @@ async fn read_frame(
     }
     let mut payload = vec![0u8; payload_len];
     if payload_len > 0 {
-        reader.read_exact(&mut payload).await.map_err(|e| e.to_string())?;
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok((msg_type, payload))
 }
@@ -275,8 +279,12 @@ async fn handle_relay_connection(
     if mt != MT_INIT {
         return Err(format!("expected INIT, got 0x{mt:02x}"));
     }
-    let ack_payload = cbor_encode_int_map(&[(1, CborVal::Integer((FRAMING_VERSION as i64).into()))]);
-    writer.write_all(&make_frame(MT_ACK, &ack_payload)).await.map_err(|e| e.to_string())?;
+    let ack_payload =
+        cbor_encode_int_map(&[(1, CborVal::Integer((FRAMING_VERSION as i64).into()))]);
+    writer
+        .write_all(&make_frame(MT_ACK, &ack_payload))
+        .await
+        .map_err(|e| e.to_string())?;
 
     // Step 2: RELAY_BIND
     let (mt, payload) = read_frame(&mut reader).await?;
@@ -384,7 +392,11 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let session = RelayWorkerSession::new("w-001".into(), tx);
         let (otx, mut orx) = oneshot::channel::<Value>();
-        session.pending.lock().unwrap().insert("call-abc".into(), otx);
+        session
+            .pending
+            .lock()
+            .unwrap()
+            .insert("call-abc".into(), otx);
         session.on_response("call-abc", json!({ "result": "ok" }));
         let val = orx.try_recv().expect("should be resolved");
         assert_eq!(val["result"], "ok");

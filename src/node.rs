@@ -316,7 +316,10 @@ async fn relay_endpoint(
     if let Some(session) = state.relay_sessions.get(target_id) {
         match session.forward_task(&task_val, 120).await {
             Ok(result) => {
-                let task_id = task_val.get("task_id").and_then(Value::as_str).unwrap_or("");
+                let task_id = task_val
+                    .get("task_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 return Json(json!({
                     "task_id": task_id,
                     "status": "completed",
@@ -1015,20 +1018,30 @@ impl IicpNode {
                     let h = Arc::clone(&handler_for_relay);
                     Box::pin(async move {
                         let req = crate::node::TaskRequest {
-                            task_id: task.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                            intent: task.get("intent").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            task_id: task
+                                .get("task_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            intent: task
+                                .get("intent")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
                             payload: task.get("payload").cloned().unwrap_or(Value::Null),
                             constraints: task.get("constraints").cloned(),
                             auth: task.get("auth").cloned(),
                             nonce: None,
                             _trace: None,
                         };
-                        h(req).await.unwrap_or_else(|e| json!({"error": e.to_string()}))
+                        h(req)
+                            .await
+                            .unwrap_or_else(|e| json!({"error": e.to_string()}))
                     })
                 });
             let (rhost, rport) = {
                 if let Some(pos) = ep.rfind(':') {
-                    let port = ep[pos+1..].parse::<u16>().unwrap_or(9485);
+                    let port = ep[pos + 1..].parse::<u16>().unwrap_or(9485);
                     (ep[..pos].to_string(), port)
                 } else {
                     (ep.clone(), 9485u16)
@@ -1038,8 +1051,8 @@ impl IicpNode {
             // appears ACTIVE in directory + stats (#358).
             let http_client = self.http.clone();
             let dir_url = self.cfg.directory_url.clone();
-            let on_bind_cb: crate::relay_worker_client::OnBindFn =
-                Arc::new(move |rh: String, rp: u16, _wid: String| {
+            let on_bind_cb: crate::relay_worker_client::OnBindFn = Arc::new(
+                move |rh: String, rp: u16, _wid: String| {
                     let http = http_client.clone();
                     let dir = dir_url.clone();
                     Box::pin(async move {
@@ -1053,7 +1066,8 @@ impl IicpNode {
                         );
                         let _ = (http, dir); // suppress unused warnings
                     })
-                });
+                },
+            );
             tokio::spawn(async move {
                 let rwc = Arc::new(
                     crate::relay_worker_client::RelayWorkerClient::new(
