@@ -170,7 +170,11 @@ async fn report_divergence(
 }
 
 /// Discover peers, probe each, report divergences. One pass.
-pub async fn run_audit_pass(directory_url: &str, own_node_id: &str, node_token: &str) -> AuditReport {
+pub async fn run_audit_pass(
+    directory_url: &str,
+    own_node_id: &str,
+    node_token: &str,
+) -> AuditReport {
     let client = reqwest::Client::new();
     let nodes = discover_peers(&client, directory_url, own_node_id).await;
     let mut results = Vec::with_capacity(nodes.len());

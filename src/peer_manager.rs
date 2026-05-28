@@ -48,7 +48,12 @@ impl PeerManager {
     }
 
     pub fn get_peers(&self) -> Vec<PeerInfo> {
-        self.peers.lock().expect("peers lock").values().cloned().collect()
+        self.peers
+            .lock()
+            .expect("peers lock")
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn relay_target(&self, node_id: &str) -> Option<PeerInfo> {
@@ -73,9 +78,21 @@ impl PeerManager {
                 nid.to_string(),
                 PeerInfo {
                     node_id: nid.to_string(),
-                    endpoint: p.get("endpoint").and_then(Value::as_str).unwrap_or("").to_string(),
-                    region: p.get("region").and_then(Value::as_str).unwrap_or("").to_string(),
-                    last_seen: p.get("last_seen").and_then(Value::as_str).unwrap_or("").to_string(),
+                    endpoint: p
+                        .get("endpoint")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    region: p
+                        .get("region")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    last_seen: p
+                        .get("last_seen")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
                     last_contact: now,
                 },
             );
@@ -155,7 +172,8 @@ impl PeerManager {
             .keys()
             .cloned()
             .collect();
-        let body = serde_json::to_vec(&serde_json::json!({ "known_peers": known })).unwrap_or_default();
+        let body =
+            serde_json::to_vec(&serde_json::json!({ "known_peers": known })).unwrap_or_default();
         let url = format!("{}/v1/peers", target.endpoint.trim_end_matches('/'));
         let mut req = self
             .client
@@ -164,7 +182,10 @@ impl PeerManager {
             .timeout(Duration::from_secs(5))
             .body(body.clone());
         if !self.node_token.is_empty() {
-            req = req.header("X-IICP-Signature", crate::pricing::sign_body(&body, &self.node_token));
+            req = req.header(
+                "X-IICP-Signature",
+                crate::pricing::sign_body(&body, &self.node_token),
+            );
         }
         if let Ok(resp) = req.send().await {
             if resp.status().is_success() {
@@ -173,7 +194,12 @@ impl PeerManager {
                         self.merge_peers(arr);
                     }
                 }
-                if let Some(p) = self.peers.lock().expect("peers lock").get_mut(&target.node_id) {
+                if let Some(p) = self
+                    .peers
+                    .lock()
+                    .expect("peers lock")
+                    .get_mut(&target.node_id)
+                {
                     p.last_contact = Instant::now();
                 }
             }

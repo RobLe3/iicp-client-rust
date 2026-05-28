@@ -26,7 +26,10 @@ impl Default for IdempotencyGuard {
 
 impl IdempotencyGuard {
     pub fn new(ttl: Duration) -> Self {
-        Self { ttl, seen: Mutex::new(HashMap::new()) }
+        Self {
+            ttl,
+            seen: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Return `true` if `task_id` is new; `false` if a duplicate within the TTL.

@@ -503,9 +503,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         );
     }
     if !BACKEND_TYPES.contains(&opts.backend_type.as_str()) {
-        return Err(format!(
-            "--backend-type must be one of {BACKEND_TYPES:?}"
-        ));
+        return Err(format!("--backend-type must be one of {BACKEND_TYPES:?}"));
     }
 
     if opts.node_id.is_empty() {

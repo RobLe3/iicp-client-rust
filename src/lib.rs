@@ -29,13 +29,13 @@ pub mod iicp_tcp;
 #[cfg(feature = "nat")]
 pub mod nat_detection;
 
+pub mod availability;
 pub mod backends;
 pub mod cip_policy;
 pub mod concurrency;
 pub mod conformance;
-pub mod availability;
-pub mod identity;
 pub mod idempotency;
+pub mod identity;
 pub mod peer_manager;
 pub mod pricing;
 pub mod scheduler;

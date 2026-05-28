@@ -88,7 +88,11 @@ mod tests {
     use super::*;
 
     fn win(start: &str, end: &str, share: f64) -> Window {
-        Window { start: start.into(), end: end.into(), share }
+        Window {
+            start: start.into(),
+            end: end.into(),
+            share,
+        }
     }
 
     #[test]

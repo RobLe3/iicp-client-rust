@@ -193,7 +193,9 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
     } else {
         json!({ "active": false })
     };
-    let eff_max = state.availability.effective_max_concurrent(state.max_concurrent);
+    let eff_max = state
+        .availability
+        .effective_max_concurrent(state.max_concurrent);
     Json(json!({
         "status": "ok",
         "node_id": state.node_id,
@@ -244,7 +246,9 @@ async fn peers_endpoint(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
-    let sig = headers.get("x-iicp-signature").and_then(|v| v.to_str().ok());
+    let sig = headers
+        .get("x-iicp-signature")
+        .and_then(|v| v.to_str().ok());
     if !state.peer_manager.verify_exchange(&body, sig) {
         return (
             StatusCode::UNAUTHORIZED,
@@ -276,7 +280,10 @@ async fn peers_endpoint(
 
 // ── POST /v1/relay (ADR-022 mesh relay) ───────────────────────────────────────
 
-async fn relay_endpoint(State(state): State<Arc<AppState>>, Json(payload): Json<Value>) -> Response {
+async fn relay_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Response {
     let target_id = payload
         .get("target_node_id")
         .and_then(Value::as_str)
@@ -285,7 +292,9 @@ async fn relay_endpoint(State(state): State<Arc<AppState>>, Json(payload): Json<
     if target_id.is_empty() || task.is_none() {
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
-            Json(json!({"error":{"code":"IICP-E000","message":"target_node_id and task required"}})),
+            Json(
+                json!({"error":{"code":"IICP-E000","message":"target_node_id and task required"}}),
+            ),
         )
             .into_response();
     }
@@ -330,7 +339,9 @@ async fn relay_endpoint(State(state): State<Arc<AppState>>, Json(payload): Json<
 async fn admit(state: &AppState, qos: &str) -> bool {
     // Effective cap folds in availability windows (ADR-006): a reduced/closed
     // window lowers capacity below max_concurrent.
-    let cap = state.availability.effective_max_concurrent(state.max_concurrent);
+    let cap = state
+        .availability
+        .effective_max_concurrent(state.max_concurrent);
     let prev = state.active_jobs.fetch_add(1, Ordering::Relaxed);
     if prev < cap {
         return true;
@@ -342,7 +353,9 @@ async fn admit(state: &AppState, qos: &str) -> bool {
     let deadline = Instant::now() + crate::scheduler::QUEUE_WAIT;
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(50)).await;
-        let cap = state.availability.effective_max_concurrent(state.max_concurrent);
+        let cap = state
+            .availability
+            .effective_max_concurrent(state.max_concurrent);
         let prev = state.active_jobs.fetch_add(1, Ordering::Relaxed);
         if prev < cap {
             return true;

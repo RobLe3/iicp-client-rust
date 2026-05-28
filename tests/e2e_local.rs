@@ -39,7 +39,9 @@ fn spawn_node(cfg: NodeConfig, port: u16) {
                 Ok(v.get("result").cloned().unwrap_or(v))
             }
         };
-        let _ = node.serve(handler, &format!("127.0.0.1:{port}"), None).await;
+        let _ = node
+            .serve(handler, &format!("127.0.0.1:{port}"), None)
+            .await;
     });
 }
 
@@ -95,8 +97,13 @@ async fn e2e_rust_serving_node_local() {
     )
     .await;
     assert_eq!(s1, 200, "task should return 200: {b1}");
-    let content = b1["result"]["choices"][0]["message"]["content"].as_str().unwrap_or("");
-    assert!(!content.is_empty(), "expected a real Ollama completion, got: {b1}");
+    let content = b1["result"]["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !content.is_empty(),
+        "expected a real Ollama completion, got: {b1}"
+    );
     eprintln!("[1] model said: {content:?}");
 
     // [2] health capacity fields
@@ -108,8 +115,14 @@ async fn e2e_rust_serving_node_local() {
         .json::<Value>()
         .await
         .unwrap();
-    assert!(h.get("effective_max_concurrent").is_some(), "health missing effective_max_concurrent: {h}");
-    eprintln!("[2] health OK: effective_max_concurrent={}", h["effective_max_concurrent"]);
+    assert!(
+        h.get("effective_max_concurrent").is_some(),
+        "health missing effective_max_concurrent: {h}"
+    );
+    eprintln!(
+        "[2] health OK: effective_max_concurrent={}",
+        h["effective_max_concurrent"]
+    );
 
     // [3] idempotency: duplicate task_id -> 409 IICP-E010
     let dup = json!({"task_id":"11111111-1111-4111-8111-111111111111","intent":INTENT,
@@ -131,7 +144,10 @@ async fn e2e_rust_serving_node_local() {
     .await;
     assert_eq!(sp, 200, "peers exchange should be 200: {peers}");
     assert!(
-        peers["peers"].as_array().map(|a| a.iter().any(|p| p["node_id"] == "e2e-rs-B")).unwrap_or(false),
+        peers["peers"]
+            .as_array()
+            .map(|a| a.iter().any(|p| p["node_id"] == "e2e-rs-B"))
+            .unwrap_or(false),
         "A should now know B: {peers}"
     );
     let (sr, rel) = post(
@@ -143,8 +159,13 @@ async fn e2e_rust_serving_node_local() {
     )
     .await;
     assert_eq!(sr, 200, "relay should return 200: {rel}");
-    let rc = rel["result"]["choices"][0]["message"]["content"].as_str().unwrap_or("");
-    assert!(!rc.is_empty(), "relay should produce a real completion from B: {rel}");
+    let rc = rel["result"]["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        !rc.is_empty(),
+        "relay should produce a real completion from B: {rel}"
+    );
     eprintln!("[4] relay round-trip OK: B said {rc:?}");
 
     // relay unknown target -> 404 IICP-E030

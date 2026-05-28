@@ -15,7 +15,9 @@ pub struct TokenValidator {
 
 impl TokenValidator {
     pub fn new(expected_token: impl Into<String>) -> Self {
-        Self { expected: expected_token.into() }
+        Self {
+            expected: expected_token.into(),
+        }
     }
 
     pub fn is_valid(&self, presented: &str) -> bool {
