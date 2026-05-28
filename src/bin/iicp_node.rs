@@ -555,8 +555,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
 
     if opts.node_id.is_empty() {
-        let suffix: String = uuid::Uuid::new_v4().simple().to_string()[..8].into();
-        opts.node_id = format!("sdk-{}-{suffix}", opts.model.replace(':', "-"));
+        opts.node_id = uuid::Uuid::new_v4().to_string();
     }
     if opts.public_endpoint.is_empty() {
         opts.public_endpoint = format!("http://localhost:{}", opts.port);
