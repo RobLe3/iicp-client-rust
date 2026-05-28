@@ -47,6 +47,9 @@ pub enum MsgType {
     Feedback = 0x08,
     Ping = 0x09,
     Pong = 0x0a,
+    /// R1 relay-as-last-resort: worker binds outbound session to relay (#341).
+    RelayBind = 0x0b,
+    RelayAck = 0x0c,
 }
 
 impl MsgType {
@@ -62,6 +65,8 @@ impl MsgType {
             0x08 => MsgType::Feedback,
             0x09 => MsgType::Ping,
             0x0a => MsgType::Pong,
+            0x0b => MsgType::RelayBind,
+            0x0c => MsgType::RelayAck,
             _ => return None,
         })
     }

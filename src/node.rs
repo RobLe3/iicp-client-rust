@@ -93,6 +93,9 @@ pub struct NodeConfig {
     /// When `true`, serve() exposes POST /v1/relay to forward tasks to peers learned
     /// via gossip (ADR-022). Requires `enable_mesh`. Default false.
     pub relay_capable: bool,
+    /// Port for the RelayAcceptServer (R1 relay-as-last-resort, #341).
+    /// Workers behind CGNAT connect here outbound and send RELAY_BIND. Default 9485.
+    pub relay_accept_port: u16,
 }
 
 impl NodeConfig {
@@ -124,6 +127,7 @@ impl NodeConfig {
             enable_idempotency: false,
             enable_mesh: false,
             relay_capable: false,
+            relay_accept_port: 9485,
         }
     }
 }
@@ -176,6 +180,8 @@ struct AppState {
     /// #343 — shared pinhole state for /iicp/health surface.
     pinhole_uid: Arc<std::sync::RwLock<Option<u32>>>,
     pinhole_lease_seconds: Arc<std::sync::RwLock<u32>>,
+    /// R1 relay-as-last-resort (#341): sessions from workers binding outbound.
+    relay_sessions: Arc<crate::relay_session::RelaySessionRegistry>,
 }
 
 // ── GET /iicp/health ─────────────────────────────────────────────────────────
@@ -298,12 +304,37 @@ async fn relay_endpoint(
         )
             .into_response();
     }
+    let task_val = task.expect("checked above").clone();
+
+    // R1: check relay session registry first (CGNAT workers with no inbound endpoint)
+    if let Some(session) = state.relay_sessions.get(target_id) {
+        match session.forward_task(&task_val, 120).await {
+            Ok(result) => {
+                let task_id = task_val.get("task_id").and_then(Value::as_str).unwrap_or("");
+                return Json(json!({
+                    "task_id": task_id,
+                    "status": "completed",
+                    "result": result
+                }))
+                .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":{"code":"IICP-E031","message":format!("relay session forward failed: {e}")}})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    // Fall back to HTTP forwarding for routable peers (ADR-022)
     let target = match state.peer_manager.relay_target(target_id) {
         Some(t) => t,
         None => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({"error":{"code":"IICP-E030","message":"target not in peer list"}})),
+                Json(json!({"error":{"code":"IICP-E030","message":"target not in peer list and not a bound relay worker"}})),
             )
                 .into_response();
         }
@@ -313,7 +344,7 @@ async fn relay_endpoint(
         .http
         .post(&url)
         .timeout(Duration::from_secs(120))
-        .json(task.expect("checked above"))
+        .json(&task_val)
         .send()
         .await
     {
@@ -801,6 +832,8 @@ impl IicpNode {
         F: Fn(TaskRequest) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
     {
+        // Extract bind host before `addr` is shadowed by the SocketAddr binding below.
+        let bind_host: String = addr.split(':').next().unwrap_or("0.0.0.0").to_string();
         let handler: TaskHandlerFn = Arc::new(move |req| Box::pin(handler(req)));
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let nonce_cache = Arc::new(Mutex::new(HashMap::new()));
@@ -836,6 +869,7 @@ impl IicpNode {
             nonce_cache,
             pinhole_uid: Arc::clone(&shared_pinhole_uid),
             pinhole_lease_seconds: Arc::clone(&shared_pinhole_lease),
+            relay_sessions: Arc::new(crate::relay_session::RelaySessionRegistry::new()),
         });
 
         // Capture the availability handle before `state` is moved into the router,
@@ -865,6 +899,8 @@ impl IicpNode {
         if self.cfg.relay_capable {
             app = app.route("/v1/relay", post(relay_endpoint));
         }
+        // R1: capture relay_sessions Arc before state is moved into the router.
+        let relay_sessions_arc = Arc::clone(&state.relay_sessions);
         let app = app.with_state(state);
 
         let addr: SocketAddr = addr
@@ -930,6 +966,23 @@ impl IicpNode {
                     } else {
                         tracing::warn!("UPnP IPv6 pinhole uid={uid} renewal failed — will retry");
                     }
+                }
+            });
+        }
+
+        // R1: start RelayAcceptServer when relay-capable (#341)
+        if self.cfg.relay_capable {
+            let relay_reg = relay_sessions_arc;
+            let relay_host_str = bind_host.clone();
+            let relay_port = self.cfg.relay_accept_port;
+            tokio::spawn(async move {
+                let srv = Arc::new(crate::relay_session::RelayAcceptServer::new(
+                    (*relay_reg).clone(),
+                    relay_host_str,
+                    relay_port,
+                ));
+                if let Err(e) = srv.serve().await {
+                    tracing::warn!("Relay accept server error: {e}");
                 }
             });
         }
