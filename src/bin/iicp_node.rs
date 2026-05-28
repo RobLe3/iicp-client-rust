@@ -862,6 +862,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 /// Query the directory for relay-capable peers and elect one deterministically.
 /// Used when NAT detection returns tier≥3 (CGNAT + no usable IPv6 path).
 /// Returns (relay_host, relay_port) or None if no relay-capable peer is found.
+/// Only called from the nat-gated tier≥3 path, so gate the definition too —
+/// otherwise it is dead code in default-feature builds (CI clippy -D warnings).
+#[cfg(feature = "nat")]
 async fn auto_elect_relay(
     directory_url: &str,
     intent: &str,
@@ -950,6 +953,7 @@ async fn auto_elect_relay(
     Some((relay_host.to_string(), relay_port))
 }
 
+#[cfg(feature = "nat")]
 fn urlencoding_simple(s: &str) -> String {
     s.chars()
         .flat_map(|c| match c {
