@@ -88,6 +88,8 @@ fn cbor_bytes(v: Option<&CborVal>) -> Option<Vec<u8>> {
     }
 }
 
+// Reserved for RELAY_BIND model-list decoding (parity with Python/TS relay session).
+#[allow(dead_code)]
 fn cbor_list_of_strings(v: Option<&CborVal>) -> Vec<String> {
     match v {
         Some(CborVal::Array(arr)) => arr

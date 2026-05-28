@@ -559,6 +559,13 @@ impl IicpNode {
         &self.cfg
     }
 
+    /// Set the relay-worker endpoint after construction. Used by the CLI when a
+    /// relay is auto-elected post-NAT-detection (tier ≥ 3): `serve()` reads
+    /// `self.cfg.relay_worker_endpoint` to start the outbound relay session.
+    pub fn set_relay_worker_endpoint(&mut self, endpoint: String) {
+        self.cfg.relay_worker_endpoint = Some(endpoint);
+    }
+
     /// Populate `endpoint`, `transport_endpoint`, and the NAT observability
     /// fields from a `NatProfile` produced by [`crate::nat_detection::detect_nat`].
     ///
@@ -969,7 +976,7 @@ impl IicpNode {
             let lease_arc = Arc::clone(&shared_pinhole_lease);
             tokio::spawn(async move {
                 loop {
-                    let (uid, lease) = {
+                    let (_uid, lease) = {
                         let u = uid_arc.read().ok().and_then(|g| *g);
                         let l = lease_arc.read().map(|g| *g).unwrap_or(3600);
                         (u, l)

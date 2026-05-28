@@ -901,10 +901,8 @@ fn list_local_ipv4_addresses() -> Vec<Ipv4Addr> {
     if out.is_empty() {
         if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
             let _ = sock.connect("8.8.8.8:80");
-            if let Ok(local) = sock.local_addr() {
-                if let SocketAddr::V4(a) = local {
-                    out.push(*a.ip());
-                }
+            if let Ok(SocketAddr::V4(a)) = sock.local_addr() {
+                out.push(*a.ip());
             }
         }
     }

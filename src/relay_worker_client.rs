@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ciborium::value::Value as CborVal;
-use serde_json::{json, Value};
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 

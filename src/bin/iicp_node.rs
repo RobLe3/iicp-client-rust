@@ -51,6 +51,28 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Return the first bindable TCP port >= `start` on `host`.
+///
+/// The official IICP port 9484 is the starting point; when running multiple
+/// nodes on one host (each model on its own port → its own pinhole) the second
+/// node auto-increments to 9485, the third to 9486, and so on. Probes by
+/// attempting a real bind so the chosen port is genuinely free before NAT
+/// detection opens a pinhole and the directory registration advertises it.
+fn find_available_port(host: &str, start: u16, max_tries: u16) -> u16 {
+    let bind_host = if host.is_empty() || host == "0.0.0.0" {
+        "0.0.0.0"
+    } else {
+        host
+    };
+    for offset in 0..max_tries {
+        let candidate = start.saturating_add(offset);
+        if std::net::TcpListener::bind((bind_host, candidate)).is_ok() {
+            return candidate;
+        }
+    }
+    start // exhausted — let serve() surface the real bind error
+}
+
 struct ServeOpts {
     node: String,
     backend_url: String,
@@ -89,7 +111,7 @@ fn print_help() {
          \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
          \x20 --max-concurrent N         IICP_MAX_CONCURRENT (default 4)\n\
          \x20 --node-id ID               IICP_NODE_ID (auto-generated if absent)\n\
-         \x20 --port N                   IICP_PORT (default 8020)\n\
+         \x20 --port N                   IICP_PORT (default 9484)\n\
          \x20 --host HOST                IICP_HOST (default 0.0.0.0)\n\
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
@@ -109,7 +131,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         intent: env_or("IICP_INTENT", Some("urn:iicp:intent:llm:chat:v1")).unwrap(),
         max_concurrent: env_int("IICP_MAX_CONCURRENT", 4) as usize,
         node_id: env_or("IICP_NODE_ID", None).unwrap_or_default(),
-        port: env_int("IICP_PORT", 8020) as u16,
+        port: env_int("IICP_PORT", 9484) as u16,
         host: env_or("IICP_HOST", Some("0.0.0.0")).unwrap(),
         skip_registration: env_bool("IICP_SKIP_REGISTRATION"),
         // Default ON — opt out with IICP_AUTO_DETECT_NAT=false.
@@ -192,7 +214,7 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
     if opts.max_concurrent == 4 {
         opts.max_concurrent = saved.max_concurrent as usize;
     }
-    if opts.port == 8020 {
+    if opts.port == 9484 {
         opts.port = saved.port;
     }
     if opts.host == "0.0.0.0" {
@@ -443,8 +465,8 @@ async fn run_init() -> Result<(), String> {
     let directory = ask("IICP directory URL", "https://iicp.network/api");
     let region = ask("Region tag", "eu-central");
     let intent = ask("Intent URN", "urn:iicp:intent:llm:chat:v1");
-    let port_s = ask("Listen port", "8020");
-    let port: u16 = port_s.parse().unwrap_or(8020);
+    let port_s = ask("Listen port", "9484");
+    let port: u16 = port_s.parse().unwrap_or(9484);
     let host = ask("Bind host", "0.0.0.0");
     let public_endpoint = ask("Public endpoint URL (blank = dev mode)", "");
     let auto_detect_nat = matches!(
@@ -564,7 +586,21 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
     // Directory column is CHAR(36) — truncate custom names to 36 chars.
     opts.node_id.truncate(36);
+
+    // Resolve the actual listen port before NAT detection: start at the
+    // requested port (default 9484, the official IICP port) and auto-increment
+    // to the next free port. Keeps one port per node (multiple models share it)
+    // while N nodes on one host each get a distinct port → distinct pinhole.
+    // Skipped when the operator supplies an explicit --public-endpoint.
     if opts.public_endpoint.is_empty() {
+        let resolved_port = find_available_port(&opts.host, opts.port, 64);
+        if resolved_port != opts.port {
+            eprintln!(
+                "[iicp-node] port {} in use — auto-incremented to first free port {}.",
+                opts.port, resolved_port
+            );
+            opts.port = resolved_port;
+        }
         opts.public_endpoint = format!("http://localhost:{}", opts.port);
     }
 
@@ -707,10 +743,10 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 profile.tier
             );
             if let Some((relay_host, relay_port)) =
-                auto_elect_relay(&cfg.directory_url, &cfg.intent, &opts.node_id).await
+                auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
             {
                 opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
-                cfg.relay_worker_endpoint = Some(opts.relay_worker_endpoint.clone());
+                node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
                 eprintln!(
                     "[iicp-node] auto-elected relay: {}:{}",
                     relay_host, relay_port

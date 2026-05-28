@@ -131,6 +131,15 @@ let v = iicp_client::backends::invoke_backend("openai_compat", &opts, &req.inten
 Ok(v.get("result").cloned().unwrap_or(v))
 ```
 
+### Listen port — default 9484, auto-increment (v0.7.5+)
+
+The official IICP port **9484** is the default listen port (`IICP_PORT`, `--port`).
+The `iicp-node` binary auto-increments to the next free port when 9484 is already
+in use, so several nodes on one host don't need hand-picked ports — first binds
+9484, second 9485, third 9486, etc. Each node gets its own port (hence its own NAT
+pinhole); multiple models on one node share that single port. Auto-increment is
+skipped when you pass an explicit `--public-endpoint`.
+
 ---
 
 ## NAT traversal — automatic (v0.7.3+)
