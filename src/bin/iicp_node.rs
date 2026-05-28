@@ -672,12 +672,17 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 async move {
                     // backend_type is validated before serve(); fall back to the
                     // openai_compat result shape if it were ever unknown.
-                    Ok(invoke_backend(&backend_type, &opts_handler, &req.intent, &req.payload)
+                    let v = invoke_backend(&backend_type, &opts_handler, &req.intent, &req.payload)
                         .await
                         .unwrap_or_else(|e| serde_json::json!({
                             "error_code": 500,
                             "error_message": e,
-                        })))
+                        }));
+                    // Unwrap the backend's {"result": ...} envelope: serve() re-wraps the
+                    // handler's value in TaskResponse.result, so returning the inner value
+                    // keeps the serve response single-level — matching the Python/TS SDKs
+                    // (cross-flavour interop). Error envelopes pass through unchanged.
+                    Ok(v.get("result").cloned().unwrap_or(v))
                 }
             },
             &bind,
