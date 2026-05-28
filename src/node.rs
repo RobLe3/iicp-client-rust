@@ -464,6 +464,8 @@ pub struct IicpNode {
     /// first register() so subsequent re-registrations sign with the
     /// directory-issued key.
     runtime_hmac_key: std::sync::RwLock<String>,
+    /// BUG-5: token stashed by register() so deregister()/heartbeat don't need it re-passed.
+    runtime_token: std::sync::RwLock<String>,
     /// #343 — UPnP IPv6 pinhole UID captured by `apply_nat_profile`, revoked
     /// on shutdown via [`Self::revoke_pinhole`]. Only read under the `nat`
     /// feature; allowed dead_code so non-nat builds compile cleanly.
@@ -485,6 +487,7 @@ impl IicpNode {
             cfg,
             http,
             runtime_hmac_key,
+            runtime_token: std::sync::RwLock::new(String::new()),
             pinhole_uid: std::sync::RwLock::new(None),
             pinhole_lease_seconds: std::sync::RwLock::new(3600),
         }
@@ -583,14 +586,23 @@ impl IicpNode {
     /// Mirrors `iicp_client.IicpNode.deregister` (Python iter-1471) and
     /// `IicpNode.deregister` (TS iter-1474). Best-effort: shutdown paths
     /// swallow failures so a flaky directory connection doesn't block exit.
-    pub async fn deregister(&self, node_token: &str) -> Result<()> {
+    /// Deregister from the directory. `node_token` defaults to the token stashed by
+    /// `register()` (BUG-5) when `None` — pass `Some(token)` to override.
+    pub async fn deregister(&self, node_token: Option<&str>) -> Result<()> {
+        let stashed = self.runtime_token.read().expect("poisoned").clone();
+        let token = node_token.map(str::to_string).unwrap_or(stashed);
+        if token.is_empty() {
+            return Err(crate::errors::IicpError::Node(
+                "deregister() requires a node_token (none stashed — call register() first)".into(),
+            ));
+        }
         let url = format!(
             "{}/v1/register",
             self.cfg.directory_url.trim_end_matches('/')
         );
         let body = serde_json::json!({
             "node_id": self.cfg.node_id,
-            "node_token": node_token,
+            "node_token": token,
         });
         let resp = self.http.delete(&url).json(&body).send().await?;
         let status = resp.status();
@@ -709,6 +721,8 @@ impl IicpNode {
             .as_str()
             .or_else(|| data["token"].as_str())
             .ok_or_else(|| IicpError::Node(format!("no node_token in response: {data}")))?;
+        // BUG-5: stash the token so deregister()/heartbeat don't need it re-passed.
+        *self.runtime_token.write().expect("poisoned") = token.to_string();
         // ADR-019: capture directory-issued HMAC key for subsequent signing.
         // Operator-provisioned key (cfg.node_hmac_key) wins — we only set the
         // runtime key from the response when the operator hasn't set one.

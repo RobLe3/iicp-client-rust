@@ -700,7 +700,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         let _ = node.revoke_pinhole().await;
     }
     if let Some(t) = &token {
-        if let Err(e) = node.deregister(t).await {
+        if let Err(e) = node.deregister(Some(t)).await {
             eprintln!("[iicp-node] deregister failed: {e}");
         }
     }

@@ -112,6 +112,27 @@ Error codes match the [IICP error reference](https://iicp.network/docs/error-ref
 
 ---
 
+## Serving as a node — handler contract
+
+When you run a serving node (`IicpNode::serve`), your handler returns the **inner result
+value**; `serve()` wraps it in the `TaskResponse.result` envelope for you. Do **not** return
+an already-wrapped `{"result": ...}` value — that double-nests the response and breaks
+cross-flavour interop with the Python/TS SDKs (response shape must be `{"result": {...}}`).
+
+The `backends::invoke_backend` / `openai_compat::invoke` helpers return a
+`{"result": ...}` consumer envelope, so when using them as a serve handler, unwrap the
+inner value first:
+
+```rust
+let v = iicp_client::backends::invoke_backend("openai_compat", &opts, &req.intent, &req.payload)
+    .await
+    .unwrap_or_else(|e| serde_json::json!({"error_code": 500, "error_message": e}));
+// serve() re-wraps in TaskResponse.result — return the inner value to stay single-level.
+Ok(v.get("result").cloned().unwrap_or(v))
+```
+
+---
+
 ## SDK conformance
 
 | Rule | Description | Status |
