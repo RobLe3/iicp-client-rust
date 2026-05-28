@@ -40,6 +40,8 @@ pub mod peer_manager;
 pub mod pricing;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_session;
+#[cfg(feature = "iicp-tcp")]
+pub mod relay_worker_client;
 pub mod scheduler;
 pub mod token_validator;
 pub mod trust_auditor;

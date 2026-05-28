@@ -67,6 +67,7 @@ struct ServeOpts {
     skip_registration: bool,
     auto_detect_nat: bool,
     external_ip_probe_url: String,
+    relay_worker_endpoint: String,
 }
 
 fn print_help() {
@@ -113,6 +114,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         skip_registration: env_bool("IICP_SKIP_REGISTRATION"),
         auto_detect_nat: env_bool("IICP_AUTO_DETECT_NAT"),
         external_ip_probe_url: env_or("IICP_EXTERNAL_IP_PROBE_URL", None).unwrap_or_default(),
+        relay_worker_endpoint: env_or("IICP_RELAY_WORKER_ENDPOINT", None).unwrap_or_default(),
     };
 
     let mut i = 0;
@@ -150,6 +152,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     "--port" => opts.port = v.parse().map_err(|e| format!("--port: {e}"))?,
                     "--host" => opts.host = v,
                     "--external-ip-probe-url" => opts.external_ip_probe_url = v,
+                    "--relay-worker-endpoint" => opts.relay_worker_endpoint = v,
                     _ => return Err(format!("unknown flag: {arg}")),
                 }
                 i += 2;
@@ -591,6 +594,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     cfg.region = Some(opts.region.clone());
     cfg.directory_url = opts.directory_url.clone();
     cfg.max_concurrent = opts.max_concurrent;
+    if !opts.relay_worker_endpoint.is_empty() {
+        cfg.relay_worker_endpoint = Some(opts.relay_worker_endpoint.clone());
+    }
     // Populate additional models; register() merges capabilities into models array.
     cfg.capabilities = discovered_models
         .into_iter()

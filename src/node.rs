@@ -96,6 +96,9 @@ pub struct NodeConfig {
     /// Port for the RelayAcceptServer (R1 relay-as-last-resort, #341).
     /// Workers behind CGNAT connect here outbound and send RELAY_BIND. Default 9485.
     pub relay_accept_port: u16,
+    /// R2: when set, this node acts as a relay WORKER — connects outbound to the
+    /// specified relay endpoint. Format: "host:port" (e.g. "relay.example.com:9485").
+    pub relay_worker_endpoint: Option<String>,
 }
 
 impl NodeConfig {
@@ -128,6 +131,7 @@ impl NodeConfig {
             enable_mesh: false,
             relay_capable: false,
             relay_accept_port: 9485,
+            relay_worker_endpoint: None,
         }
     }
 }
@@ -837,6 +841,8 @@ impl IicpNode {
         // Extract bind host before `addr` is shadowed by the SocketAddr binding below.
         let bind_host: String = addr.split(':').next().unwrap_or("0.0.0.0").to_string();
         let handler: TaskHandlerFn = Arc::new(move |req| Box::pin(handler(req)));
+        // Clone before handler is potentially moved into the relay worker closure.
+        let handler_for_relay = Arc::clone(&handler);
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let nonce_cache = Arc::new(Mutex::new(HashMap::new()));
         // #343 — shared pinhole state: pass to AppState (health endpoint) and renewal task.
@@ -989,6 +995,45 @@ impl IicpNode {
                 if let Err(e) = srv.serve().await {
                     tracing::warn!("Relay accept server error: {e}");
                 }
+            });
+        }
+
+        // R2: start relay worker client if relay_worker_endpoint is configured (#341)
+        #[cfg(feature = "iicp-tcp")]
+        if let Some(ref ep) = self.cfg.relay_worker_endpoint {
+            let ep = ep.clone();
+            let node_id = self.cfg.node_id.clone();
+            let intent = self.cfg.intent.clone();
+            let models = self.cfg.model.clone().map(|m| vec![m]).unwrap_or_default();
+            let handler_fn: crate::relay_worker_client::RelayHandlerFn =
+                Arc::new(move |task: Value| {
+                    let h = Arc::clone(&handler_for_relay);
+                    Box::pin(async move {
+                        let req = crate::node::TaskRequest {
+                            task_id: task.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            intent: task.get("intent").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            payload: task.get("payload").cloned().unwrap_or(Value::Null),
+                            constraints: task.get("constraints").cloned(),
+                            auth: task.get("auth").cloned(),
+                            nonce: None,
+                            _trace: None,
+                        };
+                        h(req).await.unwrap_or_else(|e| json!({"error": e.to_string()}))
+                    })
+                });
+            let (rhost, rport) = {
+                if let Some(pos) = ep.rfind(':') {
+                    let port = ep[pos+1..].parse::<u16>().unwrap_or(9485);
+                    (ep[..pos].to_string(), port)
+                } else {
+                    (ep.clone(), 9485u16)
+                }
+            };
+            tokio::spawn(async move {
+                let rwc = Arc::new(crate::relay_worker_client::RelayWorkerClient::new(
+                    node_id, intent, rhost, rport, handler_fn, models,
+                ));
+                rwc.run().await;
             });
         }
 
