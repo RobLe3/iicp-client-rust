@@ -557,6 +557,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     if opts.node_id.is_empty() {
         opts.node_id = uuid::Uuid::new_v4().to_string();
     }
+    // Directory column is CHAR(36) — truncate custom names to 36 chars.
+    opts.node_id.truncate(36);
     if opts.public_endpoint.is_empty() {
         opts.public_endpoint = format!("http://localhost:{}", opts.port);
     }
