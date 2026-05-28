@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/RobLe3/iicp-client-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/RobLe3/iicp-client-rust/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-[![Protocol](https://img.shields.io/badge/IICP-v1.5-indigo.svg)](https://iicp.network/spec)
+[![Protocol](https://img.shields.io/badge/IICP-v1.7-indigo.svg)](https://iicp.network/spec)
 [![crates.io](https://img.shields.io/badge/crates.io-iicp--client-orange?logo=rust)](https://crates.io/crates/iicp-client)
 
 Official Rust client library for the [IICP protocol](https://iicp.network) — route AI agent tasks by intent across a self-organising mesh of provider nodes. No central broker. No hardcoded endpoints.
@@ -133,6 +133,59 @@ Ok(v.get("result").cloned().unwrap_or(v))
 
 ---
 
+## NAT traversal — v0.7.0
+
+IICP nodes pick the best available NAT path automatically (ADR-041):
+
+| Tier | Method | Requirement |
+|------|--------|-------------|
+| 0 | Direct — publicly routable | Open port 8020 |
+| 1 | UPnP/IGD port mapping | Home router with UPnP |
+| 2 | IPv6 firewall pinhole | IPv6 + UPnP/IGD2 |
+| 3 | **Relay-as-last-resort** | A relay operator in the mesh |
+
+**Relay-as-last-resort** lets a node behind CGNAT stay reachable by binding an outbound
+channel to a public relay node that forwards inbound tasks down it.
+Requires the `iicp-tcp` feature (adds CBOR framing via `ciborium`).
+
+### Running a relay-capable node (relay operator)
+
+```toml
+[dependencies]
+iicp-client = { version = "0.7", features = ["iicp-tcp"] }
+```
+
+```rust
+use iicp_client::{IicpNode, NodeConfig};
+
+let node = IicpNode::new(NodeConfig {
+    node_id          : "relay-eu-01".into(),
+    endpoint         : "http://relay.example.com:8020".into(),
+    intent           : "urn:iicp:intent:llm:chat:v1".into(),
+    relay_capable    : true,   // accept RELAY_BIND on TCP 9485
+    relay_accept_port: 9485,
+    enable_mesh      : true,   // gossip relay_capable=true to peers
+    ..Default::default()
+});
+```
+
+### Node behind CGNAT (connects outbound to relay)
+
+```rust
+let node = IicpNode::new(NodeConfig {
+    node_id               : "cgnat-worker-001".into(),
+    endpoint              : "http://placeholder".into(), // overwritten on bind
+    intent                : "urn:iicp:intent:llm:chat:v1".into(),
+    relay_worker_endpoint : Some("relay.example.com:9485".into()),
+    ..Default::default()
+});
+```
+
+When the worker binds it re-registers with the relay's public address
+(`transport_method="turn_relay"`), making it discoverable.
+
+---
+
 ## SDK conformance
 
 | Rule | Description | Status |
@@ -151,7 +204,7 @@ Conformance tier: `iicp:sdk:v1` (spec S.14) · [Request a badge](https://iicp.ne
 ## Development
 
 ```bash
-cargo test          # 19 tests + 1 doc-test
+cargo test          # 109 tests
 cargo clippy        # lint
 cargo build --release
 cargo run --example quickstart
