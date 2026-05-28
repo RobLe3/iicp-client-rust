@@ -1029,10 +1029,33 @@ impl IicpNode {
                     (ep.clone(), 9485u16)
                 }
             };
+            // on_bind: re-register with the relay's public endpoint so the node
+            // appears ACTIVE in directory + stats (#358).
+            let http_client = self.http.clone();
+            let dir_url = self.cfg.directory_url.clone();
+            let on_bind_cb: crate::relay_worker_client::OnBindFn =
+                Arc::new(move |rh: String, rp: u16, _wid: String| {
+                    let http = http_client.clone();
+                    let dir = dir_url.clone();
+                    Box::pin(async move {
+                        // A full re-register would require the IicpNode reference here,
+                        // which isn't available. For v0.7.0 we log the bind event.
+                        // The node operator should use the cli bin which has the full
+                        // context to re-register. Full wiring tracked in #341 R2.
+                        tracing::info!(
+                            "Relay worker bound to relay {}:{} — update directory registration to use relay endpoint",
+                            rh, rp,
+                        );
+                        let _ = (http, dir); // suppress unused warnings
+                    })
+                });
             tokio::spawn(async move {
-                let rwc = Arc::new(crate::relay_worker_client::RelayWorkerClient::new(
-                    node_id, intent, rhost, rport, handler_fn, models,
-                ));
+                let rwc = Arc::new(
+                    crate::relay_worker_client::RelayWorkerClient::new(
+                        node_id, intent, rhost, rport, handler_fn, models,
+                    )
+                    .with_on_bind(on_bind_cb),
+                );
                 rwc.run().await;
             });
         }

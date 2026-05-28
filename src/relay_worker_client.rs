@@ -96,6 +96,13 @@ async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Option<(u8, Vec
 pub type RelayHandlerFn =
     Arc<dyn Fn(Value) -> std::pin::Pin<Box<dyn Future<Output = Value> + Send>> + Send + Sync>;
 
+/// Callback invoked after a successful RELAY_ACK — use to re-register with the directory (#358).
+pub type OnBindFn = Arc<
+    dyn Fn(String, u16, String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 /// Relay worker client — connects outbound to a relay, handles CALL frames.
 pub struct RelayWorkerClient {
     worker_id: String,
@@ -104,6 +111,7 @@ pub struct RelayWorkerClient {
     relay_port: u16,
     handler: RelayHandlerFn,
     models: Vec<String>,
+    on_bind: Option<OnBindFn>,
 }
 
 impl RelayWorkerClient {
@@ -122,7 +130,13 @@ impl RelayWorkerClient {
             relay_port,
             handler,
             models,
+            on_bind: None,
         }
+    }
+
+    pub fn with_on_bind(mut self, cb: OnBindFn) -> Self {
+        self.on_bind = Some(cb);
+        self
     }
 
     /// Connect-and-run loop with exponential backoff reconnect. Runs until cancelled.
@@ -177,6 +191,9 @@ impl RelayWorkerClient {
             "Relay worker {}: bound to relay {}:{}",
             self.worker_id, self.relay_host, self.relay_port
         );
+        if let Some(cb) = &self.on_bind {
+            cb(self.relay_host.clone(), self.relay_port, self.worker_id.clone()).await;
+        }
 
         // Step 3: session loop
         let handler = Arc::clone(&self.handler);
