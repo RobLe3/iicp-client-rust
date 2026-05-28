@@ -133,56 +133,65 @@ Ok(v.get("result").cloned().unwrap_or(v))
 
 ---
 
-## NAT traversal — v0.7.0
+## NAT traversal — automatic (v0.7.3+)
 
-IICP nodes pick the best available NAT path automatically (ADR-041):
-
-| Tier | Method | Requirement |
-|------|--------|-------------|
-| 0 | Direct — publicly routable | Open port 8020 |
-| 1 | UPnP/IGD port mapping | Home router with UPnP |
-| 2 | IPv6 firewall pinhole | IPv6 + UPnP/IGD2 |
-| 3 | **Relay-as-last-resort** | A relay operator in the mesh |
-
-**Relay-as-last-resort** lets a node behind CGNAT stay reachable by binding an outbound
-channel to a public relay node that forwards inbound tasks down it.
-Requires the `iicp-tcp` feature (adds CBOR framing via `ciborium`).
-
-### Running a relay-capable node (relay operator)
+Since v0.7.3, NAT detection runs automatically on every `iicp-node serve` startup — no flags
+needed. Requires the `nat` feature (UPnP detection):
 
 ```toml
 [dependencies]
-iicp-client = { version = "0.7", features = ["iicp-tcp"] }
+iicp-client = { version = "0.7", features = ["nat"] }
+# For relay substrate (CGNAT fallback): add "iicp-tcp"
+iicp-client = { version = "0.7", features = ["nat", "iicp-tcp"] }
 ```
+
+| Tier | When | What happens |
+|------|------|-------------|
+| **0** | VPS/cloud (public IP on NIC) or `IICP_PUBLIC_ENDPOINT` set | Registers directly |
+| **1a** | Home router with UPnP, no CGNAT | Port-forward via UPnP → register WAN IP |
+| **1b** | CGNAT + IPv6 + AddPinhole works | Registers IPv6 with firewall rule |
+| **1c** | CGNAT + IPv6 + AddPinhole fails (FRITZ!Box error 606) | Registers IPv6 + logs guidance |
+| **3** | CGNAT + no usable IPv6 | Auto-elects relay from directory |
+| **4** | Nothing worked | Serves locally with operator guidance |
+
+### Environment-specific behaviour
+
+**Docker bridge (`-p 8020:8020`)** — UPnP is skipped (reaches Docker NAT, not home router).
+Set `IICP_PUBLIC_ENDPOINT`:
+```bash
+docker run -e IICP_PUBLIC_ENDPOINT=http://your-host:8020 \
+           -e IICP_BACKEND_URL=http://host.docker.internal:11434 \
+           -p 8020:8020 my-iicp-node
+```
+
+**CGNAT + no IPv6 → automatic relay:**
+```
+[iicp-node] NAT tier=3: auto-electing relay from directory...
+[iicp-node] auto-elected relay: relay.example.com:9485
+```
+
+### Running a relay-capable node (relay operator)
 
 ```rust
 use iicp_client::{IicpNode, NodeConfig};
 
 let node = IicpNode::new(NodeConfig {
-    node_id          : "relay-eu-01".into(),
     endpoint         : "http://relay.example.com:8020".into(),
     intent           : "urn:iicp:intent:llm:chat:v1".into(),
-    relay_capable    : true,   // accept RELAY_BIND on TCP 9485
+    relay_capable    : true,   // accept RELAY_BIND on TCP 9485 (requires iicp-tcp)
     relay_accept_port: 9485,
-    enable_mesh      : true,   // gossip relay_capable=true to peers
+    enable_mesh      : true,   // advertise relay_capable=true in gossip
     ..Default::default()
 });
 ```
 
-### Node behind CGNAT (connects outbound to relay)
+### Opt-out / override
 
-```rust
-let node = IicpNode::new(NodeConfig {
-    node_id               : "cgnat-worker-001".into(),
-    endpoint              : "http://placeholder".into(), // overwritten on bind
-    intent                : "urn:iicp:intent:llm:chat:v1".into(),
-    relay_worker_endpoint : Some("relay.example.com:9485".into()),
-    ..Default::default()
-});
+```bash
+IICP_AUTO_DETECT_NAT=false              # disable detection entirely
+IICP_PUBLIC_ENDPOINT=http://x.x.x.x:8020  # trust this endpoint
+IICP_RELAY_WORKER_ENDPOINT=host:9485    # specific relay instead of auto-elect
 ```
-
-When the worker binds it re-registers with the relay's public address
-(`transport_method="turn_relay"`), making it discoverable.
 
 ---
 
