@@ -869,9 +869,13 @@ impl IicpNode {
             )),
             idempotency: Arc::new(crate::idempotency::IdempotencyGuard::default()),
             enable_idempotency: self.cfg.enable_idempotency,
-            peer_manager: Arc::new(crate::peer_manager::PeerManager::new(
+            peer_manager: Arc::new(crate::peer_manager::PeerManager::with_opts(
                 self.cfg.directory_url.clone(),
                 self.cfg.node_hmac_key.clone(),
+                crate::peer_manager::PeerManagerOpts {
+                    relay_capable: self.cfg.relay_capable,
+                    relay_accept_port: self.cfg.relay_accept_port,
+                },
             )),
             http: self.http.clone(),
             nonce_cache,
@@ -888,8 +892,9 @@ impl IicpNode {
         if self.cfg.enable_mesh {
             let pm = Arc::clone(&state.peer_manager);
             let node_id = self.cfg.node_id.clone();
+            let own_endpoint = self.cfg.endpoint.clone();
             tokio::spawn(async move {
-                pm.start(&node_id).await;
+                pm.start(&node_id, &own_endpoint).await;
                 let interval = pm.gossip_interval();
                 loop {
                     tokio::time::sleep(interval).await;
