@@ -634,6 +634,23 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         timeout: Duration::from_secs(60),
     };
 
+    // BUG-6 fix: probe-bind the port before registering so a port conflict fails
+    // immediately without leaving a stale directory registration.
+    // The probe listener is dropped right away; serve() re-binds milliseconds later.
+    if !opts.skip_registration {
+        let probe_addr = format!("{}:{}", opts.host, opts.port)
+            .parse::<std::net::SocketAddr>()
+            .map_err(|e| format!("invalid listen address: {e}"))?;
+        std::net::TcpListener::bind(probe_addr).map_err(|e| {
+            format!(
+                "cannot bind {}:{} — {e}  \
+                 (fix: choose a free port with --port N or free the occupied port first)",
+                opts.host, opts.port
+            )
+        })?;
+        // probe listener dropped here; port is immediately available for serve()
+    }
+
     let token = if opts.skip_registration {
         None
     } else {
