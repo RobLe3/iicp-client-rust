@@ -112,8 +112,13 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         port: env_int("IICP_PORT", 8020) as u16,
         host: env_or("IICP_HOST", Some("0.0.0.0")).unwrap(),
         skip_registration: env_bool("IICP_SKIP_REGISTRATION"),
-        auto_detect_nat: env_bool("IICP_AUTO_DETECT_NAT"),
-        external_ip_probe_url: env_or("IICP_EXTERNAL_IP_PROBE_URL", None).unwrap_or_default(),
+        // Default ON — opt out with IICP_AUTO_DETECT_NAT=false.
+        auto_detect_nat: std::env::var("IICP_AUTO_DETECT_NAT")
+            .map(|v| v.to_lowercase() != "false" && v.to_lowercase() != "0")
+            .unwrap_or(true),
+        // Default to api.ipify.org so FRITZ!Box/CGNAT detection works out of the box.
+        external_ip_probe_url: env_or("IICP_EXTERNAL_IP_PROBE_URL", None)
+            .unwrap_or_else(|| "https://api.ipify.org".to_string()),
         relay_worker_endpoint: env_or("IICP_RELAY_WORKER_ENDPOINT", None).unwrap_or_default(),
     };
 
