@@ -665,6 +665,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
 
     // ADR-041 / #343 — optional NAT auto-detection prior to register.
+    // When tier≥3 (CGNAT + no IPv6 path) and no relay configured, auto-elect
+    // a relay from the directory so the node can register via relay.
     #[cfg(feature = "nat")]
     if opts.auto_detect_nat {
         let detect_opts = iicp_client::nat_detection::DetectNatOptions {
@@ -696,6 +698,31 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             v6_pin
         );
         node.apply_nat_profile(&profile);
+
+        // Tier ≥ 3 (CGNAT + no usable IPv6 path) and no relay configured:
+        // auto-elect relay from the directory.
+        if profile.tier >= 3 && opts.relay_worker_endpoint.is_empty() {
+            eprintln!(
+                "[iicp-node] NAT tier={}: auto-electing relay from directory…",
+                profile.tier
+            );
+            if let Some((relay_host, relay_port)) =
+                auto_elect_relay(&cfg.directory_url, &cfg.intent, &opts.node_id).await
+            {
+                opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
+                cfg.relay_worker_endpoint = Some(opts.relay_worker_endpoint.clone());
+                eprintln!(
+                    "[iicp-node] auto-elected relay: {}:{}",
+                    relay_host, relay_port
+                );
+            } else {
+                eprintln!(
+                    "[iicp-node] NAT tier={}: no relay-capable peers in directory. \
+                     Set IICP_RELAY_WORKER_ENDPOINT=<host>:<port> to specify a relay manually.",
+                    profile.tier
+                );
+            }
+        }
     }
 
     let backend_url = opts.backend_url.clone();
@@ -794,6 +821,108 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
 
     serve_result
+}
+
+/// Query the directory for relay-capable peers and elect one deterministically.
+/// Used when NAT detection returns tier≥3 (CGNAT + no usable IPv6 path).
+/// Returns (relay_host, relay_port) or None if no relay-capable peer is found.
+async fn auto_elect_relay(
+    directory_url: &str,
+    intent: &str,
+    node_id: &str,
+) -> Option<(String, u16)> {
+    use sha2::{Digest, Sha256};
+    let url = format!(
+        "{}/v1/discover?intent={}&relay_capable=true",
+        directory_url.trim_end_matches('/'),
+        urlencoding_simple(intent)
+    );
+    let client = reqwest::Client::new();
+    let Ok(resp) = client
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+    else {
+        return None;
+    };
+    if !resp.status().is_success() {
+        return None;
+    }
+    let Ok(data) = resp.json::<serde_json::Value>().await else {
+        return None;
+    };
+    let candidates: Vec<&serde_json::Value> = data
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter(|n| {
+                    n.get("relay_capable")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        && n.get("endpoint")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|s| !s.is_empty())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if candidates.is_empty() {
+        return None;
+    }
+    let score = |node: &&serde_json::Value| -> (u64, String) {
+        let load = node.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let nid = node.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
+        let hash_input = format!("{node_id}:{nid}");
+        let mut hasher = Sha256::new();
+        hasher.update(hash_input.as_bytes());
+        let hash_hex = format!("{:x}", hasher.finalize());
+        ((load * 1_000_000.0) as u64, hash_hex)
+    };
+    let elected = candidates.iter().min_by(|a, b| score(a).cmp(&score(b)))?;
+    let endpoint = elected
+        .get("endpoint")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim_end_matches('/');
+    // Extract host from endpoint URL
+    let relay_host = if let Some(rest) = endpoint.strip_prefix("http://") {
+        rest.split('/')
+            .next()
+            .unwrap_or("")
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(rest)
+    } else if let Some(rest) = endpoint.strip_prefix("https://") {
+        rest.split('/')
+            .next()
+            .unwrap_or("")
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(rest)
+    } else {
+        endpoint.split('/').next().unwrap_or("")
+    };
+    if relay_host.is_empty() {
+        return None;
+    }
+    let relay_port = elected
+        .get("relay_accept_port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(9485) as u16;
+    Some((relay_host.to_string(), relay_port))
+}
+
+fn urlencoding_simple(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | ':' | '/' => {
+                vec![c]
+            }
+            _ => format!("%{:02X}", c as u8).chars().collect::<Vec<_>>(),
+        })
+        .collect()
 }
 
 #[tokio::main]
