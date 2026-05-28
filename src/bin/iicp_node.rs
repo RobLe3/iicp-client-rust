@@ -198,6 +198,51 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
     }
 }
 
+// ── GAP-6 — probe backend for all available models ─────────────────────────
+/// Best-effort: returns all model names from Ollama `/api/tags` or OpenAI `/v1/models`.
+/// Empty vec on any error — caller falls back to the single configured model.
+async fn probe_backend_models(backend_url: &str) -> Vec<String> {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+    let base = backend_url.trim_end_matches('/');
+    // Try Ollama /api/tags first
+    if let Ok(resp) = client.get(format!("{base}/api/tags")).send().await {
+        if resp.status().is_success() {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                let models: Vec<String> = data["models"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|m| m["name"].as_str().map(str::to_string))
+                    .collect();
+                if !models.is_empty() {
+                    return models;
+                }
+            }
+        }
+    }
+    // Fallback: OpenAI-compat /v1/models
+    if let Ok(resp) = client.get(format!("{base}/v1/models")).send().await {
+        if resp.status().is_success() {
+            if let Ok(data) = resp.json::<serde_json::Value>().await {
+                let models: Vec<String> = data["data"]
+                    .as_array()
+                    .unwrap_or(&vec![])
+                    .iter()
+                    .filter_map(|m| m["id"].as_str().map(str::to_string))
+                    .collect();
+                return models;
+            }
+        }
+    }
+    vec![]
+}
+
 // ── #346 — dependency checker (no auto-install on Rust — cargo would need a rebuild) ─
 
 struct DepIssue {
@@ -537,11 +582,27 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     #[cfg(not(feature = "nat"))]
     let _tier0_pinhole: Option<()> = None;
 
+    // GAP-6: probe backend for all available models so the directory registration
+    // advertises the full model list — not just the single configured model.
+    let discovered_models = probe_backend_models(&opts.backend_url).await;
+
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
     cfg.model = Some(opts.model.clone());
     cfg.region = Some(opts.region.clone());
     cfg.directory_url = opts.directory_url.clone();
     cfg.max_concurrent = opts.max_concurrent;
+    // Populate additional models; register() merges capabilities into models array.
+    cfg.capabilities = discovered_models
+        .into_iter()
+        .filter(|m| m != &opts.model)
+        .collect();
+    if !cfg.capabilities.is_empty() {
+        eprintln!(
+            "[iicp-node] GAP-6: advertising {} additional model(s): {:?}",
+            cfg.capabilities.len(),
+            &cfg.capabilities[..cfg.capabilities.len().min(6)],
+        );
+    }
     // Surface Tier-0 declaration so the directory accepts public_reachable=true
     // without dial-back. Mirrors the apply_nat_profile path used after
     // detect_nat — but without running the full v4 UPnP escalation.
