@@ -33,8 +33,14 @@ pub mod backends;
 pub mod cip_policy;
 pub mod concurrency;
 pub mod conformance;
+pub mod availability;
 pub mod identity;
+pub mod idempotency;
+pub mod peer_manager;
 pub mod pricing;
+pub mod scheduler;
+pub mod token_validator;
+pub mod trust_auditor;
 
 pub use client::IicpClient;
 pub use errors::{IicpError, Result};

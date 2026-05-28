@@ -81,10 +81,20 @@ pub const SUPPORTED_INTENTS: &[&str] = &[
 /// `{"error_code": int, "error_message": str}` on failure.
 #[cfg(feature = "iicp-tcp")]
 pub fn openai_compat_handler(opts: OpenAiCompatOptions) -> crate::iicp_tcp::TcpTaskHandler {
+    build_handler("openai_compat", opts)
+}
+
+/// Shared handler builder used by every engine module (openai_compat / vllm /
+/// llamacpp). `engine` is the label that appears in error messages.
+#[cfg(feature = "iicp-tcp")]
+pub(crate) fn build_handler(
+    engine: &'static str,
+    opts: OpenAiCompatOptions,
+) -> crate::iicp_tcp::TcpTaskHandler {
     let opts = Arc::new(opts);
     Arc::new(move |task| {
         let opts = Arc::clone(&opts);
-        Box::pin(async move { handle_task(opts, task).await })
+        Box::pin(async move { handle_task(engine, opts, task).await })
     })
 }
 
@@ -92,12 +102,22 @@ pub fn openai_compat_handler(opts: OpenAiCompatOptions) -> crate::iicp_tcp::TcpT
 /// don't enable the `iicp-tcp` feature but still want to plug this handler
 /// into their own task pipeline.
 pub async fn invoke(opts: &OpenAiCompatOptions, intent: &str, payload: &Value) -> Value {
-    let task = crate::backends::openai_compat::Task {
+    invoke_with_engine("openai_compat", opts, intent, payload).await
+}
+
+/// Engine-labelled variant of [`invoke`], shared by the vllm / llamacpp modules.
+pub(crate) async fn invoke_with_engine(
+    engine: &'static str,
+    opts: &OpenAiCompatOptions,
+    intent: &str,
+    payload: &Value,
+) -> Value {
+    let task = Task {
         task_id: String::new(),
         intent: intent.to_string(),
         payload: payload.clone(),
     };
-    handle_task_inner(opts.clone(), task).await
+    handle_task_inner(engine, opts.clone(), task).await
 }
 
 /// Lightweight task struct used by [`invoke`]. Kept private (the iicp_tcp
@@ -109,8 +129,13 @@ struct Task {
 }
 
 #[cfg(feature = "iicp-tcp")]
-async fn handle_task(opts: Arc<OpenAiCompatOptions>, task: crate::iicp_tcp::TcpTask) -> Value {
+async fn handle_task(
+    engine: &'static str,
+    opts: Arc<OpenAiCompatOptions>,
+    task: crate::iicp_tcp::TcpTask,
+) -> Value {
     handle_task_inner(
+        engine,
         (*opts).clone(),
         Task {
             task_id: task.task_id,
@@ -121,7 +146,7 @@ async fn handle_task(opts: Arc<OpenAiCompatOptions>, task: crate::iicp_tcp::TcpT
     .await
 }
 
-async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
+async fn handle_task_inner(engine: &'static str, opts: OpenAiCompatOptions, task: Task) -> Value {
     let _ = task.task_id;
     let intent = task.intent;
     let payload = task.payload;
@@ -132,8 +157,8 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
             return json!({
                 "error_code": 400,
                 "error_message": format!(
-                    "openai_compat: unsupported intent {:?}; supported: {:?}",
-                    intent, SUPPORTED_INTENTS
+                    "{}: unsupported intent {:?}; supported: {:?}",
+                    engine, intent, SUPPORTED_INTENTS
                 ),
             });
         }
@@ -146,7 +171,8 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
             return json!({
                 "error_code": 400,
                 "error_message": format!(
-                    "openai_compat: task.payload must be a JSON object, got {}",
+                    "{}: task.payload must be a JSON object, got {}",
+                    engine,
                     type_name(&other)
                 ),
             });
@@ -167,8 +193,11 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
     {
         return json!({
             "error_code": 400,
-            "error_message": "openai_compat: no model — either pass `model` to OpenAiCompatOptions \
-                              or include `model` in the task payload",
+            "error_message": format!(
+                "{}: no model — either pass `model` to the backend options \
+                 or include `model` in the task payload",
+                engine
+            ),
         });
     }
 
@@ -180,7 +209,7 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
         Err(e) => {
             return json!({
                 "error_code": 500,
-                "error_message": format!("openai_compat: client build failed: {e}"),
+                "error_message": format!("{engine}: client build failed: {e}"),
             });
         }
     };
@@ -193,12 +222,12 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
     let resp = match req.send().await {
         Ok(r) => r,
         Err(e) if e.is_timeout() => {
-            return json!({"error_code": 408, "error_message": "openai_compat: backend timed out"});
+            return json!({"error_code": 408, "error_message": format!("{engine}: backend timed out")});
         }
         Err(e) => {
             return json!({
                 "error_code": 502,
-                "error_message": format!("openai_compat: HTTP transport error: {e}"),
+                "error_message": format!("{engine}: HTTP transport error: {e}"),
             });
         }
     };
@@ -209,7 +238,7 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
         let truncated: String = text.chars().take(512).collect();
         return json!({
             "error_code": status,
-            "error_message": format!("openai_compat: upstream {status}: {truncated}"),
+            "error_message": format!("{engine}: upstream {status}: {truncated}"),
         });
     }
 
@@ -217,7 +246,7 @@ async fn handle_task_inner(opts: OpenAiCompatOptions, task: Task) -> Value {
         Ok(data) => json!({"result": data}),
         Err(e) => json!({
             "error_code": 502,
-            "error_message": format!("openai_compat: upstream returned non-JSON: {e}"),
+            "error_message": format!("{engine}: upstream returned non-JSON: {e}"),
         }),
     }
 }

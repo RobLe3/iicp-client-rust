@@ -22,7 +22,9 @@ use std::io::{self, BufRead, Write};
 use std::process;
 use std::time::Duration;
 
-use iicp_client::backends::openai_compat::{invoke, OpenAiCompatOptions};
+use iicp_client::backends::invoke_backend;
+use iicp_client::backends::openai_compat::OpenAiCompatOptions;
+use iicp_client::backends::BACKEND_TYPES;
 use iicp_client::identity::{
     config_dir, generate_node, list_nodes, load_node, load_operator, save_node, save_operator,
     NodeIdentity, OperatorIdentity,
@@ -52,6 +54,7 @@ fn env_bool(name: &str) -> bool {
 struct ServeOpts {
     node: String,
     backend_url: String,
+    backend_type: String,
     model: String,
     public_endpoint: String,
     directory_url: String,
@@ -78,6 +81,7 @@ fn print_help() {
          \x20 --model NAME               IICP_BACKEND_MODEL (e.g. qwen2.5:0.5b)\n\
          \x20 (or --node NAME            load from ~/.iicp/nodes/<NAME>.json after `iicp-node init`)\n\n\
          serve optional:\n\
+         \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp (default openai_compat)\n\
          \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --region REGION            IICP_REGION (default eu-central)\n\
@@ -96,6 +100,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
     let mut opts = ServeOpts {
         node: env_or("IICP_NODE_NAME", None).unwrap_or_default(),
         backend_url: env_or("IICP_BACKEND_URL", None).unwrap_or_default(),
+        backend_type: env_or("IICP_BACKEND_TYPE", Some("openai_compat")).unwrap(),
         model: env_or("IICP_BACKEND_MODEL", None).unwrap_or_default(),
         public_endpoint: env_or("IICP_PUBLIC_ENDPOINT", None).unwrap_or_default(),
         directory_url: env_or("IICP_DIRECTORY_URL", Some("https://iicp.network/api")).unwrap(),
@@ -131,6 +136,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                 match arg.as_str() {
                     "--node" => opts.node = v,
                     "--backend-url" => opts.backend_url = v,
+                    "--backend-type" => opts.backend_type = v,
                     "--model" => opts.model = v,
                     "--public-endpoint" => opts.public_endpoint = v,
                     "--directory-url" => opts.directory_url = v,
@@ -496,6 +502,11 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 .into(),
         );
     }
+    if !BACKEND_TYPES.contains(&opts.backend_type.as_str()) {
+        return Err(format!(
+            "--backend-type must be one of {BACKEND_TYPES:?}"
+        ));
+    }
 
     if opts.node_id.is_empty() {
         let suffix: String = uuid::Uuid::new_v4().simple().to_string()[..8].into();
@@ -650,13 +661,24 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     );
 
     let opts_handler = openai_opts.clone();
+    let backend_type = opts.backend_type.clone();
     let bind = format!("{}:{}", opts.host, opts.port);
     let token_for_serve = token.clone();
     let serve_result = tokio::select! {
         r = node.serve(
             move |req| {
                 let opts_handler = opts_handler.clone();
-                async move { Ok(invoke(&opts_handler, &req.intent, &req.payload).await) }
+                let backend_type = backend_type.clone();
+                async move {
+                    // backend_type is validated before serve(); fall back to the
+                    // openai_compat result shape if it were ever unknown.
+                    Ok(invoke_backend(&backend_type, &opts_handler, &req.intent, &req.payload)
+                        .await
+                        .unwrap_or_else(|e| serde_json::json!({
+                            "error_code": 500,
+                            "error_message": e,
+                        })))
+                }
             },
             &bind,
             token_for_serve,

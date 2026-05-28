@@ -79,6 +79,20 @@ pub struct NodeConfig {
     /// empty, the SDK captures the directory-issued key from the register
     /// response and uses it for subsequent signing.
     pub node_hmac_key: String,
+    /// Phase 3+ availability windows (ADR-006). Local-time "HH:MM" windows that
+    /// shape the effective capacity advertised to the directory and gated at
+    /// serve time. Empty → always full capacity. See [`crate::availability`].
+    pub availability_windows: Vec<crate::availability::Window>,
+    /// ADR-010 task_id idempotency. `false` by default to preserve the pre-0.6
+    /// contract (a task_id may be resubmitted). When `true`, a duplicate task_id
+    /// within the 5-minute window is rejected with IICP-E010.
+    pub enable_idempotency: bool,
+    /// Phase 2 mesh (ADR-009/022). When `true`, serve() gossips peers and exposes
+    /// POST /v1/peers. Default false.
+    pub enable_mesh: bool,
+    /// When `true`, serve() exposes POST /v1/relay to forward tasks to peers learned
+    /// via gossip (ADR-022). Requires `enable_mesh`. Default false.
+    pub relay_capable: bool,
 }
 
 impl NodeConfig {
@@ -106,6 +120,10 @@ impl NodeConfig {
             cip_policy: None,
             pricing: None,
             node_hmac_key: String::new(),
+            availability_windows: Vec::new(),
+            enable_idempotency: false,
+            enable_mesh: false,
+            relay_capable: false,
         }
     }
 }
@@ -149,6 +167,11 @@ struct AppState {
     model: String,
     active_jobs: Arc<AtomicUsize>,
     max_concurrent: usize,
+    availability: Arc<crate::availability::AvailabilityEvaluator>,
+    idempotency: Arc<crate::idempotency::IdempotencyGuard>,
+    enable_idempotency: bool,
+    peer_manager: Arc<crate::peer_manager::PeerManager>,
+    http: reqwest::Client,
     nonce_cache: Arc<Mutex<HashMap<String, Instant>>>,
     /// #343 — shared pinhole state for /iicp/health surface.
     pinhole_uid: Arc<std::sync::RwLock<Option<u32>>>,
@@ -170,6 +193,7 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
     } else {
         json!({ "active": false })
     };
+    let eff_max = state.availability.effective_max_concurrent(state.max_concurrent);
     Json(json!({
         "status": "ok",
         "node_id": state.node_id,
@@ -177,7 +201,8 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "load": (active as f64 / state.max_concurrent.max(1) as f64),
         "active_jobs": active,
         "max_concurrent": state.max_concurrent,
-        "available": active < state.max_concurrent,
+        "effective_max_concurrent": eff_max,
+        "available": active < eff_max,
         "model": state.model,
         "intent": state.intent,
         "pinhole_state": pinhole_state,
@@ -212,17 +237,135 @@ async fn metrics_endpoint() -> Response {
         .into_response()
 }
 
+// ── POST /v1/peers (ADR-009 gossip exchange) ──────────────────────────────────
+
+async fn peers_endpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let sig = headers.get("x-iicp-signature").and_then(|v| v.to_str().ok());
+    if !state.peer_manager.verify_exchange(&body, sig) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":{"code":"IICP-E012","message":"invalid_signature"}})),
+        )
+            .into_response();
+    }
+    if let Ok(parsed) = serde_json::from_slice::<Value>(&body) {
+        if let Some(arr) = parsed.get("known_peers").and_then(Value::as_array) {
+            let dicts: Vec<Value> = arr.iter().filter(|p| p.is_object()).cloned().collect();
+            state.peer_manager.merge_peers(&dicts);
+        }
+    }
+    let peers: Vec<Value> = state
+        .peer_manager
+        .get_peers()
+        .iter()
+        .map(|p| {
+            json!({
+                "node_id": p.node_id,
+                "endpoint": p.endpoint,
+                "region": p.region,
+                "last_seen": p.last_seen,
+            })
+        })
+        .collect();
+    Json(json!({ "peers": peers })).into_response()
+}
+
+// ── POST /v1/relay (ADR-022 mesh relay) ───────────────────────────────────────
+
+async fn relay_endpoint(State(state): State<Arc<AppState>>, Json(payload): Json<Value>) -> Response {
+    let target_id = payload
+        .get("target_node_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let task = payload.get("task");
+    if target_id.is_empty() || task.is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"error":{"code":"IICP-E000","message":"target_node_id and task required"}})),
+        )
+            .into_response();
+    }
+    let target = match state.peer_manager.relay_target(target_id) {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":{"code":"IICP-E030","message":"target not in peer list"}})),
+            )
+                .into_response();
+        }
+    };
+    let url = format!("{}/v1/task", target.endpoint.trim_end_matches('/'));
+    match state
+        .http
+        .post(&url)
+        .timeout(Duration::from_secs(120))
+        .json(task.expect("checked above"))
+        .send()
+        .await
+    {
+        Ok(resp) => {
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
+            let bytes = resp.bytes().await.unwrap_or_default();
+            (status, bytes).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error":{"code":"IICP-E031","message":format!("relay failed: {e}")}})),
+        )
+            .into_response(),
+    }
+}
+
 // ── POST /v1/task ─────────────────────────────────────────────────────────────
+
+/// Try to claim a concurrency slot. On `true` the caller owns one increment of
+/// `active_jobs` and MUST `fetch_sub` it on every exit path. realtime/interactive
+/// wait briefly for a slot; other tiers fail fast so the proxy sees back-pressure
+/// immediately (ADR-006; see [`crate::scheduler`]).
+async fn admit(state: &AppState, qos: &str) -> bool {
+    // Effective cap folds in availability windows (ADR-006): a reduced/closed
+    // window lowers capacity below max_concurrent.
+    let cap = state.availability.effective_max_concurrent(state.max_concurrent);
+    let prev = state.active_jobs.fetch_add(1, Ordering::Relaxed);
+    if prev < cap {
+        return true;
+    }
+    state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    if !crate::scheduler::is_queue_eligible(qos) {
+        return false;
+    }
+    let deadline = Instant::now() + crate::scheduler::QUEUE_WAIT;
+    while Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let cap = state.availability.effective_max_concurrent(state.max_concurrent);
+        let prev = state.active_jobs.fetch_add(1, Ordering::Relaxed);
+        if prev < cap {
+            return true;
+        }
+        state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    }
+    false
+}
 
 async fn task_endpoint(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Json(mut req): Json<TaskRequest>,
 ) -> Response {
-    // Concurrency gate — IICP-E021
-    let prev = state.active_jobs.fetch_add(1, Ordering::Relaxed);
-    if prev >= state.max_concurrent {
-        state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+    // QoS-aware admission — IICP-E021
+    let qos = req
+        .constraints
+        .as_ref()
+        .and_then(|c| c.get("qos_class"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("best_effort")
+        .to_string();
+    if !admit(&state, &qos).await {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             [("Retry-After", "2"), ("Content-Type", "application/json")],
@@ -230,6 +373,7 @@ async fn task_endpoint(
                 "error": {
                     "code": "IICP-E021",
                     "message": "capacity_exceeded",
+                    "qos_class": qos,
                     "retry_after_ms": 2000,
                 }
             })),
@@ -252,6 +396,19 @@ async fn task_endpoint(
                 .into_response();
         }
         cache.insert(nonce.clone(), Instant::now());
+    }
+
+    // Idempotency — duplicate task_id within the retry window (ADR-010). Opt-in
+    // (NodeConfig.enable_idempotency) to preserve the pre-0.6 contract.
+    if state.enable_idempotency && !state.idempotency.check_and_register(&req.task_id) {
+        state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": { "code": "IICP-E010", "message": "duplicate_task" }
+            })),
+        )
+            .into_response();
     }
 
     // W3C traceparent propagation
@@ -584,6 +741,11 @@ impl IicpNode {
                 "node_id": self.cfg.node_id,
                 "node_token": node_token,
                 "status": "available",
+                // Live capacity after availability shaping (ADR-006).
+                "max_concurrent": crate::availability::AvailabilityEvaluator::new(
+                    self.cfg.availability_windows.clone(),
+                )
+                .effective_max_concurrent(self.cfg.max_concurrent),
             }))
             .send()
             .await
@@ -634,16 +796,49 @@ impl IicpNode {
             model: self.cfg.model.clone().unwrap_or_default(),
             active_jobs,
             max_concurrent: self.cfg.max_concurrent,
+            availability: Arc::new(crate::availability::AvailabilityEvaluator::new(
+                self.cfg.availability_windows.clone(),
+            )),
+            idempotency: Arc::new(crate::idempotency::IdempotencyGuard::default()),
+            enable_idempotency: self.cfg.enable_idempotency,
+            peer_manager: Arc::new(crate::peer_manager::PeerManager::new(
+                self.cfg.directory_url.clone(),
+                self.cfg.node_hmac_key.clone(),
+            )),
+            http: self.http.clone(),
             nonce_cache,
             pinhole_uid: Arc::clone(&shared_pinhole_uid),
             pinhole_lease_seconds: Arc::clone(&shared_pinhole_lease),
         });
 
-        let app = Router::new()
+        // Capture the availability handle before `state` is moved into the router,
+        // so the heartbeat loop below can report effective capacity.
+        let hb_availability = Arc::clone(&state.availability);
+        // Phase 2 mesh: bootstrap + gossip when enabled (before `state` is moved).
+        if self.cfg.enable_mesh {
+            let pm = Arc::clone(&state.peer_manager);
+            let node_id = self.cfg.node_id.clone();
+            tokio::spawn(async move {
+                pm.start(&node_id).await;
+                let interval = pm.gossip_interval();
+                loop {
+                    tokio::time::sleep(interval).await;
+                    pm.gossip_round().await;
+                }
+            });
+        }
+
+        let mut app = Router::new()
             .route("/v1/task", post(task_endpoint))
             .route("/iicp/health", get(health_endpoint))
-            .route("/metrics", get(metrics_endpoint))
-            .with_state(state);
+            .route("/metrics", get(metrics_endpoint));
+        if self.cfg.enable_mesh {
+            app = app.route("/v1/peers", post(peers_endpoint));
+        }
+        if self.cfg.relay_capable {
+            app = app.route("/v1/relay", post(relay_endpoint));
+        }
+        let app = app.with_state(state);
 
         let addr: SocketAddr = addr
             .parse()
@@ -658,6 +853,8 @@ impl IicpNode {
             let node_id = self.cfg.node_id.clone();
             let dir = self.cfg.directory_url.clone();
             let http = self.http.clone();
+            let avail = Arc::clone(&hb_availability);
+            let max_c = self.cfg.max_concurrent;
             tokio::spawn(async move {
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
@@ -670,6 +867,8 @@ impl IicpNode {
                             "node_id": &node_id,
                             "node_token": &token,
                             "status": "available",
+                            // Live capacity after availability shaping (ADR-006).
+                            "max_concurrent": avail.effective_max_concurrent(max_c),
                         }))
                         .send()
                         .await

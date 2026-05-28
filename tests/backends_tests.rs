@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use iicp_client::backends::openai_compat::{invoke, OpenAiCompatOptions};
+use iicp_client::backends::{invoke_backend, llamacpp, vllm, BACKEND_TYPES};
 use serde_json::json;
 
 fn opts(base_url: String, model: Option<&str>) -> OpenAiCompatOptions {
@@ -253,4 +254,79 @@ async fn test_base_url_trailing_slash_normalized() {
     )
     .await;
     assert!(result.get("error_code").is_none(), "unexpected: {result}");
+}
+
+// ── Dedicated backends (vLLM / llama.cpp) + selector — parity Block B ────────
+
+#[tokio::test]
+async fn test_vllm_invoke_happy_path() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_body(r#"{"id":"ok"}"#)
+        .create_async()
+        .await;
+    let result = vllm::invoke(
+        &opts(server.url(), Some("mistral-7b")),
+        "urn:iicp:intent:llm:chat:v1",
+        &json!({"messages": []}),
+    )
+    .await;
+    assert!(result.get("error_code").is_none(), "unexpected: {result}");
+    assert_eq!(result["result"]["id"].as_str(), Some("ok"));
+}
+
+#[tokio::test]
+async fn test_vllm_error_message_uses_engine_label() {
+    let server = mockito::Server::new_async().await;
+    let result = vllm::invoke(
+        &opts(server.url(), Some("m")),
+        "urn:iicp:intent:bogus:v1",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(result["error_code"].as_u64(), Some(400));
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .starts_with("vllm:"));
+}
+
+#[tokio::test]
+async fn test_llamacpp_invoke_happy_path() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_body(r#"{"id":"ok"}"#)
+        .create_async()
+        .await;
+    let result = llamacpp::invoke(
+        &opts(server.url(), Some("gguf")),
+        "urn:iicp:intent:llm:chat:v1",
+        &json!({"messages": []}),
+    )
+    .await;
+    assert!(result.get("error_code").is_none(), "unexpected: {result}");
+}
+
+#[test]
+fn test_default_options_ports() {
+    assert!(vllm::default_options().base_url.contains(":8000"));
+    assert!(llamacpp::default_options().base_url.contains(":8080"));
+}
+
+#[tokio::test]
+async fn test_invoke_backend_dispatches_and_rejects_unknown() {
+    let server = mockito::Server::new_async().await;
+    let o = opts(server.url(), Some("m"));
+    for t in BACKEND_TYPES {
+        // unsupported intent → 400 from the engine, but dispatch itself is Ok(_)
+        let r = invoke_backend(t, &o, "urn:iicp:intent:bogus:v1", &json!({})).await;
+        assert!(r.is_ok(), "dispatch for {t} should be Ok");
+    }
+    let bad = invoke_backend("nope", &o, "urn:iicp:intent:llm:chat:v1", &json!({})).await;
+    assert!(bad.is_err());
+    assert!(bad.unwrap_err().contains("unknown backend_type"));
 }
