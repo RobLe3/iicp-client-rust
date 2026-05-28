@@ -841,11 +841,13 @@ impl IicpNode {
         F: Fn(TaskRequest) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
     {
-        // Extract bind host before `addr` is shadowed by the SocketAddr binding below.
-        let bind_host: String = addr.split(':').next().unwrap_or("0.0.0.0").to_string();
         let handler: TaskHandlerFn = Arc::new(move |req| Box::pin(handler(req)));
-        // Clone before handler is potentially moved into the relay worker closure.
+        // Clone before handler is potentially moved into the relay worker closure (iicp-tcp only).
+        #[cfg(feature = "iicp-tcp")]
         let handler_for_relay = Arc::clone(&handler);
+        // Extract bind host before `addr` is shadowed by SocketAddr (iicp-tcp only).
+        #[cfg(feature = "iicp-tcp")]
+        let bind_host: String = addr.split(':').next().unwrap_or("0.0.0.0").to_string();
         let active_jobs = Arc::new(AtomicUsize::new(0));
         let nonce_cache = Arc::new(Mutex::new(HashMap::new()));
         // #343 — shared pinhole state: pass to AppState (health endpoint) and renewal task.
