@@ -8,7 +8,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use serde_json::{json, Value};
+use ciborium::value::Value as CborVal;
+use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
@@ -40,24 +41,67 @@ fn make_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
     buf
 }
 
-fn cbor_encode(v: &Value) -> Vec<u8> {
-    #[cfg(feature = "iicp-tcp")]
-    {
-        let mut buf = Vec::new();
-        let _ = ciborium::into_writer(v, &mut buf);
-        buf
-    }
-    #[cfg(not(feature = "iicp-tcp"))]
-    serde_json::to_vec(v).unwrap_or_default()
+/// Encode a CBOR map with integer keys (IICP framing spec requirement).
+fn cbor_encode_int_map(entries: &[(i64, CborVal)]) -> Vec<u8> {
+    let map = CborVal::Map(
+        entries
+            .iter()
+            .map(|(k, v)| (CborVal::Integer((*k).into()), v.clone()))
+            .collect(),
+    );
+    let mut buf = Vec::new();
+    let _ = ciborium::ser::into_writer(&map, &mut buf);
+    buf
 }
 
-fn cbor_decode(data: &[u8]) -> Option<Value> {
-    #[cfg(feature = "iicp-tcp")]
-    {
-        ciborium::from_reader(data).ok()
+/// Decode a CBOR map to `HashMap<integer_key, CborVal>`.
+fn cbor_decode_int_map(data: &[u8]) -> Option<HashMap<i64, CborVal>> {
+    let v: CborVal = ciborium::de::from_reader(data).ok()?;
+    let map = match v {
+        CborVal::Map(m) => m,
+        _ => return None,
+    };
+    let mut out = HashMap::new();
+    for (k, val) in map {
+        if let CborVal::Integer(n) = k {
+            if let Ok(key_i) = i64::try_from(n) {
+                out.insert(key_i, val);
+            }
+        }
     }
-    #[cfg(not(feature = "iicp-tcp"))]
-    serde_json::from_slice(data).ok()
+    Some(out)
+}
+
+fn cbor_text_or_bytes(v: Option<&CborVal>) -> Option<String> {
+    match v? {
+        CborVal::Text(s) => Some(s.clone()),
+        CborVal::Bytes(b) => String::from_utf8(b.clone()).ok(),
+        _ => None,
+    }
+}
+
+fn cbor_bytes(v: Option<&CborVal>) -> Option<Vec<u8>> {
+    match v? {
+        CborVal::Bytes(b) => Some(b.clone()),
+        CborVal::Text(s) => Some(s.as_bytes().to_vec()),
+        _ => None,
+    }
+}
+
+fn cbor_list_of_strings(v: Option<&CborVal>) -> Vec<String> {
+    match v {
+        Some(CborVal::Array(arr)) => arr
+            .iter()
+            .filter_map(|x| {
+                if let CborVal::Text(s) = x {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        _ => vec![],
+    }
 }
 
 // ── RelayWorkerSession ────────────────────────────────────────────────────────
@@ -88,7 +132,11 @@ impl RelayWorkerSession {
         self.pending.lock().unwrap().insert(call_id.clone(), tx);
 
         let payload_json = serde_json::to_string(task).unwrap_or_default();
-        let cbor = cbor_encode(&json!({ "15": &call_id, "5": payload_json.as_bytes() }));
+        // Integer CBOR keys (spec): 15 = call_id, 5 = task payload bytes
+        let cbor = cbor_encode_int_map(&[
+            (15, CborVal::Text(call_id.clone())),
+            (5, CborVal::Bytes(payload_json.into_bytes())),
+        ]);
         let frame = make_frame(MT_CALL, &cbor);
 
         if self.write_tx.send(frame).is_err() {
@@ -227,7 +275,7 @@ async fn handle_relay_connection(
     if mt != MT_INIT {
         return Err(format!("expected INIT, got 0x{mt:02x}"));
     }
-    let ack_payload = cbor_encode(&json!({ "1": FRAMING_VERSION as u64 }));
+    let ack_payload = cbor_encode_int_map(&[(1, CborVal::Integer((FRAMING_VERSION as i64).into()))]);
     writer.write_all(&make_frame(MT_ACK, &ack_payload)).await.map_err(|e| e.to_string())?;
 
     // Step 2: RELAY_BIND
@@ -235,9 +283,9 @@ async fn handle_relay_connection(
     if mt != MT_RELAY_BIND {
         return Err(format!("expected RELAY_BIND, got 0x{mt:02x}"));
     }
-    let body = cbor_decode(&payload).ok_or("RELAY_BIND decode failed")?;
-    let worker_id = body.get("1").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    let intent = body.get("2").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let body = cbor_decode_int_map(&payload).ok_or("RELAY_BIND decode failed")?;
+    let worker_id = cbor_text_or_bytes(body.get(&1)).unwrap_or_default();
+    let intent = cbor_text_or_bytes(body.get(&2)).unwrap_or_default();
     if worker_id.is_empty() {
         return Err("RELAY_BIND missing worker_id".into());
     }
@@ -256,7 +304,10 @@ async fn handle_relay_connection(
     registry.bind(worker_id.clone(), session.clone());
     tracing::info!("Relay: worker={} bound (intent={})", worker_id, intent);
 
-    let relay_ack = cbor_encode(&json!({ "1": "ok", "2": &worker_id }));
+    let relay_ack = cbor_encode_int_map(&[
+        (1, CborVal::Text("ok".into())),
+        (2, CborVal::Text(worker_id.clone())),
+    ]);
     session.send_raw(make_frame(MT_RELAY_ACK, &relay_ack))?;
 
     // Step 3: relay-worker frame loop (read only; writes go through the channel)
@@ -277,25 +328,18 @@ async fn relay_worker_loop(
         };
         match mt {
             MT_PING => {
-                let echo = cbor_decode(&payload)
-                    .and_then(|b| b.get("1").and_then(|v| v.as_str().map(str::to_string)));
-                let pong = cbor_encode(&json!({ "1": echo.unwrap_or_default() }));
+                let echo = cbor_decode_int_map(&payload)
+                    .and_then(|b| cbor_bytes(b.get(&1)))
+                    .unwrap_or_default();
+                let pong = cbor_encode_int_map(&[(1, CborVal::Bytes(echo))]);
                 session.send_raw(make_frame(MT_PONG, &pong))?;
             }
             MT_RESPONSE => {
-                if let Some(body) = cbor_decode(&payload) {
-                    let call_id = body.get("15").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    let raw5 = body.get("5");
-                    let result: Value = match raw5 {
-                        Some(v) if v.is_string() => {
-                            serde_json::from_str(v.as_str().unwrap()).unwrap_or(Value::Null)
-                        }
-                        Some(v) if v.is_array() => {
-                            let bytes: Vec<u8> = v.as_array().unwrap()
-                                .iter().filter_map(|x| x.as_u64().map(|n| n as u8)).collect();
-                            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-                        }
-                        _ => Value::Null,
+                if let Some(body) = cbor_decode_int_map(&payload) {
+                    let call_id = cbor_text_or_bytes(body.get(&15)).unwrap_or_default();
+                    let result: Value = match cbor_bytes(body.get(&5)) {
+                        Some(bytes) => serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+                        None => Value::Null,
                     };
                     if !call_id.is_empty() {
                         session.on_response(&call_id, result);
@@ -311,6 +355,7 @@ async fn relay_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[cfg(feature = "iicp-tcp")]
     #[test]

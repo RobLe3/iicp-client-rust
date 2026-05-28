@@ -38,6 +38,7 @@ pub mod idempotency;
 pub mod identity;
 pub mod peer_manager;
 pub mod pricing;
+#[cfg(feature = "iicp-tcp")]
 pub mod relay_session;
 pub mod scheduler;
 pub mod token_validator;

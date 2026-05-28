@@ -181,6 +181,7 @@ struct AppState {
     pinhole_uid: Arc<std::sync::RwLock<Option<u32>>>,
     pinhole_lease_seconds: Arc<std::sync::RwLock<u32>>,
     /// R1 relay-as-last-resort (#341): sessions from workers binding outbound.
+    #[cfg(feature = "iicp-tcp")]
     relay_sessions: Arc<crate::relay_session::RelaySessionRegistry>,
 }
 
@@ -307,6 +308,7 @@ async fn relay_endpoint(
     let task_val = task.expect("checked above").clone();
 
     // R1: check relay session registry first (CGNAT workers with no inbound endpoint)
+    #[cfg(feature = "iicp-tcp")]
     if let Some(session) = state.relay_sessions.get(target_id) {
         match session.forward_task(&task_val, 120).await {
             Ok(result) => {
@@ -869,6 +871,7 @@ impl IicpNode {
             nonce_cache,
             pinhole_uid: Arc::clone(&shared_pinhole_uid),
             pinhole_lease_seconds: Arc::clone(&shared_pinhole_lease),
+            #[cfg(feature = "iicp-tcp")]
             relay_sessions: Arc::new(crate::relay_session::RelaySessionRegistry::new()),
         });
 
@@ -900,6 +903,7 @@ impl IicpNode {
             app = app.route("/v1/relay", post(relay_endpoint));
         }
         // R1: capture relay_sessions Arc before state is moved into the router.
+        #[cfg(feature = "iicp-tcp")]
         let relay_sessions_arc = Arc::clone(&state.relay_sessions);
         let app = app.with_state(state);
 
@@ -971,6 +975,7 @@ impl IicpNode {
         }
 
         // R1: start RelayAcceptServer when relay-capable (#341)
+        #[cfg(feature = "iicp-tcp")]
         if self.cfg.relay_capable {
             let relay_reg = relay_sessions_arc;
             let relay_host_str = bind_host.clone();
