@@ -617,7 +617,11 @@ impl IicpNode {
         }));
         // ADR-043 §9 (#344) — derive the canonical 8-category exposure_mode and
         // advertise it so the directory can store nodes.exposure_mode for routing.
-        self.cfg.exposure_mode = Some(crate::qualify::qualify_service(profile).exposure_mode.to_string());
+        self.cfg.exposure_mode = Some(
+            crate::qualify::qualify_service(profile)
+                .exposure_mode
+                .to_string(),
+        );
         // #343 — capture the IPv6 firewall pinhole UID and lease so we can renew and revoke.
         if let Some(v6) = &profile.ipv6 {
             if v6.pinhole_active {
