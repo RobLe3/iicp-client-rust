@@ -100,10 +100,10 @@ fn print_help() {
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
          \x20 serve                      Register and serve a node\n\n\
          serve required (flag or env):\n\
-         \x20 --backend-url URL          IICP_BACKEND_URL\n\
          \x20 --model NAME               IICP_BACKEND_MODEL (e.g. qwen2.5:0.5b)\n\
          \x20 (or --node NAME            load from ~/.iicp/nodes/<NAME>.json after `iicp-node init`)\n\n\
          serve optional:\n\
+         \x20 --backend-url URL          IICP_BACKEND_URL (default http://localhost:11434 — local Ollama)\n\
          \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp (default openai_compat)\n\
          \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
@@ -122,7 +122,9 @@ fn print_help() {
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
     let mut opts = ServeOpts {
         node: env_or("IICP_NODE_NAME", None).unwrap_or_default(),
-        backend_url: env_or("IICP_BACKEND_URL", None).unwrap_or_default(),
+        // Onboarding: default to Ollama's well-known local port so `iicp-node serve --model X`
+        // works with no --backend-url for the overwhelmingly common local-Ollama case.
+        backend_url: env_or("IICP_BACKEND_URL", Some("http://localhost:11434")).unwrap(),
         backend_type: env_or("IICP_BACKEND_TYPE", Some("openai_compat")).unwrap(),
         model: env_or("IICP_BACKEND_MODEL", None).unwrap_or_default(),
         public_endpoint: env_or("IICP_PUBLIC_ENDPOINT", None).unwrap_or_default(),
