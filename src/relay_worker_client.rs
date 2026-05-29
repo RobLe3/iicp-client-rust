@@ -21,6 +21,9 @@ const FRAMING_VERSION: u8 = 0x01;
 const FRAME_HEADER_LEN: usize = 12;
 const PING_INTERVAL_SECS: u64 = 30;
 const MAX_RECONNECT_DELAY_SECS: u64 = 60;
+// #359 — explicit connect timeout so a TCP-reachable-but-not-accepting relay
+// fails fast instead of blocking on the OS default (~75s+); run() reconnects.
+const CONNECT_TIMEOUT_SECS: u64 = 10;
 
 const MT_INIT: u8 = 0x01;
 const MT_ACK: u8 = 0x02;
@@ -173,9 +176,13 @@ impl RelayWorkerClient {
     }
 
     async fn session(&self) -> Result<(), String> {
-        let stream = TcpStream::connect(format!("{}:{}", self.relay_host, self.relay_port))
-            .await
-            .map_err(|e| e.to_string())?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(CONNECT_TIMEOUT_SECS),
+            TcpStream::connect(format!("{}:{}", self.relay_host, self.relay_port)),
+        )
+        .await
+        .map_err(|_| format!("relay connect timed out after {CONNECT_TIMEOUT_SECS}s"))?
+        .map_err(|e| e.to_string())?;
         tracing::debug!(
             "Relay worker {}: connected to {}:{}",
             self.worker_id,
