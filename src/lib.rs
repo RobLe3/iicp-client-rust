@@ -29,6 +29,9 @@ pub mod iicp_tcp;
 #[cfg(feature = "nat")]
 pub mod nat_detection;
 
+#[cfg(feature = "nat")]
+pub mod qualify;
+
 pub mod availability;
 pub mod backends;
 pub mod cip_policy;
@@ -45,6 +48,12 @@ pub mod relay_worker_client;
 pub mod scheduler;
 pub mod token_validator;
 pub mod trust_auditor;
+
+#[cfg(feature = "nat")]
+pub use qualify::{
+    qualify_service, qualify_service_async, ExposureMode, ExposureQualification, Ipv4Qualification,
+    Ipv6Qualification, ServiceQualification,
+};
 
 pub use client::IicpClient;
 pub use errors::{IicpError, Result};
