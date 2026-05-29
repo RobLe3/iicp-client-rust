@@ -770,7 +770,11 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // raw backend_url is kept for probe_backend_models (which queries /api/tags).
     let base_url = {
         let t = backend_url.trim_end_matches('/');
-        if t.ends_with("/v1") { t.to_string() } else { format!("{t}/v1") }
+        if t.ends_with("/v1") {
+            t.to_string()
+        } else {
+            format!("{t}/v1")
+        }
     };
     let openai_opts = OpenAiCompatOptions {
         base_url,
