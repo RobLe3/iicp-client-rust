@@ -660,11 +660,13 @@ impl IicpNode {
             "{}/v1/register",
             self.cfg.directory_url.trim_end_matches('/')
         );
-        let body = serde_json::json!({
-            "node_id": self.cfg.node_id,
-            "node_token": token,
-        });
-        let resp = self.http.delete(&url).json(&body).send().await?;
+        let resp = self
+            .http
+            .delete(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({"node_id": self.cfg.node_id}))
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() && status.as_u16() != 404 {
             return Err(crate::errors::IicpError::Node(format!(
