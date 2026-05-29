@@ -67,6 +67,9 @@ pub struct NodeConfig {
     pub nat_type: Option<String>,
     /// Forward-compat slot for ADR-041 transport_candidates[] + relay_endpoint.
     pub transport_metadata: Option<serde_json::Value>,
+    /// ADR-043 §9 — 8-category exposure_mode, computed by `qualify_service` and set
+    /// in `apply_nat_profile`. Surfaced to the directory `nodes.exposure_mode` column (#344).
+    pub exposure_mode: Option<String>,
     /// S.12 §2.1 CIP policy block surfaced to the directory register payload.
     /// When `None`, register() falls back to the module-level
     /// [`crate::cip_policy::get_cip_policy`] — operators can configure once
@@ -123,6 +126,7 @@ impl NodeConfig {
             transport_method: None,
             nat_type: None,
             transport_metadata: None,
+            exposure_mode: None,
             cip_policy: None,
             pricing: None,
             node_hmac_key: String::new(),
@@ -611,6 +615,9 @@ impl IicpNode {
             "tier": profile.tier,
             "detection_log_tail": tail,
         }));
+        // ADR-043 §9 (#344) — derive the canonical 8-category exposure_mode and
+        // advertise it so the directory can store nodes.exposure_mode for routing.
+        self.cfg.exposure_mode = Some(crate::qualify::qualify_service(profile).exposure_mode.to_string());
         // #343 — capture the IPv6 firewall pinhole UID and lease so we can renew and revoke.
         if let Some(v6) = &profile.ipv6 {
             if v6.pinhole_active {
@@ -730,6 +737,10 @@ impl IicpNode {
         }
         if let Some(md) = &self.cfg.transport_metadata {
             payload["transport_metadata"] = md.clone();
+        }
+        // ADR-043 §9 (#344) — 8-category network exposure classification
+        if let Some(e) = &self.cfg.exposure_mode {
+            payload["exposure_mode"] = json!(e);
         }
 
         // SDK self-identification — directory surfaces these on /v1/discover
