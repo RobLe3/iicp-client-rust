@@ -573,11 +573,23 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
     }
 
+    // Onboarding: if no --model given, auto-select the first model the backend advertises
+    // (Ollama /api/tags or OpenAI /v1/models) so a bare `iicp-node serve` just works.
+    if opts.model.is_empty() && !opts.backend_url.is_empty() {
+        let models = probe_backend_models(&opts.backend_url).await;
+        if let Some(first) = models.first() {
+            eprintln!(
+                "[iicp-node] no --model given — auto-selected '{first}' from backend {}",
+                opts.backend_url
+            );
+            opts.model = first.clone();
+        }
+    }
     if opts.backend_url.is_empty() || opts.model.is_empty() {
-        return Err(
-            "--backend-url and --model are required (or IICP_BACKEND_URL / IICP_BACKEND_MODEL, or --node NAME)"
-                .into(),
-        );
+        return Err(format!(
+            "no --model given and backend {} advertised no models. Pass --model NAME, or check the backend is running (e.g. `ollama pull qwen2.5:0.5b`).",
+            opts.backend_url
+        ));
     }
     if !BACKEND_TYPES.contains(&opts.backend_type.as_str()) {
         return Err(format!("--backend-type must be one of {BACKEND_TYPES:?}"));
