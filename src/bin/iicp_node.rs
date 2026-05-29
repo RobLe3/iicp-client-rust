@@ -763,8 +763,17 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     let backend_url = opts.backend_url.clone();
     let model = opts.model.clone();
+    // Normalize to the OpenAI-dialect root: the handler appends /chat/completions,
+    // so base_url MUST end in /v1 (Ollama serves the OpenAI dialect at /v1). An
+    // operator naturally passes --backend-url http://host:11434 (matching the
+    // /api/tags probe URL), so append /v1 if absent. Mirrors the Python CLI; the
+    // raw backend_url is kept for probe_backend_models (which queries /api/tags).
+    let base_url = {
+        let t = backend_url.trim_end_matches('/');
+        if t.ends_with("/v1") { t.to_string() } else { format!("{t}/v1") }
+    };
     let openai_opts = OpenAiCompatOptions {
-        base_url: backend_url.clone(),
+        base_url,
         model: Some(model.clone()),
         api_key: None,
         timeout: Duration::from_secs(60),
