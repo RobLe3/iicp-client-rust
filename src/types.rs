@@ -169,7 +169,8 @@ mod tests {
     // A directory predating v1.10.0 omits the fields; parsing must not break.
     #[test]
     fn node_health_fields_default_none_for_old_directory() {
-        let json = r#"{"node_id":"n1","endpoint":"https://x","score":0.5,"available":true,"region":"eu"}"#;
+        let json =
+            r#"{"node_id":"n1","endpoint":"https://x","score":0.5,"available":true,"region":"eu"}"#;
         let n: Node = serde_json::from_str(json).unwrap();
         assert!(n.health_label.is_none());
         assert!(n.exposure_mode.is_none());
