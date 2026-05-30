@@ -41,6 +41,13 @@ pub struct Node {
     pub region: String,
     pub models: Option<Vec<String>>,
     pub cip_policy: Option<CipPolicy>,
+    /// ADR-044 composed health label (healthy/degraded/impaired/critical/offline).
+    /// `None` against a directory predating v1.10.0.
+    #[serde(default)]
+    pub health_label: Option<String>,
+    /// ADR-043 8-category network exposure classification. `None` if unset.
+    #[serde(default)]
+    pub exposure_mode: Option<String>,
 }
 
 /// CIP policy block from the discover response.
@@ -144,4 +151,27 @@ pub struct ChatUsage {
     pub total_tokens: Option<u32>,
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Node;
+
+    // ADR-044 — discover Node parses the composed health_label + exposure_mode.
+    #[test]
+    fn node_parses_health_label_and_exposure_mode() {
+        let json = r#"{"node_id":"n1","endpoint":"https://x","score":0.9,"available":true,"region":"eu","health_label":"healthy","exposure_mode":"ipv4_public_direct"}"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(n.health_label.as_deref(), Some("healthy"));
+        assert_eq!(n.exposure_mode.as_deref(), Some("ipv4_public_direct"));
+    }
+
+    // A directory predating v1.10.0 omits the fields; parsing must not break.
+    #[test]
+    fn node_health_fields_default_none_for_old_directory() {
+        let json = r#"{"node_id":"n1","endpoint":"https://x","score":0.5,"available":true,"region":"eu"}"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert!(n.health_label.is_none());
+        assert!(n.exposure_mode.is_none());
+    }
 }
