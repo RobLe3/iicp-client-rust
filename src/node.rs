@@ -23,6 +23,7 @@ use axum::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -950,9 +951,36 @@ impl IicpNode {
         let addr: SocketAddr = addr
             .parse()
             .map_err(|e| IicpError::Node(format!("invalid addr: {e}")))?;
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|e| IicpError::Node(e.to_string()))?;
+
+        // For IPv6 addresses (including the default :: host), create a dual-stack socket
+        // so the same listener accepts both IPv4 and IPv6 connections. Linux defaults to
+        // IPV6_V6ONLY=1 which would silently reject IPv4; setting it to false here gives
+        // macOS-equivalent behaviour on all platforms.
+        let listener = if addr.is_ipv6() {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))
+                .map_err(|e| IicpError::Node(format!("socket create: {e}")))?;
+            socket
+                .set_only_v6(false)
+                .map_err(|e| IicpError::Node(format!("set_only_v6: {e}")))?;
+            socket
+                .set_reuse_address(true)
+                .map_err(|e| IicpError::Node(format!("set_reuse_address: {e}")))?;
+            socket
+                .bind(&addr.into())
+                .map_err(|e| IicpError::Node(format!("bind {addr}: {e}")))?;
+            socket
+                .listen(1024)
+                .map_err(|e| IicpError::Node(format!("listen: {e}")))?;
+            let std_listener: std::net::TcpListener = socket.into();
+            std_listener
+                .set_nonblocking(true)
+                .map_err(|e| IicpError::Node(e.to_string()))?;
+            TcpListener::from_std(std_listener).map_err(|e| IicpError::Node(e.to_string()))?
+        } else {
+            TcpListener::bind(addr)
+                .await
+                .map_err(|e| IicpError::Node(e.to_string()))?
+        };
 
         tracing::info!("IICP node {} listening on {}", self.cfg.node_id, addr);
 

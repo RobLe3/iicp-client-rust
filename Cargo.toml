@@ -1,6 +1,6 @@
 [package]
 name = "iicp-client"
-version = "0.7.21"
+version = "0.7.22"
 edition = "2021"
 rust-version = "1.80"
 description = "Official Rust client SDK for the IICP protocol (ADR-016)"
@@ -55,6 +55,8 @@ igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"
 # ADR-019 pricing-block HMAC-SHA256. Pulled in unconditionally — operators
 # who don't use pricing pay only ~30KB in binary size.
 hmac = "0.12"
+# Dual-stack IPv4+IPv6 server binding (set_only_v6=false on Linux).
+socket2 = { version = "0.5", features = ["all"] }
 sha2 = "0.10"
 subtle = "2"
 # IICP-CX S.16 E2E confidentiality: X25519-HKDF-SHA256 + AES-256-GCM
