@@ -6,13 +6,15 @@
 //!
 //! # Example
 //! ```no_run
-//! use iicp_client::{qualify_service, detect_nat, DetectNatOptions};
+//! use iicp_client::qualify_service;
+//! use iicp_client::nat_detection::{detect_nat, DetectNatOptions};
 //!
-//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let profile = detect_nat(DetectNatOptions::default()).await?;
+//! # #[tokio::main]
+//! # async fn main() {
+//! let profile = detect_nat(DetectNatOptions::default()).await;
 //! let sq = qualify_service(&profile);
 //! println!("{}", sq.exposure_mode);  // e.g. "ipv4_public_direct"
-//! # Ok(()) }
+//! # }
 //! ```
 
 use crate::nat_detection::{NatProfile, TransportMethod};

@@ -1,6 +1,6 @@
 [package]
 name = "iicp-client"
-version = "0.7.13"
+version = "0.7.14"
 edition = "2021"
 rust-version = "1.80"
 description = "Official Rust client SDK for the IICP protocol (ADR-016)"
@@ -28,13 +28,15 @@ name = "iicp-node"
 path = "src/bin/iicp_node.rs"
 
 [features]
+# nat is on by default so `cargo install iicp-client` ships with UPnP support.
+# Library consumers that don't need SSDP/IGD can opt out with --no-default-features.
+default = ["nat"]
 metrics = ["dep:prometheus"]
 # Native IICP binary transport (port 9484, spec/iicp-framing.md) — opt-in
 # because ciborium adds ~50KB to release binaries; HTTP-only nodes don't need it.
 iicp-tcp = ["dep:ciborium"]
 # ADR-041 UPnP NAT detection — auto-discover the public endpoint on operator
-# networks behind a UPnP-capable router. Opt-in because igd-next pulls in
-# SSDP discovery + XML parsing that headless deployments don't need.
+# networks behind a UPnP-capable router.
 nat = ["dep:igd-next"]
 
 [dependencies]

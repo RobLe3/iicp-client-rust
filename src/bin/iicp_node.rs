@@ -720,6 +720,15 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // ADR-041 / #343 — optional NAT auto-detection prior to register.
     // When tier≥3 (CGNAT + no IPv6 path) and no relay configured, auto-elect
     // a relay from the directory so the node can register via relay.
+    #[cfg(not(feature = "nat"))]
+    if opts.auto_detect_nat {
+        eprintln!(
+            "[iicp-node] WARNING: --auto-detect-nat requested but this binary was compiled \
+             without the 'nat' feature (UPnP/IPv6 pinhole support).\n\
+             Reinstall with: cargo install iicp-client --features nat\n\
+             NAT detection will be skipped."
+        );
+    }
     #[cfg(feature = "nat")]
     if opts.auto_detect_nat {
         let detect_opts = iicp_client::nat_detection::DetectNatOptions {
