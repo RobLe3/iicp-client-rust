@@ -36,6 +36,7 @@ pub mod availability;
 pub mod backends;
 pub mod cip_policy;
 pub mod concurrency;
+pub mod confidentiality;
 pub mod conformance;
 pub mod idempotency;
 pub mod identity;

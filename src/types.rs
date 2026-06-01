@@ -9,6 +9,8 @@ pub struct ClientConfig {
     pub timeout_ms: u64,
     pub region: Option<String>,
     pub node_token: Option<String>,
+    /// IICP-CX S.16: encrypt task payloads when the node advertises cx_public_key. Default: false.
+    pub use_confidentiality: bool,
 }
 
 impl Default for ClientConfig {
@@ -18,6 +20,7 @@ impl Default for ClientConfig {
             timeout_ms: 30_000,
             region: None,
             node_token: None,
+            use_confidentiality: false,
         }
     }
 }
@@ -29,6 +32,16 @@ pub struct DiscoverOptions {
     pub model: Option<String>,
     pub min_reputation: Option<f64>,
     pub limit: Option<u32>,
+}
+
+/// X25519 public key advertised by a CX-Provider node (IICP-CX S.16 §3.1).
+#[derive(Debug, Clone, Deserialize)]
+pub struct CxPublicKey {
+    pub algorithm: String,
+    /// Base64url-encoded 32-byte X25519 public key.
+    pub key: String,
+    /// 8-hex-byte key identifier.
+    pub key_id: String,
 }
 
 /// A single IICP node returned by `/v1/discover`.
@@ -48,6 +61,10 @@ pub struct Node {
     /// ADR-043 8-category network exposure classification. `None` if unset.
     #[serde(default)]
     pub exposure_mode: Option<String>,
+    /// IICP-CX S.16 §3.1 — X25519 public key for E2E payload confidentiality.
+    /// Present only when the node registered with cx_public_key (directory v1.10.7+).
+    #[serde(default)]
+    pub cx_public_key: Option<CxPublicKey>,
 }
 
 /// CIP policy block from the discover response.

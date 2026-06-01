@@ -55,6 +55,12 @@ igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
+# IICP-CX S.16 E2E confidentiality: X25519-HKDF-SHA256 + AES-256-GCM
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+base64 = "0.22"
 # Local time-of-day for availability windows (ADR-006). "clock" only — no serde/format.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

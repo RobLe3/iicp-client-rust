@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use regex::Regex;
 
+use crate::confidentiality::encrypt_payload;
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
 use crate::types::*;
@@ -28,9 +29,17 @@ fn is_ssrf_safe(url: &str) -> bool {
 
     // Extract host — handles IPv6 [addr]:port and plain host:port/path
     let host = if rest.starts_with('[') {
-        rest.split(']').next().map(|s| s.trim_start_matches('[')).unwrap_or("")
+        rest.split(']')
+            .next()
+            .map(|s| s.trim_start_matches('['))
+            .unwrap_or("")
     } else {
-        rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("")
+        rest.split('/')
+            .next()
+            .unwrap_or("")
+            .split(':')
+            .next()
+            .unwrap_or("")
     };
 
     if host.is_empty() {
@@ -39,7 +48,14 @@ fn is_ssrf_safe(url: &str) -> bool {
     if matches!(host, "localhost" | "0.0.0.0" | "::1" | "::") {
         return false;
     }
-    const BLOCKED_SUFFIXES: &[&str] = &[".local", ".internal", ".lan", ".test", ".invalid", ".localhost"];
+    const BLOCKED_SUFFIXES: &[&str] = &[
+        ".local",
+        ".internal",
+        ".lan",
+        ".test",
+        ".invalid",
+        ".localhost",
+    ];
     if BLOCKED_SUFFIXES.iter().any(|s| host.ends_with(s)) {
         return false;
     }
@@ -50,8 +66,11 @@ fn is_ssrf_safe(url: &str) -> bool {
     if let Ok(addr) = host.parse::<std::net::IpAddr>() {
         match addr {
             std::net::IpAddr::V4(v4) => {
-                if v4.is_loopback() || v4.is_private() || v4.is_link_local()
-                    || v4.is_broadcast() || v4.is_unspecified()
+                if v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_broadcast()
+                    || v4.is_unspecified()
                 {
                     return false;
                 }
@@ -152,13 +171,31 @@ impl IicpClient {
                 intent: request.intent.clone(),
             })?;
 
+        // IICP-CX S.16 §5: encrypt payload when use_confidentiality=true + node has cx_public_key
+        let body: serde_json::Value = if self.config.use_confidentiality {
+            if let Some(ref cx_key) = node.cx_public_key {
+                let iicp_conf =
+                    encrypt_payload(&request.payload, cx_key, &request.task_id, &request.intent)?;
+                let mut body = serde_json::to_value(&request)?;
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("payload");
+                    obj.insert("iicp_conf".to_string(), serde_json::to_value(iicp_conf)?);
+                }
+                body
+            } else {
+                serde_json::to_value(&request)?
+            }
+        } else {
+            serde_json::to_value(&request)?
+        };
+
         let mut last_err: Option<IicpError> = None;
         for attempt in 0..MAX_RETRIES {
             match self
                 .http
                 .post_json(
                     &format!("{}/v1/task", node.endpoint),
-                    &request,
+                    &body,
                     None,
                     Some(&tp),
                 )
