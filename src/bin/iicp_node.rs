@@ -797,6 +797,29 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         timeout: Duration::from_secs(60),
     };
 
+    // NAT-4 guard: if the endpoint is non-routable (localhost/private) and no relay
+    // is configured, registration will always fail with 422. Skip it early and print
+    // a clear diagnostic instead of a confusing "422 Unprocessable Entity" error.
+    let endpoint_is_local = {
+        let ep = opts.public_endpoint.to_lowercase();
+        ep.contains("localhost")
+            || ep.contains("127.")
+            || ep.contains("0.0.0.0")
+            || ep.contains("192.168.")
+            || ep.contains("10.")
+    };
+    if endpoint_is_local && opts.relay_worker_endpoint.is_empty() && !opts.skip_registration {
+        eprintln!(
+            "[iicp-node] no routable endpoint detected and no relay configured — \
+             skipping directory registration. This node will accept direct connections \
+             on {}:{} but will not appear in discover results. \
+             To register: set IICP_PUBLIC_ENDPOINT=<your-public-url> or \
+             IICP_RELAY_WORKER_ENDPOINT=<relay-host>:<port>.",
+            opts.host, opts.port
+        );
+        opts.skip_registration = true;
+    }
+
     // BUG-6 fix: probe-bind the port before registering so a port conflict fails
     // immediately without leaving a stale directory registration.
     // The probe listener is dropped right away; serve() re-binds milliseconds later.
