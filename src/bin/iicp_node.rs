@@ -191,7 +191,7 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     let client = IicpClient::new(config).map_err(|e| format!("client init: {e}"))?;
 
     let request = TaskRequest {
-        task_id: uuid_v4(),
+        task_id: uuid::Uuid::new_v4().to_string(),
         intent: intent.clone(),
         payload: serde_json::json!({
             "messages": [{"role": "user", "content": prompt}]
@@ -240,22 +240,6 @@ async fn run_query(args: &[String]) -> Result<(), String> {
         return Err(format!("task did not complete (status={})", resp.status));
     }
     Ok(())
-}
-
-fn uuid_v4() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        std::process::id().wrapping_mul(0x9e3779b9),
-        (ns >> 16) & 0xffff,
-        (ns >> 4) & 0xfff,
-        0x8000 | (ns & 0x3fff),
-        (ns as u64).wrapping_mul(0x5851f42d4c957f2d)
-    )
 }
 
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
