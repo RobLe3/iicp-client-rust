@@ -15,6 +15,66 @@ static INTENT_RE: LazyLock<Regex> =
 const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_RETRIES: u32 = 3;
 
+/// SSRF guard: return true only if url is safe to use as a node endpoint (#388).
+fn is_ssrf_safe(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    let rest = if let Some(s) = lower.strip_prefix("https://") {
+        s
+    } else if let Some(s) = lower.strip_prefix("http://") {
+        s
+    } else {
+        return false;
+    };
+
+    // Extract host — handles IPv6 [addr]:port and plain host:port/path
+    let host = if rest.starts_with('[') {
+        rest.split(']').next().map(|s| s.trim_start_matches('[')).unwrap_or("")
+    } else {
+        rest.split('/').next().unwrap_or("").split(':').next().unwrap_or("")
+    };
+
+    if host.is_empty() {
+        return false;
+    }
+    if matches!(host, "localhost" | "0.0.0.0" | "::1" | "::") {
+        return false;
+    }
+    const BLOCKED_SUFFIXES: &[&str] = &[".local", ".internal", ".lan", ".test", ".invalid", ".localhost"];
+    if BLOCKED_SUFFIXES.iter().any(|s| host.ends_with(s)) {
+        return false;
+    }
+    // Bare hostname (no dot and no colon = Docker service name; IPv6 has colons)
+    if !host.contains('.') && !host.contains(':') {
+        return false;
+    }
+    if let Ok(addr) = host.parse::<std::net::IpAddr>() {
+        match addr {
+            std::net::IpAddr::V4(v4) => {
+                if v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                    || v4.is_broadcast() || v4.is_unspecified()
+                {
+                    return false;
+                }
+                let o = v4.octets();
+                if o[0] == 100 && (64..=127).contains(&o[1]) {
+                    return false; // CGNAT 100.64/10
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_multicast() || v6.is_unspecified() {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// Reject model/region strings containing query-separator or newline characters (#388 §FINDING-4-5).
+fn is_safe_query_param(s: &str) -> bool {
+    !s.contains(['&', '=', '\n', '\r', '\0'])
+}
+
 /// IICP client — discover → select → submit (ADR-016 §1).
 pub struct IicpClient {
     config: ClientConfig,
@@ -45,10 +105,14 @@ impl IicpClient {
             self.config.directory_url, intent
         );
         if let Some(region) = opts.region.as_ref().or(self.config.region.as_ref()) {
-            url.push_str(&format!("&region={region}"));
+            if is_safe_query_param(region) {
+                url.push_str(&format!("&region={region}"));
+            }
         }
         if let Some(model) = &opts.model {
-            url.push_str(&format!("&model={model}"));
+            if is_safe_query_param(model) {
+                url.push_str(&format!("&model={model}"));
+            }
         }
         if let Some(rep) = opts.min_reputation {
             url.push_str(&format!("&min_reputation={rep}"));
@@ -71,6 +135,18 @@ impl IicpClient {
         let node = nodes
             .nodes
             .into_iter()
+            .filter(|n| {
+                if !is_ssrf_safe(&n.endpoint) {
+                    eprintln!(
+                        "[iicp-client] SSRF guard: skipping node {} — endpoint {} is not publicly routable",
+                        &n.node_id[..n.node_id.len().min(8)],
+                        n.endpoint
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
             .find(|n| n.available)
             .ok_or_else(|| IicpError::NoNodes {
                 intent: request.intent.clone(),
