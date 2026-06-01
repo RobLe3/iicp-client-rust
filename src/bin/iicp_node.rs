@@ -30,6 +30,7 @@ use iicp_client::identity::{
     NodeIdentity, OperatorIdentity,
 };
 use iicp_client::node::{IicpNode, NodeConfig};
+use iicp_client::{ClientConfig, IicpClient, TaskRequest};
 
 fn env_or(name: &str, fallback: Option<&str>) -> Option<String> {
     env::var(name)
@@ -98,7 +99,8 @@ fn print_help() {
          Commands:\n\
          \x20 init                       Interactive wizard — set up operator + first node\n\
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
-         \x20 serve                      Register and serve a node\n\n\
+         \x20 serve                      Register and serve a node\n\
+         \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\n\
          Global flags:\n\
          \x20 --version, -V              Print version and exit\n\
          \x20 --help, -h                 Print this help\n\n\
@@ -118,8 +120,134 @@ fn print_help() {
          \x20 --host HOST                IICP_HOST (default 0.0.0.0)\n\
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
-         \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n"
+         \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\n\
+         query optional:\n\
+         \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
+         \x20 --model NAME               Pin to a specific model on the remote node\n\
+         \x20 --max-tokens N             Limit response length\n\
+         \x20 --timeout-ms N             Request timeout (default 60000)\n"
     );
+}
+
+async fn run_query(args: &[String]) -> Result<(), String> {
+    // Collect positional args and flags
+    let mut prompt = String::new();
+    let mut directory_url =
+        env::var("IICP_DIRECTORY_URL").unwrap_or_else(|_| "https://iicp.network/api".to_string());
+    let mut intent =
+        env::var("IICP_INTENT").unwrap_or_else(|_| "urn:iicp:intent:llm:chat:v1".to_string());
+    let mut model: Option<String> = None;
+    let mut max_tokens: Option<u32> = None;
+    let mut timeout_ms: u64 = 60_000;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a.starts_with('-') {
+            if i + 1 >= args.len() {
+                return Err(format!("flag {a} needs a value"));
+            }
+            let v = args[i + 1].clone();
+            match a.as_str() {
+                "--directory-url" => directory_url = v,
+                "--intent" => intent = v,
+                "--model" => model = Some(v),
+                "--max-tokens" => {
+                    max_tokens = Some(v.parse().map_err(|e| format!("--max-tokens: {e}"))?)
+                }
+                "--timeout-ms" => {
+                    timeout_ms = v.parse().map_err(|e| format!("--timeout-ms: {e}"))?
+                }
+                _ => return Err(format!("unknown flag: {a}")),
+            }
+            i += 2;
+        } else {
+            if !prompt.is_empty() {
+                prompt.push(' ');
+            }
+            prompt.push_str(a);
+            i += 1;
+        }
+    }
+
+    if prompt.is_empty() {
+        return Err("Usage: iicp-node query <prompt> [flags]".to_string());
+    }
+
+    let config = ClientConfig {
+        directory_url,
+        timeout_ms,
+        ..Default::default()
+    };
+    let client = IicpClient::new(config).map_err(|e| format!("client init: {e}"))?;
+
+    let request = TaskRequest {
+        task_id: uuid_v4(),
+        intent: intent.clone(),
+        payload: serde_json::json!({
+            "messages": [{"role": "user", "content": prompt}]
+        }),
+        constraints: if model.is_some() || max_tokens.is_some() {
+            Some(iicp_client::TaskConstraints {
+                timeout_ms: None,
+                max_tokens,
+                model,
+            })
+        } else {
+            None
+        },
+        auth: None,
+    };
+
+    eprintln!("[iicp-node] Discovering nodes for {}...", intent);
+    let resp = client.submit(request).await.map_err(|e| format!("{e}"))?;
+
+    if resp.status == "completed" {
+        let content = resp
+            .result
+            .as_ref()
+            .and_then(|r| r.get("content").and_then(|v| v.as_str()))
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| {
+                serde_json::to_string_pretty(
+                    resp.result.as_ref().unwrap_or(&serde_json::Value::Null),
+                )
+                .unwrap_or_default()
+            });
+        println!("{content}");
+        if let Some(m) = &resp.metrics {
+            if let Some(node_id) = &m.node_id {
+                eprintln!(
+                    "[iicp-node] routed to node {}",
+                    &node_id[..8.min(node_id.len())]
+                );
+            }
+            if let Some(ms) = m.latency_ms {
+                eprintln!("[iicp-node] latency {ms:.0}ms");
+            }
+        }
+    } else {
+        eprintln!("[iicp-node] task status: {}", resp.status);
+        return Err(format!("task did not complete (status={})", resp.status));
+    }
+    Ok(())
+}
+
+fn uuid_v4() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        std::process::id().wrapping_mul(0x9e3779b9),
+        (ns >> 16) & 0xffff,
+        (ns >> 4) & 0xfff,
+        0x8000 | (ns & 0x3fff),
+        (ns as u64).wrapping_mul(0x5851f42d4c957f2d)
+    )
 }
 
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
@@ -1063,6 +1191,13 @@ async fn main() {
     }
     if cmd == "list" {
         if let Err(e) = run_list() {
+            eprintln!("ERROR: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if cmd == "query" {
+        if let Err(e) = run_query(&args[2..]).await {
             eprintln!("ERROR: {e}");
             process::exit(1);
         }
