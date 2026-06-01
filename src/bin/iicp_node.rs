@@ -60,18 +60,26 @@ fn env_bool(name: &str) -> bool {
 /// attempting a real bind so the chosen port is genuinely free before NAT
 /// detection opens a pinhole and the directory registration advertises it.
 fn find_available_port(host: &str, start: u16, max_tries: u16) -> u16 {
-    let bind_host = if host.is_empty() || host == "0.0.0.0" {
-        "0.0.0.0"
-    } else {
-        host
-    };
     for offset in 0..max_tries {
         let candidate = start.saturating_add(offset);
-        if std::net::TcpListener::bind((bind_host, candidate)).is_ok() {
+        let addr_str = fmt_bind_addr(host, candidate);
+        if addr_str
+            .parse::<std::net::SocketAddr>()
+            .is_ok_and(|a| std::net::TcpListener::bind(a).is_ok())
+        {
             return candidate;
         }
     }
     start // exhausted — let serve() surface the real bind error
+}
+
+/// Format a bind address string, wrapping IPv6 host in brackets.
+fn fmt_bind_addr(host: &str, port: u16) -> String {
+    if host.contains(':') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 struct ServeOpts {
@@ -117,7 +125,7 @@ fn print_help() {
          \x20 --max-concurrent N         IICP_MAX_CONCURRENT (default 4)\n\
          \x20 --node-id ID               IICP_NODE_ID (auto-generated if absent)\n\
          \x20 --port N                   IICP_PORT (default 9484)\n\
-         \x20 --host HOST                IICP_HOST (default 0.0.0.0)\n\
+         \x20 --host HOST                IICP_HOST (default :: — dual-stack IPv4+IPv6)\n\
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\n\
@@ -265,7 +273,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         max_concurrent: env_int("IICP_MAX_CONCURRENT", 4) as usize,
         node_id: env_or("IICP_NODE_ID", None).unwrap_or_default(),
         port: env_int("IICP_PORT", 9484) as u16,
-        host: env_or("IICP_HOST", Some("0.0.0.0")).unwrap(),
+        host: env_or("IICP_HOST", Some("::")).unwrap(),
         skip_registration: env_bool("IICP_SKIP_REGISTRATION"),
         // Default ON — opt out with IICP_AUTO_DETECT_NAT=false.
         auto_detect_nat: std::env::var("IICP_AUTO_DETECT_NAT")
@@ -350,8 +358,11 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
     if opts.port == 9484 {
         opts.port = saved.port;
     }
-    if opts.host == "0.0.0.0" {
-        opts.host = saved.host.clone();
+    if opts.host == "::" || opts.host == "0.0.0.0" {
+        // Both are "default" / all-interfaces — let the saved config win
+        if !saved.host.is_empty() && saved.host != "::" && saved.host != "0.0.0.0" {
+            opts.host = saved.host.clone();
+        }
     }
     if !opts.auto_detect_nat {
         opts.auto_detect_nat = saved.auto_detect_nat;
@@ -979,7 +990,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // immediately without leaving a stale directory registration.
     // The probe listener is dropped right away; serve() re-binds milliseconds later.
     if !opts.skip_registration {
-        let probe_addr = format!("{}:{}", opts.host, opts.port)
+        let probe_addr = fmt_bind_addr(&opts.host, opts.port)
             .parse::<std::net::SocketAddr>()
             .map_err(|e| format!("invalid listen address: {e}"))?;
         std::net::TcpListener::bind(probe_addr).map_err(|e| {
@@ -1018,7 +1029,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     let opts_handler = openai_opts.clone();
     let backend_type = opts.backend_type.clone();
-    let bind = format!("{}:{}", opts.host, opts.port);
+    let bind = fmt_bind_addr(&opts.host, opts.port);
     let token_for_serve = token.clone();
     let serve_result = tokio::select! {
         r = node.serve(
