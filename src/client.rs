@@ -119,10 +119,8 @@ impl IicpClient {
     ) -> Result<NodeList> {
         self.validate_intent(intent)?;
         let opts = opts.unwrap_or_default();
-        let mut url = format!(
-            "{}/api/v1/discover?intent={}",
-            self.config.directory_url, intent
-        );
+        let base = self.config.directory_url.trim_end_matches('/');
+        let mut url = format!("{base}/v1/discover?intent={intent}");
         if let Some(region) = opts.region.as_ref().or(self.config.region.as_ref()) {
             if is_safe_query_param(region) {
                 url.push_str(&format!("&region={region}"));
