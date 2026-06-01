@@ -770,6 +770,12 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
         node.apply_nat_profile(&profile);
 
+        // Propagate detected public endpoint back to opts so the NAT-4 guard
+        // (which checks opts.public_endpoint) sees the real reachable URL.
+        if let Some(ep) = &profile.public_endpoint {
+            opts.public_endpoint = ep.clone();
+        }
+
         // Tier ≥ 3 (CGNAT + no usable IPv6 path) and no relay configured:
         // auto-elect relay from the directory.
         if profile.tier >= 3 && opts.relay_worker_endpoint.is_empty() {

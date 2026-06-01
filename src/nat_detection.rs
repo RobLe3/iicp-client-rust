@@ -366,18 +366,43 @@ pub async fn try_upnp_mapping(internal_ports: Vec<u16>, lease_seconds: u32) -> O
     // the platform-specific submodule (aio::tokio::search_gateway in 0.17).
     use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
 
-    // FRITZ!Box can take up to 5 seconds for SSDP discovery on a cold network.
-    // Use a 10-second timeout to avoid false-negative tier-4 on slow routers.
-    let search = SearchOptions {
-        timeout: Some(Duration::from_secs(10)),
-        ..Default::default()
-    };
-    let gateway = match search_gateway(search).await {
-        Ok(g) => g,
-        Err(e) => {
+    // Try SSDP discovery with each local IPv4 address as the bind address.
+    // On macOS with multiple interfaces (WiFi + VPN), binding to 0.0.0.0 may
+    // route the multicast M-SEARCH to the wrong interface (VPN instead of LAN).
+    // Trying each LAN IP ensures the packet reaches the router (FRITZ!Box etc.).
+    let mut bind_candidates: Vec<std::net::SocketAddr> = vec!["0.0.0.0:0".parse().unwrap()];
+    // Append each local IPv4 in case the default bind routes multicast incorrectly.
+    for ip in list_local_ipv4_addresses() {
+        let candidate: std::net::SocketAddr = (ip, 0).into();
+        if !bind_candidates.contains(&candidate) {
+            bind_candidates.push(candidate);
+        }
+    }
+
+    let mut last_err = String::from("no candidates");
+    let mut gateway_opt = None;
+    'outer: for bind_addr in bind_candidates {
+        let search = SearchOptions {
+            bind_addr,
+            timeout: Some(Duration::from_secs(6)),
+            ..Default::default()
+        };
+        match search_gateway(search).await {
+            Ok(g) => {
+                gateway_opt = Some(g);
+                break 'outer;
+            }
+            Err(e) => {
+                last_err = format!("{e} (tried bind={bind_addr})");
+            }
+        }
+    }
+    let gateway = match gateway_opt {
+        Some(g) => g,
+        None => {
             return Some(UpnpResult {
                 success: false,
-                error: Some(format!("IGD discovery failed: {e}")),
+                error: Some(format!("IGD discovery failed: {last_err}")),
                 ..Default::default()
             });
         }
