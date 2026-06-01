@@ -27,6 +27,19 @@ iicp-client = { git = "https://github.com/RobLe3/iicp-client-rust" }
 
 ---
 
+## Architecture — consumer or provider?
+
+This SDK covers **both** sides of the IICP protocol:
+
+| Role | What you do | Type |
+|------|-------------|------|
+| **Consumer** | Send AI tasks to the mesh; discover and submit | `IicpClient` |
+| **Provider** | Run a node, register with the directory, serve tasks | `IicpNode` |
+
+Consumer and provider can run in the same process. For production provider nodes backed by Ollama/vLLM, see [iicp.network/docs/node-setup](https://iicp.network/docs/node-setup).
+
+---
+
 ## Quickstart
 
 ```rust
