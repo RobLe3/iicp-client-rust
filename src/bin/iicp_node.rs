@@ -99,6 +99,9 @@ fn print_help() {
          \x20 init                       Interactive wizard — set up operator + first node\n\
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
          \x20 serve                      Register and serve a node\n\n\
+         Global flags:\n\
+         \x20 --version, -V              Print version and exit\n\
+         \x20 --help, -h                 Print this help\n\n\
          serve required (flag or env):\n\
          \x20 --model NAME               IICP_BACKEND_MODEL (e.g. qwen2.5:0.5b)\n\
          \x20 (or --node NAME            load from ~/.iicp/nodes/<NAME>.json after `iicp-node init`)\n\n\
@@ -1021,6 +1024,10 @@ async fn main() {
     if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
         print_help();
         process::exit(if args.len() < 2 { 2 } else { 0 });
+    }
+    if args[1] == "--version" || args[1] == "-V" {
+        println!("iicp-node {}", env!("CARGO_PKG_VERSION"));
+        process::exit(0);
     }
     let cmd = &args[1];
     if cmd == "init" {
