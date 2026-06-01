@@ -151,7 +151,8 @@ impl IicpClient {
 
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
         let nodes = self.discover(&request.intent, None, Some(&tp)).await?;
-        let node = nodes
+        // Collect up to MAX_RETRIES candidates — fall back to the next on connection errors.
+        let candidates: Vec<_> = nodes
             .nodes
             .into_iter()
             .filter(|n| {
@@ -166,50 +167,76 @@ impl IicpClient {
                     true
                 }
             })
-            .find(|n| n.available)
-            .ok_or_else(|| IicpError::NoNodes {
-                intent: request.intent.clone(),
-            })?;
+            .filter(|n| n.available)
+            .take(MAX_RETRIES as usize)
+            .collect();
 
-        // IICP-CX S.16 §5: encrypt payload when use_confidentiality=true + node has cx_public_key
-        let body: serde_json::Value = if self.config.use_confidentiality {
-            if let Some(ref cx_key) = node.cx_public_key {
-                let iicp_conf =
-                    encrypt_payload(&request.payload, cx_key, &request.task_id, &request.intent)?;
-                let mut body = serde_json::to_value(&request)?;
-                if let Some(obj) = body.as_object_mut() {
-                    obj.remove("payload");
-                    obj.insert("iicp_conf".to_string(), serde_json::to_value(iicp_conf)?);
-                }
-                body
-            } else {
-                serde_json::to_value(&request)?
-            }
-        } else {
-            serde_json::to_value(&request)?
-        };
+        if candidates.is_empty() {
+            return Err(IicpError::NoNodes {
+                intent: request.intent.clone(),
+            });
+        }
 
         let mut last_err: Option<IicpError> = None;
-        for attempt in 0..MAX_RETRIES {
-            match self
-                .http
-                .post_json(
-                    &format!("{}/v1/task", node.endpoint),
-                    &body,
-                    None,
-                    Some(&tp),
-                )
-                .await
-            {
-                Ok(resp) => return Ok(resp),
-                Err(e) if e.is_transient() && attempt < MAX_RETRIES - 1 => {
-                    tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt))).await;
-                    last_err = Some(e);
+
+        'nodes: for node in &candidates {
+            // IICP-CX S.16 §5: build body per node (cx_public_key may differ per node)
+            let body: serde_json::Value = if self.config.use_confidentiality {
+                if let Some(ref cx_key) = node.cx_public_key {
+                    let iicp_conf = encrypt_payload(
+                        &request.payload,
+                        cx_key,
+                        &request.task_id,
+                        &request.intent,
+                    )?;
+                    let mut body = serde_json::to_value(&request)?;
+                    if let Some(obj) = body.as_object_mut() {
+                        obj.remove("payload");
+                        obj.insert("iicp_conf".to_string(), serde_json::to_value(iicp_conf)?);
+                    }
+                    body
+                } else {
+                    serde_json::to_value(&request)?
                 }
-                Err(e) => return Err(e),
+            } else {
+                serde_json::to_value(&request)?
+            };
+
+            for attempt in 0..MAX_RETRIES {
+                match self
+                    .http
+                    .post_json(
+                        &format!("{}/v1/task", node.endpoint),
+                        &body,
+                        None,
+                        Some(&tp),
+                    )
+                    .await
+                {
+                    Ok(resp) => return Ok(resp),
+                    Err(e) => {
+                        last_err = Some(e);
+                        let err = last_err.as_ref().unwrap();
+                        if !err.is_transient() {
+                            return Err(last_err.unwrap()); // hard failure, don't retry
+                        }
+                        // Network/connection error → try next node immediately
+                        if matches!(err, IicpError::Http(_)) {
+                            continue 'nodes;
+                        }
+                        // Server 5xx → retry same node with backoff
+                        if attempt < MAX_RETRIES - 1 {
+                            tokio::time::sleep(Duration::from_millis(200 * 2u64.pow(attempt)))
+                                .await;
+                        }
+                    }
+                }
             }
         }
-        Err(last_err.unwrap())
+
+        Err(last_err.unwrap_or_else(|| IicpError::NoNodes {
+            intent: request.intent.clone(),
+        }))
     }
 
     /// Discover → select best LLM node → submit chat task (SDK-02).
