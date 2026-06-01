@@ -149,7 +149,10 @@ fn build_ipv6(profile: &NatProfile) -> Ipv6Qualification {
         },
         Some(v6) => Ipv6Qualification {
             routable: !v6.addresses.is_empty(),
-            pinhole_ok: v6.pinhole_active && v6.pinhole_inbound_allowed.unwrap_or(false),
+            // pinhole_active = router accepted AddPinhole = port is open.
+            // pinhole_inbound_allowed is a global FRITZ!Box setting that returns
+            // false even when individual pinholes work; do not require it.
+            pinhole_ok: v6.pinhole_active,
             address: v6.addresses.first().cloned(),
         },
     }
@@ -173,8 +176,11 @@ fn derive_exposure_mode(
             ExposureMode::OutboundOnly
         };
     }
-    // tier 0 or 1
-    let ipv4_ok = profile.public_endpoint.is_some();
+    // tier 0 or 1 — IPv6 GUA endpoints contain '['; must not be mistaken for IPv4.
+    let ipv4_ok = profile
+        .public_endpoint
+        .as_deref()
+        .is_some_and(|ep| !ep.contains('['));
     if ipv4_ok && ipv6.routable && ipv6.pinhole_ok {
         return ExposureMode::DualStackAvailable;
     }
