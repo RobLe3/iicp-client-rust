@@ -103,6 +103,9 @@ pub struct NodeConfig {
     /// R2: when set, this node acts as a relay WORKER — connects outbound to the
     /// specified relay endpoint. Format: "host:port" (e.g. "relay.example.com:9485").
     pub relay_worker_endpoint: Option<String>,
+    /// Directory for persistent log files (`<node_id>.log` + `events.jsonl`).
+    /// `None` disables file logging (stderr only). Overridden by `IICP_LOG_DIR`.
+    pub log_dir: Option<std::path::PathBuf>,
 }
 
 impl NodeConfig {
@@ -137,6 +140,7 @@ impl NodeConfig {
             relay_capable: false,
             relay_accept_port: 9485,
             relay_worker_endpoint: None,
+            log_dir: None,
         }
     }
 }
@@ -179,6 +183,9 @@ struct AppState {
     intent: String,
     model: String,
     active_jobs: Arc<AtomicUsize>,
+    /// Incremental task success/failure counters reset on each heartbeat.
+    tasks_success: Arc<AtomicUsize>,
+    tasks_failed: Arc<AtomicUsize>,
     max_concurrent: usize,
     availability: Arc<crate::availability::AvailabilityEvaluator>,
     idempotency: Arc<crate::idempotency::IdempotencyGuard>,
@@ -491,23 +498,29 @@ async fn task_endpoint(
     state.active_jobs.fetch_sub(1, Ordering::Relaxed);
 
     match result {
-        Ok(value) => Json(TaskResponse {
-            task_id,
-            status: "completed".into(),
-            result: Some(value),
-            error: None,
-        })
-        .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
+        Ok(value) => {
+            state.tasks_success.fetch_add(1, Ordering::Relaxed);
             Json(TaskResponse {
                 task_id,
-                status: "error".into(),
-                result: None,
-                error: Some(json!({ "message": e.to_string() })),
-            }),
-        )
-            .into_response(),
+                status: "completed".into(),
+                result: Some(value),
+                error: None,
+            })
+            .into_response()
+        }
+        Err(e) => {
+            state.tasks_failed.fetch_add(1, Ordering::Relaxed);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(TaskResponse {
+                    task_id,
+                    status: "error".into(),
+                    result: None,
+                    error: Some(json!({ "message": e.to_string() })),
+                }),
+            )
+            .into_response()
+        }
     }
 }
 
@@ -886,6 +899,8 @@ impl IicpNode {
                 .unwrap_or(3600),
         ));
 
+        let tasks_success = Arc::new(AtomicUsize::new(0));
+        let tasks_failed = Arc::new(AtomicUsize::new(0));
         let state = Arc::new(AppState {
             handler,
             node_id: self.cfg.node_id.clone(),
@@ -893,6 +908,8 @@ impl IicpNode {
             intent: self.cfg.intent.clone(),
             model: self.cfg.model.clone().unwrap_or_default(),
             active_jobs,
+            tasks_success: Arc::clone(&tasks_success),
+            tasks_failed: Arc::clone(&tasks_failed),
             max_concurrent: self.cfg.max_concurrent,
             availability: Arc::new(crate::availability::AvailabilityEvaluator::new(
                 self.cfg.availability_windows.clone(),
@@ -990,10 +1007,27 @@ impl IicpNode {
             let http = self.http.clone();
             let avail = Arc::clone(&hb_availability);
             let max_c = self.cfg.max_concurrent;
+            // Optional file logger shared with the heartbeat background task.
+            let hb_log: Option<Arc<crate::node_log::NodeLog>> =
+                self.cfg.log_dir.as_deref().and_then(|d| {
+                    crate::node_log::NodeLog::open(d, &node_id)
+                        .map(Arc::new)
+                        .ok()
+                });
+            let hb_node_id = node_id.clone();
+            let hb_tasks_success = Arc::clone(&tasks_success);
+            let hb_tasks_failed = Arc::clone(&tasks_failed);
             tokio::spawn(async move {
+                let mut seq: u64 = 0;
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
-                    if let Err(e) = http
+                    seq += 1;
+                    // Drain incremental task counters so the directory receives
+                    // the delta since the last heartbeat (ReputationService::upsert
+                    // expects incremental, not cumulative counts).
+                    let ok = hb_tasks_success.swap(0, Ordering::Relaxed);
+                    let fail = hb_tasks_failed.swap(0, Ordering::Relaxed);
+                    match http
                         // /v1/heartbeat — see heartbeat() above for the doubled-prefix
                         // history. Same fix applied here in the background loop.
                         .post(format!("{}/v1/heartbeat", dir.trim_end_matches('/')))
@@ -1004,11 +1038,32 @@ impl IicpNode {
                             "status": "available",
                             // Live capacity after availability shaping (ADR-006).
                             "max_concurrent": avail.effective_max_concurrent(max_c),
+                            // Task outcome metrics — only sent when non-zero to
+                            // avoid moving reputation on idle periods.
+                            "metrics": if ok > 0 || fail > 0 {
+                                json!({"tasks_success": ok, "tasks_failed": fail})
+                            } else {
+                                json!({})
+                            },
                         }))
                         .send()
                         .await
                     {
-                        tracing::warn!("heartbeat failed: {e}");
+                        Ok(_) => {
+                            if let Some(ref log) = hb_log {
+                                log.write("heartbeat_ok", &hb_node_id, &format!("seq={seq}"));
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("heartbeat failed: {e}");
+                            if let Some(ref log) = hb_log {
+                                log.write(
+                                    "heartbeat_fail",
+                                    &hb_node_id,
+                                    &format!("seq={seq} error={e}"),
+                                );
+                            }
+                        }
                     }
                 }
             });

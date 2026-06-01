@@ -99,6 +99,7 @@ struct ServeOpts {
     auto_detect_nat: bool,
     external_ip_probe_url: String,
     relay_worker_endpoint: String,
+    log_dir: Option<String>,
 }
 
 fn print_help() {
@@ -128,7 +129,8 @@ fn print_help() {
          \x20 --host HOST                IICP_HOST (default :: — dual-stack IPv4+IPv6)\n\
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
-         \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\n\
+         \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
+         \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\n\
          query optional:\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
@@ -267,6 +269,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         external_ip_probe_url: env_or("IICP_EXTERNAL_IP_PROBE_URL", None)
             .unwrap_or_else(|| "https://api.ipify.org".to_string()),
         relay_worker_endpoint: env_or("IICP_RELAY_WORKER_ENDPOINT", None).unwrap_or_default(),
+        log_dir: env_or("IICP_LOG_DIR", None),
     };
 
     let mut i = 0;
@@ -305,6 +308,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     "--host" => opts.host = v,
                     "--external-ip-probe-url" => opts.external_ip_probe_url = v,
                     "--relay-worker-endpoint" => opts.relay_worker_endpoint = v,
+                    "--log-dir" => opts.log_dir = Some(v),
                     _ => return Err(format!("unknown flag: {arg}")),
                 }
                 i += 2;
@@ -779,6 +783,15 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     if !opts.relay_worker_endpoint.is_empty() {
         cfg.relay_worker_endpoint = Some(opts.relay_worker_endpoint.clone());
     }
+    // Resolve log directory: CLI flag > IICP_LOG_DIR > ~/.iicp/logs/
+    cfg.log_dir = Some({
+        let raw = opts.log_dir.clone().unwrap_or_else(|| {
+            config_dir()
+                .map(|d| d.join("logs").to_string_lossy().into_owned())
+                .unwrap_or_else(|_| ".iicp/logs".to_string())
+        });
+        std::path::PathBuf::from(raw)
+    });
     // Populate additional models; register() merges capabilities into models array.
     cfg.capabilities = discovered_models
         .into_iter()
@@ -806,8 +819,18 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 .cloned(),
         }));
     }
+    // Capture before cfg is consumed by IicpNode::new.
+    let resolved_log_dir = cfg.log_dir.clone();
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
     let mut node = IicpNode::new(cfg);
+
+    // Open node log (best-effort — log failure never blocks serve).
+    let node_log: Option<std::sync::Arc<iicp_client::node_log::NodeLog>> =
+        resolved_log_dir.as_deref().and_then(|d| {
+            iicp_client::node_log::NodeLog::open(d, &opts.node_id)
+                .map(std::sync::Arc::new)
+                .ok()
+        });
 
     // If a v6 pinhole was opened, register the UID with the node so
     // graceful shutdown revokes it.
@@ -997,10 +1020,20 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                     opts.node_id,
                     t.chars().take(8).collect::<String>()
                 );
+                if let Some(ref log) = node_log {
+                    log.write(
+                        "register_ok",
+                        &opts.node_id,
+                        &format!("endpoint={}", opts.public_endpoint),
+                    );
+                }
                 Some(t)
             }
             Err(e) => {
                 eprintln!("[iicp-node] registration failed: {e} — continuing without heartbeat");
+                if let Some(ref log) = node_log {
+                    log.write("register_fail", &opts.node_id, &format!("error={e}"));
+                }
                 None
             }
         }
@@ -1010,6 +1043,16 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         "[iicp-node] serving {} on {}:{} — backend {} (model={}, max_concurrent={})",
         opts.intent, opts.host, opts.port, opts.backend_url, opts.model, opts.max_concurrent
     );
+    if let Some(ref log) = node_log {
+        log.write(
+            "serve_start",
+            &opts.node_id,
+            &format!(
+                "port={} model={} intent={}",
+                opts.port, opts.model, opts.intent
+            ),
+        );
+    }
 
     let opts_handler = openai_opts.clone();
     let backend_type = opts.backend_type.clone();
@@ -1051,8 +1094,18 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         let _ = node.revoke_pinhole().await;
     }
     if let Some(t) = &token {
-        if let Err(e) = node.deregister(Some(t)).await {
-            eprintln!("[iicp-node] deregister failed: {e}");
+        match node.deregister(Some(t)).await {
+            Ok(()) => {
+                if let Some(ref log) = node_log {
+                    log.write("deregister_ok", &opts.node_id, "");
+                }
+            }
+            Err(e) => {
+                eprintln!("[iicp-node] deregister failed: {e}");
+                if let Some(ref log) = node_log {
+                    log.write("deregister_fail", &opts.node_id, &format!("error={e}"));
+                }
+            }
         }
     }
 

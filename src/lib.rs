@@ -21,6 +21,7 @@ mod client;
 mod errors;
 mod http;
 pub mod node;
+pub mod node_log;
 mod types;
 
 #[cfg(feature = "iicp-tcp")]
