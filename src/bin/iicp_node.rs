@@ -759,6 +759,15 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             profile.public_endpoint.as_deref().unwrap_or("<none>"),
             v6_pin
         );
+        if profile.tier >= 3 && !profile.detection_log.is_empty() {
+            eprintln!("[iicp-node] NAT detection log:");
+            for line in &profile.detection_log {
+                eprintln!("[iicp-node]   {line}");
+            }
+        }
+        if let Some(guidance) = &profile.operator_guidance {
+            eprintln!("[iicp-node] NAT guidance: {guidance}");
+        }
         node.apply_nat_profile(&profile);
 
         // Tier ≥ 3 (CGNAT + no usable IPv6 path) and no relay configured:

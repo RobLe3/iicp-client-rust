@@ -111,7 +111,7 @@ impl Default for DetectNatOptions {
             bind_port: 8080,
             operator_public_endpoint: None,
             upnp_lease_seconds: 3600,
-            timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(10),
             external_ip_probe_url: None,
             transport_port: Some(9484),
             detect_v6: true,
@@ -366,7 +366,12 @@ pub async fn try_upnp_mapping(internal_ports: Vec<u16>, lease_seconds: u32) -> O
     // the platform-specific submodule (aio::tokio::search_gateway in 0.17).
     use igd_next::{aio::tokio::search_gateway, PortMappingProtocol, SearchOptions};
 
-    let search = SearchOptions::default();
+    // FRITZ!Box can take up to 5 seconds for SSDP discovery on a cold network.
+    // Use a 10-second timeout to avoid false-negative tier-4 on slow routers.
+    let search = SearchOptions {
+        timeout: Some(Duration::from_secs(10)),
+        ..Default::default()
+    };
     let gateway = match search_gateway(search).await {
         Ok(g) => g,
         Err(e) => {
