@@ -1019,31 +1019,55 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         // probe listener dropped here; port is immediately available for serve()
     }
 
+    // #404 — register with bounded backoff retry. On persistent failure, still
+    // start the heartbeat loop with an empty token: its first heartbeat 401s and
+    // the #399 re-register path recovers once the directory is reachable. This is
+    // the self-healing watchdog — the node never ends up running un-registered
+    // with no heartbeat (the old "continuing without heartbeat" dead end).
     let token = if opts.skip_registration {
         None
     } else {
-        match node.register().await {
-            Ok(t) => {
-                eprintln!(
-                    "[iicp-node] registered as {} (token={}…)",
-                    opts.node_id,
-                    t.chars().take(8).collect::<String>()
-                );
-                if let Some(ref log) = node_log {
-                    log.write(
-                        "register_ok",
-                        &opts.node_id,
-                        &format!("endpoint={}", opts.public_endpoint),
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            match node.register().await {
+                Ok(t) => {
+                    eprintln!(
+                        "[iicp-node] registered as {} (token={}…)",
+                        opts.node_id,
+                        t.chars().take(8).collect::<String>()
                     );
+                    if let Some(ref log) = node_log {
+                        log.write(
+                            "register_ok",
+                            &opts.node_id,
+                            &format!("endpoint={}", opts.public_endpoint),
+                        );
+                    }
+                    break Some(t);
                 }
-                Some(t)
-            }
-            Err(e) => {
-                eprintln!("[iicp-node] registration failed: {e} — continuing without heartbeat");
-                if let Some(ref log) = node_log {
-                    log.write("register_fail", &opts.node_id, &format!("error={e}"));
+                Err(e) if attempt >= 3 => {
+                    eprintln!(
+                        "[iicp-node] registration failed after {attempt} attempts: {e} — \
+                         starting heartbeat loop anyway; it will re-register on the first 401"
+                    );
+                    if let Some(ref log) = node_log {
+                        log.write(
+                            "register_fail",
+                            &opts.node_id,
+                            &format!("error={e} attempts={attempt}"),
+                        );
+                    }
+                    break Some(String::new()); // empty token → #399 re-register self-heals
                 }
-                None
+                Err(e) => {
+                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt));
+                    eprintln!(
+                        "[iicp-node] registration attempt {attempt} failed: {e} — retrying in {}s",
+                        backoff.as_secs()
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
             }
         }
     };
