@@ -130,7 +130,7 @@ pub fn save_operator(op: &OperatorIdentity) -> io::Result<PathBuf> {
     Ok(p)
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub node_id: String,
     pub operator_id: String,

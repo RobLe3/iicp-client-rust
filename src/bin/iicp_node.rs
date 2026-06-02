@@ -82,6 +82,7 @@ fn fmt_bind_addr(host: &str, port: u16) -> String {
     }
 }
 
+#[derive(Default)]
 struct ServeOpts {
     node: String,
     backend_url: String,
@@ -253,9 +254,10 @@ async fn run_query(args: &[String]) -> Result<(), String> {
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
     let mut opts = ServeOpts {
         node: env_or("IICP_NODE_NAME", None).unwrap_or_default(),
-        // Onboarding: default to Ollama's well-known local port so `iicp-node serve --model X`
-        // works with no --backend-url for the overwhelmingly common local-Ollama case.
-        backend_url: env_or("IICP_BACKEND_URL", Some("http://localhost:11434")).unwrap(),
+        // #410 — default EMPTY here so saved-node config (--node) can supply backend_url.
+        // The Ollama localhost:11434 fallback is applied AFTER apply_saved_node, giving the
+        // correct precedence: flag > env > saved-config > built-in default.
+        backend_url: env_or("IICP_BACKEND_URL", None).unwrap_or_default(),
         backend_type: env_or("IICP_BACKEND_TYPE", Some("openai_compat")).unwrap(),
         model: env_or("IICP_BACKEND_MODEL", None).unwrap_or_default(),
         public_endpoint: env_or("IICP_PUBLIC_ENDPOINT", None).unwrap_or_default(),
@@ -723,6 +725,12 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 ));
             }
         }
+    }
+
+    // #410 — built-in fallback applied LAST (after flag/env/saved-config), so the
+    // Ollama default never shadows a saved-node backend_url.
+    if opts.backend_url.is_empty() {
+        opts.backend_url = "http://localhost:11434".to_string();
     }
 
     // Onboarding: if no --model given, auto-select the first model the backend advertises
@@ -1330,5 +1338,42 @@ async fn main() {
     if let Err(e) = run_serve(opts).await {
         eprintln!("ERROR: {e}");
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #410 — saved-node backend_url must be applied when no flag/env supplied it.
+    // Regression: ServeOpts.backend_url used to default to the non-empty Ollama
+    // literal, so apply_saved_node's `is_empty()` guard never fired and the saved
+    // config's backend_url was silently ignored (node served the wrong backend).
+    #[test]
+    fn saved_backend_url_applies_when_unset() {
+        let mut opts = ServeOpts::default(); // backend_url == "" (the #410 fix)
+        let saved = NodeIdentity {
+            backend_url: "http://localhost:1234/v1".to_string(),
+            model: "qwen2.5-coder-14b-instruct-mlx".to_string(),
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert_eq!(opts.backend_url, "http://localhost:1234/v1");
+        assert_eq!(opts.model, "qwen2.5-coder-14b-instruct-mlx");
+    }
+
+    // An explicit flag/env value (non-empty before apply_saved_node) must win.
+    #[test]
+    fn explicit_backend_url_overrides_saved() {
+        let mut opts = ServeOpts {
+            backend_url: "http://flag:9999/v1".to_string(),
+            ..Default::default()
+        };
+        let saved = NodeIdentity {
+            backend_url: "http://localhost:1234/v1".to_string(),
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert_eq!(opts.backend_url, "http://flag:9999/v1");
     }
 }
