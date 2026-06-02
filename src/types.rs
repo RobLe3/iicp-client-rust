@@ -65,6 +65,10 @@ pub struct Node {
     /// Present only when the node registered with cx_public_key (directory v1.10.7+).
     #[serde(default)]
     pub cx_public_key: Option<CxPublicKey>,
+    /// #397 — transport protocols the node speaks (e.g. ["https","iicp-native"]).
+    /// Empty/absent against a directory predating the field.
+    #[serde(default)]
+    pub transport: Vec<String>,
 }
 
 /// CIP policy block from the discover response.
@@ -177,10 +181,12 @@ mod tests {
     // ADR-044 — discover Node parses the composed health_label + exposure_mode.
     #[test]
     fn node_parses_health_label_and_exposure_mode() {
-        let json = r#"{"node_id":"n1","endpoint":"https://x","score":0.9,"available":true,"region":"eu","health_label":"healthy","exposure_mode":"ipv4_public_direct"}"#;
+        let json = r#"{"node_id":"n1","endpoint":"https://x","score":0.9,"available":true,"region":"eu","health_label":"healthy","exposure_mode":"ipv4_public_direct","transport":["https","iicp-native"]}"#;
         let n: Node = serde_json::from_str(json).unwrap();
         assert_eq!(n.health_label.as_deref(), Some("healthy"));
         assert_eq!(n.exposure_mode.as_deref(), Some("ipv4_public_direct"));
+        // #397 — transport parses from discover.
+        assert_eq!(n.transport, vec!["https", "iicp-native"]);
     }
 
     // A directory predating v1.10.0 omits the fields; parsing must not break.
