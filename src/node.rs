@@ -33,6 +33,21 @@ const DEFAULT_DIRECTORY: &str = "https://iicp.network/api";
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const NONCE_TTL_SECS: u64 = 300;
 
+/// #404 — re-register: POST the register payload and return the fresh `node_token`.
+/// Extracted from the heartbeat loop's re-register arm so the self-heal behaviour
+/// is unit-testable (the 30s interval loop itself is not).
+async fn reregister(http: &Client, url: &str, payload: &serde_json::Value) -> Option<String> {
+    let resp = http.post(url).json(payload).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let data = resp.json::<serde_json::Value>().await.ok()?;
+    data["node_token"]
+        .as_str()
+        .or_else(|| data["token"].as_str())
+        .map(String::from)
+}
+
 /// Configuration for an IICP provider node.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -1043,8 +1058,7 @@ impl IicpNode {
             // if the directory drops the node (deregister/TTL-expiry/restart).
             let hb_register_payload = self.build_register_payload();
             let hb_token_arc = Arc::clone(&self.runtime_token);
-            let hb_register_url =
-                format!("{}/v1/register", dir.trim_end_matches('/'));
+            let hb_register_url = format!("{}/v1/register", dir.trim_end_matches('/'));
             tokio::spawn(async move {
                 let mut token = token;
                 let mut seq: u64 = 0;
@@ -1088,41 +1102,27 @@ impl IicpNode {
                         // heartbeat gap, or the directory restarted). Re-register
                         // and resume with the fresh token instead of heartbeating
                         // into the void forever.
-                        Ok(resp)
-                            if matches!(resp.status().as_u16(), 401 | 404 | 410) =>
-                        {
+                        Ok(resp) if matches!(resp.status().as_u16(), 401 | 404 | 410) => {
                             let code = resp.status().as_u16();
                             tracing::warn!(
                                 "heartbeat rejected ({code}) — node unknown to directory; re-registering"
                             );
-                            match http
-                                .post(&hb_register_url)
-                                .json(&hb_register_payload)
-                                .send()
-                                .await
-                            {
-                                Ok(r) if r.status().is_success() => {
-                                    if let Ok(data) = r.json::<serde_json::Value>().await {
-                                        if let Some(t) = data["node_token"]
-                                            .as_str()
-                                            .or_else(|| data["token"].as_str())
-                                        {
-                                            token = t.to_string();
-                                            if let Ok(mut g) = hb_token_arc.write() {
-                                                *g = token.clone();
-                                            }
-                                            if let Some(ref log) = hb_log {
-                                                log.write(
-                                                    "reregister_ok",
-                                                    &hb_node_id,
-                                                    &format!("seq={seq} after_status={code}"),
-                                                );
-                                            }
-                                        }
+                            match reregister(&http, &hb_register_url, &hb_register_payload).await {
+                                Some(t) => {
+                                    token = t;
+                                    if let Ok(mut g) = hb_token_arc.write() {
+                                        *g = token.clone();
+                                    }
+                                    if let Some(ref log) = hb_log {
+                                        log.write(
+                                            "reregister_ok",
+                                            &hb_node_id,
+                                            &format!("seq={seq} after_status={code}"),
+                                        );
                                     }
                                 }
-                                other => {
-                                    tracing::warn!("re-registration failed: {other:?}");
+                                None => {
+                                    tracing::warn!("re-registration failed (after status {code})");
                                     if let Some(ref log) = hb_log {
                                         log.write(
                                             "reregister_fail",
@@ -1279,5 +1279,44 @@ impl IicpNode {
         axum::serve(listener, app)
             .await
             .map_err(|e| IicpError::Node(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod reregister_tests {
+    use super::reregister;
+    use serde_json::json;
+
+    // #404 — the re-register seam used by the self-healing heartbeat loop:
+    // POST the register payload, return the fresh node_token.
+    #[tokio::test]
+    async fn reregister_returns_fresh_token() {
+        let mut server = mockito::Server::new_async().await;
+        let m = server
+            .mock("POST", "/v1/register")
+            .with_status(201)
+            .with_body(json!({"node_token": "recovered-xyz"}).to_string())
+            .create_async()
+            .await;
+        let http = reqwest::Client::new();
+        let payload = json!({"endpoint": "https://x", "region": "r"});
+        let url = format!("{}/v1/register", server.url());
+        let tok = reregister(&http, &url, &payload).await;
+        assert_eq!(tok, Some("recovered-xyz".to_string()));
+        m.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn reregister_none_on_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let _m = server
+            .mock("POST", "/v1/register")
+            .with_status(500)
+            .create_async()
+            .await;
+        let http = reqwest::Client::new();
+        let url = format!("{}/v1/register", server.url());
+        let tok = reregister(&http, &url, &json!({})).await;
+        assert_eq!(tok, None);
     }
 }
