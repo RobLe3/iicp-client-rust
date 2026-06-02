@@ -188,6 +188,8 @@ struct AppState {
     tasks_failed: Arc<AtomicUsize>,
     max_concurrent: usize,
     availability: Arc<crate::availability::AvailabilityEvaluator>,
+    /// #403 — CIP per-task admission policy (tool-execution gate).
+    cip_policy: Arc<crate::cip_policy::CooperativeInferencePolicy>,
     idempotency: Arc<crate::idempotency::IdempotencyGuard>,
     enable_idempotency: bool,
     peer_manager: Arc<crate::peer_manager::PeerManager>,
@@ -422,6 +424,23 @@ async fn task_endpoint(
     headers: HeaderMap,
     Json(mut req): Json<TaskRequest>,
 ) -> Response {
+    // #403 — CIP per-task admission gate (parity with the adapter cip_gate):
+    // reject tool-execution-domain intents unless the operator opted in via
+    // cip_policy.allow_tool_execution. Checked before the QoS slot so a denied
+    // task doesn't consume capacity.
+    if !state.cip_policy.permits_intent(&req.intent) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": {
+                    "code": "tool_execution_denied",
+                    "message": "Tool-execution intents are not permitted by this node's CIP policy",
+                }
+            })),
+        )
+            .into_response();
+    }
+
     // QoS-aware admission — IICP-E021
     let qos = req
         .constraints
@@ -910,6 +929,12 @@ impl IicpNode {
             availability: Arc::new(crate::availability::AvailabilityEvaluator::new(
                 self.cfg.availability_windows.clone(),
             )),
+            // #403 — resolve the CIP admission policy (cfg override or module default).
+            cip_policy: self
+                .cfg
+                .cip_policy
+                .clone()
+                .unwrap_or_else(crate::cip_policy::get_cip_policy),
             idempotency: Arc::new(crate::idempotency::IdempotencyGuard::default()),
             enable_idempotency: self.cfg.enable_idempotency,
             peer_manager: Arc::new(crate::peer_manager::PeerManager::with_opts(

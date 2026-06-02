@@ -26,6 +26,8 @@ pub struct CooperativeInferencePolicy {
     /// Bounded to [1, 60000] ms.
     pub max_worker_timeout_ms: u32,
     pub max_concurrent_remote: usize,
+    /// #403 — allow tool-execution-domain intents (default false).
+    pub allow_tool_execution: bool,
     in_flight: AtomicUsize,
 }
 
@@ -37,6 +39,7 @@ pub struct CooperativeInferencePolicyOptions {
     pub max_replicas: usize,
     pub max_worker_timeout_ms: u32,
     pub max_concurrent_remote: usize,
+    pub allow_tool_execution: bool,
 }
 
 impl Default for CooperativeInferencePolicyOptions {
@@ -48,6 +51,7 @@ impl Default for CooperativeInferencePolicyOptions {
             max_replicas: 3,
             max_worker_timeout_ms: 30_000,
             max_concurrent_remote: 2,
+            allow_tool_execution: false,
         }
     }
 }
@@ -61,8 +65,18 @@ impl CooperativeInferencePolicy {
             max_replicas: opts.max_replicas.max(1),
             max_worker_timeout_ms: opts.max_worker_timeout_ms.clamp(1, 60_000),
             max_concurrent_remote: opts.max_concurrent_remote.max(1),
+            allow_tool_execution: opts.allow_tool_execution,
             in_flight: AtomicUsize::new(0),
         }
+    }
+
+    /// #403 — per-task admission: reject tool-execution-domain intents unless
+    /// the operator opted in via `allow_tool_execution`. Mirrors the adapter
+    /// cip_gate. Intent URN form: `urn:iicp:intent:<domain>:...` — domain is
+    /// segment index 3.
+    pub fn permits_intent(&self, intent: &str) -> bool {
+        let domain = intent.split(':').nth(3).unwrap_or("");
+        self.allow_tool_execution || domain != "tool"
     }
 
     /// CIP-W01: returns true if this node may act as a CIP coordinator.
@@ -112,6 +126,7 @@ impl CooperativeInferencePolicy {
         }
         Some(serde_json::json!({
             "allow_remote_inference": self.allow_worker,
+            "allow_tool_execution": self.allow_tool_execution,
         }))
     }
 }

@@ -229,3 +229,19 @@ fn test_configure_cip_policy_replaces_global() {
     assert_eq!(p.max_concurrent_remote, 5);
     configure_cip_policy(opts()); // reset
 }
+
+// #403 — per-task admission: tool-execution intent gate (parity with adapter cip_gate)
+#[test]
+fn test_permits_intent_tool_execution_gate() {
+    let denied = CooperativeInferencePolicy::new(opts()); // allow_tool_execution=false default
+    assert!(!denied.allow_tool_execution);
+    assert!(denied.permits_intent("urn:iicp:intent:llm:chat:v1")); // non-tool always ok
+    assert!(!denied.permits_intent("urn:iicp:intent:tool:shell:v1")); // tool denied by default
+    let mut o = opts();
+    o.allow_tool_execution = true;
+    o.enabled = true;
+    let allowed = CooperativeInferencePolicy::new(o);
+    assert!(allowed.permits_intent("urn:iicp:intent:tool:shell:v1"));
+    let block = allowed.as_register_policy_block().unwrap();
+    assert_eq!(block["allow_tool_execution"], serde_json::json!(true));
+}
