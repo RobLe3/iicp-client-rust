@@ -41,6 +41,7 @@ pub mod confidentiality;
 pub mod conformance;
 pub mod idempotency;
 pub mod identity;
+pub mod instance_lock;
 pub mod peer_manager;
 pub mod pricing;
 #[cfg(feature = "iicp-tcp")]

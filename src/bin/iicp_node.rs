@@ -100,6 +100,8 @@ struct ServeOpts {
     external_ip_probe_url: String,
     relay_worker_endpoint: String,
     log_dir: Option<String>,
+    /// #405 — take over the per-node_id single-instance lock if another process holds it.
+    force: bool,
 }
 
 fn print_help() {
@@ -128,6 +130,7 @@ fn print_help() {
          \x20 --port N                   IICP_PORT (default 9484)\n\
          \x20 --host HOST                IICP_HOST (default :: — dual-stack IPv4+IPv6)\n\
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
+         \x20 --force                    IICP_FORCE — take over the single-instance lock for this node_id\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\n\
@@ -270,6 +273,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             .unwrap_or_else(|| "https://api.ipify.org".to_string()),
         relay_worker_endpoint: env_or("IICP_RELAY_WORKER_ENDPOINT", None).unwrap_or_default(),
         log_dir: env_or("IICP_LOG_DIR", None),
+        force: env_bool("IICP_FORCE"),
     };
 
     let mut i = 0;
@@ -279,6 +283,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             "--help" | "-h" => return Err("HELP".into()),
             "--skip-registration" => {
                 opts.skip_registration = true;
+                i += 1;
+            }
+            "--force" => {
+                opts.force = true;
                 i += 1;
             }
             "--auto-detect-nat" => {
@@ -739,6 +747,18 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
     // Directory column is CHAR(36) — truncate custom names to 36 chars.
     opts.node_id.truncate(36);
+
+    // #405 — single-instance lock: refuse a second LIVE process for this node_id
+    // (the token-rotation war). Distinct node_ids are unaffected. Held for the
+    // serve lifetime; the pidfile is removed on shutdown (Drop). Fails open.
+    let _instance_lock =
+        match iicp_client::instance_lock::InstanceLock::acquire(&opts.node_id, opts.force) {
+            Ok(lock) => lock,
+            Err(e) => {
+                eprintln!("[iicp-node] {e}");
+                return Err(e);
+            }
+        };
 
     // Resolve the actual listen port before NAT detection: start at the
     // requested port (default 9484, the official IICP port) and auto-increment
