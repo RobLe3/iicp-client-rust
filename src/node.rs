@@ -536,7 +536,8 @@ pub struct IicpNode {
     /// directory-issued key.
     runtime_hmac_key: std::sync::RwLock<String>,
     /// BUG-5: token stashed by register() so deregister()/heartbeat don't need it re-passed.
-    runtime_token: std::sync::RwLock<String>,
+    /// Arc so the background heartbeat task can update it after a re-registration (#399).
+    runtime_token: Arc<std::sync::RwLock<String>>,
     /// #343 — UPnP IPv6 pinhole UID captured by `apply_nat_profile`, revoked
     /// on shutdown via [`Self::revoke_pinhole`]. Only read under the `nat`
     /// feature; allowed dead_code so non-nat builds compile cleanly.
@@ -558,7 +559,7 @@ impl IicpNode {
             cfg,
             http,
             runtime_hmac_key,
-            runtime_token: std::sync::RwLock::new(String::new()),
+            runtime_token: Arc::new(std::sync::RwLock::new(String::new())),
             pinhole_uid: std::sync::RwLock::new(None),
             pinhole_lease_seconds: std::sync::RwLock::new(3600),
         }
@@ -707,7 +708,10 @@ impl IicpNode {
     /// dual-endpoint extension (`transport_endpoint`). Pre-iter-1413
     /// builds sent a non-spec flat-`intent` shape that the production
     /// directory rejects with 422; fixed here.
-    pub async fn register(&self) -> Result<String> {
+    /// Build the spec-compliant REGISTER payload (iicp-dir §3.1 + v0.7.0
+    /// dual-endpoint). Extracted so the background heartbeat task can re-POST
+    /// the same payload to recover after the directory drops the node (#399).
+    fn build_register_payload(&self) -> Value {
         // Build the spec-compliant capability object. Legacy
         // `capabilities: Vec<String>` is folded into the models array.
         let mut models: Vec<String> = match &self.cfg.model {
@@ -741,12 +745,9 @@ impl IicpNode {
         if !self.cfg.node_id.is_empty() {
             payload["node_id"] = json!(self.cfg.node_id);
         }
-        // spec v0.7.0 — native IICP binary endpoint
         if let Some(t) = &self.cfg.transport_endpoint {
             payload["transport_endpoint"] = json!(t);
         }
-        // #331 / ADR-041 — NAT-traversal observability (set manually or via
-        // apply_nat_profile after detect_nat)
         if let Some(m) = &self.cfg.transport_method {
             payload["transport_method"] = json!(m);
         }
@@ -756,19 +757,11 @@ impl IicpNode {
         if let Some(md) = &self.cfg.transport_metadata {
             payload["transport_metadata"] = md.clone();
         }
-        // ADR-043 §9 (#344) — 8-category network exposure classification
         if let Some(e) = &self.cfg.exposure_mode {
             payload["exposure_mode"] = json!(e);
         }
-
-        // SDK self-identification — directory surfaces these on /v1/discover
-        // so dashboards can render a language badge. Free-form so future
-        // SDKs in other languages can self-tag without a directory change.
         payload["sdk_language"] = json!("rust");
         payload["sdk_version"] = json!(env!("CARGO_PKG_VERSION"));
-
-        // S.12 §2.1 CIP-D1 policy block. Use the per-config policy if set,
-        // otherwise fall back to the module-level cip_policy::get_cip_policy().
         let policy_arc = self
             .cfg
             .cip_policy
@@ -777,8 +770,6 @@ impl IicpNode {
         if let Some(block) = policy_arc.as_register_policy_block() {
             payload["policy"] = block;
         }
-
-        // ADR-019 — declarative pricing block. Operator opt-in.
         if let Some(pricing) = &self.cfg.pricing {
             let hmac_key = self.runtime_hmac_key.read().expect("poisoned").clone();
             payload["pricing"] = crate::pricing::build_pricing_block(pricing, &hmac_key);
@@ -786,6 +777,11 @@ impl IicpNode {
         if !self.cfg.node_hmac_key.is_empty() {
             payload["node_hmac_key"] = json!(self.cfg.node_hmac_key);
         }
+        payload
+    }
+
+    pub async fn register(&self) -> Result<String> {
+        let payload = self.build_register_payload();
 
         let resp = self
             .http
@@ -1017,7 +1013,15 @@ impl IicpNode {
             let hb_node_id = node_id.clone();
             let hb_tasks_success = Arc::clone(&tasks_success);
             let hb_tasks_failed = Arc::clone(&tasks_failed);
+            // #399 — re-registration recovery: capture the register payload + the
+            // shared runtime token so the loop can re-register and update the token
+            // if the directory drops the node (deregister/TTL-expiry/restart).
+            let hb_register_payload = self.build_register_payload();
+            let hb_token_arc = Arc::clone(&self.runtime_token);
+            let hb_register_url =
+                format!("{}/v1/register", dir.trim_end_matches('/'));
             tokio::spawn(async move {
+                let mut token = token;
                 let mut seq: u64 = 0;
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
@@ -1049,9 +1053,68 @@ impl IicpNode {
                         .send()
                         .await
                     {
-                        Ok(_) => {
+                        Ok(resp) if resp.status().is_success() => {
                             if let Some(ref log) = hb_log {
                                 log.write("heartbeat_ok", &hb_node_id, &format!("seq={seq}"));
+                            }
+                        }
+                        // #399 — directory no longer knows this node (it was
+                        // deregistered on a prior shutdown, TTL-expired after a
+                        // heartbeat gap, or the directory restarted). Re-register
+                        // and resume with the fresh token instead of heartbeating
+                        // into the void forever.
+                        Ok(resp)
+                            if matches!(resp.status().as_u16(), 401 | 404 | 410) =>
+                        {
+                            let code = resp.status().as_u16();
+                            tracing::warn!(
+                                "heartbeat rejected ({code}) — node unknown to directory; re-registering"
+                            );
+                            match http
+                                .post(&hb_register_url)
+                                .json(&hb_register_payload)
+                                .send()
+                                .await
+                            {
+                                Ok(r) if r.status().is_success() => {
+                                    if let Ok(data) = r.json::<serde_json::Value>().await {
+                                        if let Some(t) = data["node_token"]
+                                            .as_str()
+                                            .or_else(|| data["token"].as_str())
+                                        {
+                                            token = t.to_string();
+                                            if let Ok(mut g) = hb_token_arc.write() {
+                                                *g = token.clone();
+                                            }
+                                            if let Some(ref log) = hb_log {
+                                                log.write(
+                                                    "reregister_ok",
+                                                    &hb_node_id,
+                                                    &format!("seq={seq} after_status={code}"),
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                other => {
+                                    tracing::warn!("re-registration failed: {other:?}");
+                                    if let Some(ref log) = hb_log {
+                                        log.write(
+                                            "reregister_fail",
+                                            &hb_node_id,
+                                            &format!("seq={seq} after_status={code}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(resp) => {
+                            if let Some(ref log) = hb_log {
+                                log.write(
+                                    "heartbeat_fail",
+                                    &hb_node_id,
+                                    &format!("seq={seq} status={}", resp.status().as_u16()),
+                                );
                             }
                         }
                         Err(e) => {
