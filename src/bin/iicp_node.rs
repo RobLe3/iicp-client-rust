@@ -102,6 +102,8 @@ struct ServeOpts {
     log_dir: Option<String>,
     /// #405 — take over the per-node_id single-instance lock if another process holds it.
     force: bool,
+    /// #5 — Bearer key for an auth-requiring OpenAI-compat backend (LM Studio, hosted). Empty = none.
+    backend_api_key: String,
 }
 
 fn print_help() {
@@ -131,6 +133,7 @@ fn print_help() {
          \x20 --host HOST                IICP_HOST (default :: — dual-stack IPv4+IPv6)\n\
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
          \x20 --force                    IICP_FORCE — take over the single-instance lock for this node_id\n\
+         \x20 --backend-api-key KEY      IICP_BACKEND_API_KEY — Bearer key for an auth'd backend (LM Studio, hosted)\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\n\
@@ -274,6 +277,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         relay_worker_endpoint: env_or("IICP_RELAY_WORKER_ENDPOINT", None).unwrap_or_default(),
         log_dir: env_or("IICP_LOG_DIR", None),
         force: env_bool("IICP_FORCE"),
+        backend_api_key: env_or("IICP_BACKEND_API_KEY", Some("")).unwrap(),
     };
 
     let mut i = 0;
@@ -302,6 +306,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     "--node" => opts.node = v,
                     "--backend-url" => opts.backend_url = v,
                     "--backend-type" => opts.backend_type = v,
+                    "--backend-api-key" => opts.backend_api_key = v,
                     "--model" => opts.model = v,
                     "--public-endpoint" => opts.public_endpoint = v,
                     "--directory-url" => opts.directory_url = v,
@@ -995,7 +1000,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let openai_opts = OpenAiCompatOptions {
         base_url,
         model: Some(model.clone()),
-        api_key: None,
+        // #5 — backend auth: LM Studio / hosted OpenAI-compat endpoints require a
+        // Bearer key. Empty → no Authorization header (local Ollama/vLLM).
+        api_key: Some(opts.backend_api_key.clone()).filter(|k| !k.is_empty()),
         timeout: Duration::from_secs(60),
     };
 
