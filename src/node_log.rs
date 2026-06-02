@@ -108,7 +108,20 @@ fn epoch_to_datetime(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
         year += 1;
     }
     let leap = is_leap(year);
-    let months = [31u32, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let months = [
+        31u32,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mon = 1u32;
     for &m in &months {
         if rem < m {
@@ -180,7 +193,10 @@ mod tests {
         let padding: Vec<u8> = vec![b'X'; MAX_LOG_BYTES as usize + 1];
         fs::write(dir.join("r.log"), &padding).unwrap();
         let pre_size = fs::metadata(dir.join("r.log")).unwrap().len();
-        assert!(pre_size > MAX_LOG_BYTES, "padding not written correctly: {pre_size}");
+        assert!(
+            pre_size > MAX_LOG_BYTES,
+            "padding not written correctly: {pre_size}"
+        );
         log.write("serve_start", "r", "port=9484");
         // Original file was renamed to .1; new file exists with the event.
         assert!(

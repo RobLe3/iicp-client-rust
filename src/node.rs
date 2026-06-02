@@ -519,7 +519,7 @@ async fn task_endpoint(
                     error: Some(json!({ "message": e.to_string() })),
                 }),
             )
-            .into_response()
+                .into_response()
         }
     }
 }

@@ -409,7 +409,11 @@ async fn probe_backend_models(backend_url: &str) -> Vec<String> {
 
 struct DepIssue {
     name: String,
-    severity: &'static str, // "ok" | "warn" | "missing"
+    // "ok"       — present / compiled in
+    // "optional" — opt-in capability not compiled; node runs fine without it
+    // "warn"     — degraded runtime state (backend unreachable, no IPv6)
+    // "missing"  — required dependency absent
+    severity: &'static str,
     message: String,
 }
 
@@ -460,10 +464,8 @@ async fn check_dependencies(backend_url: &str) -> Vec<DepIssue> {
     #[cfg(not(feature = "nat"))]
     out.push(DepIssue {
         name: "nat".into(),
-        severity: "missing",
-        message:
-            "feature nat not compiled — rebuild with `cargo install iicp-client --features nat`"
-                .into(),
+        severity: "optional",
+        message: "UPnP/IPv6 NAT detection off (optional — set a public endpoint manually, or enable with --features nat)".into(),
     });
 
     #[cfg(feature = "iicp-tcp")]
@@ -475,8 +477,8 @@ async fn check_dependencies(backend_url: &str) -> Vec<DepIssue> {
     #[cfg(not(feature = "iicp-tcp"))]
     out.push(DepIssue {
         name: "iicp-tcp".into(),
-        severity: "warn",
-        message: "feature iicp-tcp not compiled — rebuild with --features iicp-tcp".into(),
+        severity: "optional",
+        message: "native IICP-TCP transport off (optional — HTTP transport active; enable with --features iicp-tcp)".into(),
     });
 
     #[cfg(feature = "metrics")]
@@ -488,8 +490,9 @@ async fn check_dependencies(backend_url: &str) -> Vec<DepIssue> {
     #[cfg(not(feature = "metrics"))]
     out.push(DepIssue {
         name: "metrics".into(),
-        severity: "warn",
-        message: "feature metrics not compiled — rebuild with --features metrics".into(),
+        severity: "optional",
+        message: "Prometheus /metrics endpoint off (optional — enable with --features metrics)"
+            .into(),
     });
 
     // IPv6 routing surface (advisory)
@@ -522,6 +525,7 @@ fn print_dep_status(issues: &[DepIssue]) {
     for i in issues {
         let glyph = match i.severity {
             "ok" => "  ✓",
+            "optional" => "  ○",
             "warn" => "  !",
             "missing" => "  ✗",
             _ => "  ?",
@@ -640,10 +644,15 @@ async fn run_init() -> Result<(), String> {
     println!("Checking dependencies …");
     let issues = check_dependencies(&backend).await;
     print_dep_status(&issues);
-    let missing = issues.iter().any(|i| i.severity == "missing");
-    if missing {
+    let required_missing = issues.iter().any(|i| i.severity == "missing");
+    let optional_off = issues.iter().any(|i| i.severity == "optional");
+    if required_missing {
         println!();
-        println!("  ! some features are not compiled. Rebuild with the right --features set:");
+        println!("  ✗ a required dependency is missing — see above before serving.");
+    } else if optional_off {
+        println!();
+        println!("  ○ optional features above are off — your node runs fine without them.");
+        println!("    To enable all of them, reinstall with:");
         println!("    cargo install iicp-client --features \"nat iicp-tcp metrics\"");
     }
 
