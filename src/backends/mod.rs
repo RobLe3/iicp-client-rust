@@ -8,9 +8,12 @@
 //!   HTTP server.
 //! - [`vllm`] — vLLM OpenAI server (default port 8000).
 //! - [`llamacpp`] — llama.cpp `llama-server` (default port 8080).
+//! - [`anthropic`] — native Anthropic Messages API (`POST /v1/messages`) for
+//!   first-class Claude. Translates the IICP chat task ↔ Messages API so a
+//!   Claude-backed node looks identical to an Ollama/vLLM node to clients.
 //!
 //! Use [`invoke_backend`] to dispatch by engine name (e.g. from a CLI
-//! `--backend-type` flag).
+//! `--backend-type` flag). Valid names are listed in [`BACKEND_TYPES`].
 
 pub mod anthropic;
 pub mod llamacpp;

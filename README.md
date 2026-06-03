@@ -1,6 +1,5 @@
 # iicp-client · Rust SDK
 
-[![CI](https://github.com/RobLe3/iicp-client-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/RobLe3/iicp-client-rust/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Protocol](https://img.shields.io/badge/IICP-v1.7-indigo.svg)](https://iicp.network/spec)
 [![crates.io](https://img.shields.io/badge/crates.io-iicp--client-orange?logo=rust)](https://crates.io/crates/iicp-client)
@@ -11,11 +10,23 @@ Official Rust client library for the [IICP protocol](https://iicp.network) — r
 urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
 ```
 
-## Add to Cargo.toml
+## Install
+
+```bash
+cargo add iicp-client
+```
+
+Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.2"
+iicp-client = "0.7.35"
+```
+
+To run a provider node from the command line, install the `iicp-node` binary:
+
+```bash
+cargo install iicp-client
 ```
 
 Or for the latest unreleased code:
@@ -42,6 +53,9 @@ Consumer and provider can run in the same process. For production provider nodes
 
 ## Quickstart
 
+`chat()` discovers the best node and submits the task internally (SDK-01) — no
+manual node selection needed.
+
 ```rust
 use iicp_client::{ChatMessage, ChatOptions, ClientConfig, IicpClient};
 
@@ -49,11 +63,7 @@ use iicp_client::{ChatMessage, ChatOptions, ClientConfig, IicpClient};
 async fn main() -> iicp_client::Result<()> {
     let client = IicpClient::new(ClientConfig::default())?;
 
-    let nodes = client.discover("urn:iicp:intent:llm:chat:v1", None).await?;
-    let node  = nodes.nodes.into_iter().next().expect("no nodes available");
-
     let reply = client.chat(
-        &node,
         vec![
             ChatMessage { role: "system".into(), content: "You are a helpful assistant.".into() },
             ChatMessage { role: "user".into(),   content: "What is IICP?".into() },
@@ -64,6 +74,14 @@ async fn main() -> iicp_client::Result<()> {
     println!("{}", reply.choices[0].message.content);
     Ok(())
 }
+```
+
+Need the discovered nodes directly? Call `discover` yourself — the third
+argument is an optional W3C `traceparent` for trace propagation:
+
+```rust
+let nodes = client.discover("urn:iicp:intent:llm:chat:v1", None, None).await?;
+let node  = nodes.nodes.into_iter().next().expect("no nodes available");
 ```
 
 ---
@@ -103,6 +121,7 @@ let nodes = client.discover(
         min_reputation: Some(0.7),
         limit         : Some(5),
     }),
+    None, // optional W3C traceparent
 ).await?;
 ```
 
@@ -113,7 +132,7 @@ let nodes = client.discover(
 ```rust
 use iicp_client::IicpError;
 
-match client.submit(&node, request).await {
+match client.submit(request).await {
     Ok(resp) => println!("{:?}", resp),
     Err(IicpError::Protocol { code, message, status }) =>
         eprintln!("[{code}] {message}  (HTTP {status})"),
@@ -143,6 +162,59 @@ let v = iicp_client::backends::invoke_backend("openai_compat", &opts, &req.inten
 // serve() re-wraps in TaskResponse.result — return the inner value to stay single-level.
 Ok(v.get("result").cloned().unwrap_or(v))
 ```
+
+### Backends — pick an inference engine
+
+`iicp-node serve` (and the `backends::invoke_backend` dispatch) supports four
+backend engines, selected with `--backend-type` / `IICP_BACKEND_TYPE`
+(default `openai_compat`):
+
+| `--backend-type` | Speaks | Typical backend |
+|------------------|--------|-----------------|
+| `openai_compat` | OpenAI `/v1/*` | Ollama, LM Studio, any OpenAI-compatible server |
+| `vllm` | OpenAI `/v1/*` | vLLM OpenAI server (default port 8000) |
+| `llamacpp` | OpenAI `/v1/*` | llama.cpp `llama-server` (default port 8080) |
+| `anthropic` | Anthropic Messages API (`POST /v1/messages`) | Anthropic API → first-class Claude |
+
+The `anthropic` backend translates the IICP `llm:chat:v1` task into an Anthropic
+Messages request and translates the reply back to the OpenAI chat-completion
+shape — so a Claude-backed node looks identical to any other node to IICP
+clients. It hoists system-role messages into the top-level `system` param, sends
+`x-api-key` + `anthropic-version` headers, and defaults `max_tokens` (Anthropic
+requires it). With no `--backend-url` override it targets `https://api.anthropic.com/v1`.
+
+```bash
+# Serve Claude as an IICP node
+iicp-node serve \
+  --backend-type anthropic \
+  --model claude-opus-4-8 \
+  --backend-api-key "$ANTHROPIC_API_KEY"
+# or set IICP_BACKEND_TYPE / IICP_BACKEND_API_KEY in the environment
+```
+
+The API key comes from `--backend-api-key` (env `IICP_BACKEND_API_KEY`). For the
+OpenAI-compatible backends this is sent as a Bearer token; for `anthropic` it is
+sent as the `x-api-key` header.
+
+### Input modalities — text, image, audio
+
+A node advertises the input modalities each model accepts under
+`capabilities[].input_modalities`, detected from the model name (conservative
+name-pattern matching, ADR-046 / #408 / #414):
+
+| Model name contains | Advertised modalities |
+|---------------------|-----------------------|
+| `vl` / `vision` / `llava` | `["text", "image"]` |
+| `audio` / `voxtral` | `["text", "audio"]` |
+| `omni` | `["text", "image", "audio"]` |
+| anything else | `["text"]` |
+
+Each modality is a modality of chat, not a separate intent. A single node hosting
+several models advertises one capability object per `(intent, input_modalities)`
+group, so a text model and a vision model on the same node surface as distinct
+capabilities. Image and audio are passed through OpenAI-style content parts
+(`text` and `image_url` blocks); the `anthropic` backend maps `image_url` parts
+(data-URL or remote URL) into native Anthropic image content blocks.
 
 ### Listen port — default 9484, auto-increment (v0.7.5+)
 
@@ -225,8 +297,8 @@ IICP_RELAY_WORKER_ENDPOINT=host:9485    # specific relay instead of auto-elect
 | SDK-02 | `task_id` auto-generated (UUID v4) | ✓ |
 | SDK-03 | Intent URN pattern validation (regex) | ✓ |
 | SDK-04 | `timeout_ms` capped at 120 000 ms | ✓ |
-| SDK-05 | Retry on 429 / 503 | planned |
-| SDK-06 | W3C `traceparent` propagation | planned |
+| SDK-05 | Retry on transient errors (429 / 502 / 503 / 504) | ✓ |
+| SDK-06 | W3C `traceparent` propagation (shared across discover + submit) | ✓ |
 
 Conformance tier: `iicp:sdk:v1` (spec S.14) · [Request a badge](https://iicp.network/conformance)
 
@@ -235,7 +307,7 @@ Conformance tier: `iicp:sdk:v1` (spec S.14) · [Request a badge](https://iicp.ne
 ## Development
 
 ```bash
-cargo test          # 109 tests
+cargo test          # 157 tests
 cargo clippy        # lint
 cargo build --release
 cargo run --example quickstart
