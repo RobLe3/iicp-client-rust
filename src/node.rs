@@ -48,6 +48,55 @@ async fn reregister(http: &Client, url: &str, payload: &serde_json::Value) -> Op
         .map(String::from)
 }
 
+/// #409 — classify a backend model name to the IICP intent it serves.
+/// Embedding models (name contains "embed") advertise the embedding intent;
+/// every other model advertises the node's configured/default intent (chat).
+/// Conservative by design: we only split out embeddings, which is the verified
+/// real case (e.g. an LM Studio backend serving a chat model + `*-embed-*`).
+fn intent_for_model(model: &str, default_intent: &str) -> String {
+    if model.to_lowercase().contains("embed") {
+        "urn:iicp:intent:llm:embedding:v1".to_string()
+    } else {
+        default_intent.to_string()
+    }
+}
+
+/// #409 — group detected backend models into one capability object per intent,
+/// so a single node advertises every intent its backend can serve (chat +
+/// embedding) instead of a hardcoded single intent. The directory already
+/// accepts and stores a multi-element `capabilities` array; serving works
+/// because the client picks the per-intent model from discover and it flows
+/// through the task payload. Back-compatible: a chat-only model set yields the
+/// same single capability as before. Order: first-seen intent first (the
+/// configured model — typically chat — leads).
+fn build_capabilities(models: &[String], default_intent: &str, max_tokens: u32) -> Vec<Value> {
+    if models.is_empty() {
+        return vec![json!({"intent": default_intent, "models": [], "max_tokens": max_tokens})];
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    for m in models {
+        let intent = intent_for_model(m, default_intent);
+        let entry = groups.entry(intent.clone()).or_insert_with(|| {
+            order.push(intent.clone());
+            Vec::new()
+        });
+        if !entry.contains(m) {
+            entry.push(m.clone());
+        }
+    }
+    order
+        .into_iter()
+        .map(|intent| {
+            json!({
+                "intent": intent,
+                "models": groups.remove(&intent).unwrap_or_default(),
+                "max_tokens": max_tokens,
+            })
+        })
+        .collect()
+}
+
 /// Configuration for an IICP provider node.
 #[derive(Debug, Clone)]
 pub struct NodeConfig {
@@ -766,11 +815,10 @@ impl IicpNode {
         let mut payload = json!({
             "endpoint": self.cfg.endpoint,
             "region": region,
-            "capabilities": [{
-                "intent": self.cfg.intent,
-                "models": models,
-                "max_tokens": self.cfg.max_tokens,
-            }],
+            // #409 — advertise one capability object per intent the backend can
+            // serve (e.g. chat + embedding from one Ollama/LM Studio backend),
+            // classified from the detected model set, instead of a single intent.
+            "capabilities": build_capabilities(&models, &self.cfg.intent, self.cfg.max_tokens),
             "limits": {
                 "max_concurrent": self.cfg.max_concurrent,
                 "tokens_per_min": self.cfg.tokens_per_min,
@@ -1279,6 +1327,55 @@ impl IicpNode {
         axum::serve(listener, app)
             .await
             .map_err(|e| IicpError::Node(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::build_capabilities;
+
+    const CHAT: &str = "urn:iicp:intent:llm:chat:v1";
+    const EMBED: &str = "urn:iicp:intent:llm:embedding:v1";
+
+    // #409 — a backend serving a chat model AND an embedding model advertises
+    // BOTH intents (the verified LM Studio case). Fails on the old single-cap code.
+    #[test]
+    fn chat_plus_embedding_models_advertise_two_intents() {
+        let models = vec![
+            "qwen2.5-coder-14b-instruct".to_string(),
+            "text-embedding-nomic-embed-text-v1.5".to_string(),
+        ];
+        let caps = build_capabilities(&models, CHAT, 4096);
+        assert_eq!(caps.len(), 2, "should advertise chat + embedding");
+        // chat first (configured model leads), embedding second
+        assert_eq!(caps[0]["intent"], CHAT);
+        assert_eq!(
+            caps[0]["models"],
+            serde_json::json!(["qwen2.5-coder-14b-instruct"])
+        );
+        assert_eq!(caps[1]["intent"], EMBED);
+        assert_eq!(
+            caps[1]["models"],
+            serde_json::json!(["text-embedding-nomic-embed-text-v1.5"])
+        );
+    }
+
+    // Back-compat: a chat-only model set yields exactly one capability (unchanged wire shape).
+    #[test]
+    fn chat_only_yields_single_capability() {
+        let caps = build_capabilities(&["qwen2.5:0.5b".to_string()], CHAT, 4096);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0]["intent"], CHAT);
+        assert_eq!(caps[0]["models"], serde_json::json!(["qwen2.5:0.5b"]));
+    }
+
+    // No models → single default-intent capability with empty models (unchanged).
+    #[test]
+    fn empty_models_yields_default_intent_capability() {
+        let caps = build_capabilities(&[], CHAT, 1024);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(caps[0]["intent"], CHAT);
+        assert_eq!(caps[0]["models"], serde_json::json!([]));
     }
 }
 
