@@ -170,6 +170,33 @@ pub async fn detect_nat(opts: DetectNatOptions) -> NatProfile {
         return t0;
     }
 
+    // Tier 0 (IPv6, #416) — a stable global IPv6 GUA on a dual-stack host with a
+    // working v6 listener is directly reachable when the v6 firewall is open (the
+    // common residential dual-stack case). Auto-advertise it as a Direct endpoint so
+    // the operator needs no manual IICP_PUBLIC_ENDPOINT. Inbound firewall state cannot
+    // be proven locally; the directory's un-hide model (ADR-047) tolerates a node it
+    // cannot dial-back-probe, and clients fall back if a dial fails.
+    let v6_ready = profile
+        .ipv6
+        .as_ref()
+        .map(|v6| v6.global_v6_available && v6.listener_v6_ok)
+        .unwrap_or(false);
+    if v6_ready {
+        if let Some(gua) = macos_secured_global_v6() {
+            let auto_url = format!("http://[{}]:{}", gua, opts.bind_port);
+            profile.detection_log.push(format!(
+                "tier-0: auto-detected stable global IPv6 GUA → {auto_url:?} \
+                 (direct IPv6; inbound depends on an open v6 firewall)"
+            ));
+            let mut t0 = NatProfile::new(0, TransportMethod::Direct);
+            t0.public_endpoint = Some(auto_url);
+            t0.internal_endpoint = profile.internal_endpoint;
+            t0.detection_log = profile.detection_log;
+            t0.ipv6 = profile.ipv6;
+            return t0;
+        }
+    }
+
     // Tier 1 — UPnP
     let mut ports_to_map: Vec<u16> = vec![opts.bind_port];
     if let Some(tp) = opts.transport_port {
@@ -1042,25 +1069,60 @@ fn local_v6_addresses() -> std::io::Result<Vec<std::net::Ipv6Addr>> {
         }
         return Ok(out);
     }
-    // macOS / BSD: getifaddrs via libc. To stay dep-light, fall back to
-    // resolving the host's own hostname and pick v6 entries.
-    use std::net::ToSocketAddrs;
-    let host = match std::env::var("HOSTNAME") {
-        Ok(h) if !h.is_empty() => h,
-        _ => match hostname_via_uname() {
-            Some(h) => h,
-            None => return Ok(Vec::new()),
-        },
-    };
-    let mut out = Vec::new();
-    if let Ok(iter) = format!("{host}:0").to_socket_addrs() {
-        for sa in iter {
-            if let std::net::SocketAddr::V6(a) = sa {
-                out.push(*a.ip());
+    // macOS / BSD: parse `ifconfig -a` for inet6 addresses (a getifaddrs-equivalent,
+    // dep-free). #416 — the prior fallback resolved the host's own hostname, but a
+    // Mac's hostname does NOT resolve to its global IPv6 GUA (no AAAA record), so it
+    // returned empty and the node wrongly concluded it had no IPv6 (→ tier-4 → refused
+    // to register) despite a perfectly reachable en0 GUA.
+    if let Ok(output) = std::process::Command::new("/sbin/ifconfig")
+        .arg("-a")
+        .output()
+    {
+        let text = String::from_utf8_lossy(&output.stdout);
+        let mut out = Vec::new();
+        for line in text.lines() {
+            if let Some(rest) = line.trim().strip_prefix("inet6 ") {
+                let tok = rest.split_whitespace().next().unwrap_or("");
+                let tok = tok.split('%').next().unwrap_or(tok); // strip %scope zone id
+                if let Ok(a) = tok.parse::<std::net::Ipv6Addr>() {
+                    out.push(a);
+                }
+            }
+        }
+        return Ok(out);
+    }
+    Ok(Vec::new())
+}
+
+/// #416 — macOS stable global IPv6 GUA: the `secured` autoconf address (RFC 7217),
+/// identified by ifconfig's `secured` flag (NOT the `ff:fe`/EUI-64 heuristic, which
+/// misclassifies RFC-7217 secured addresses as privacy). Preferred over the rotating
+/// `temporary` privacy address for advertising a stable public endpoint. Returns the
+/// first secured GUA, or None on non-macOS / when absent.
+fn macos_secured_global_v6() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let out = std::process::Command::new("/sbin/ifconfig")
+        .arg("-a")
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    for line in text.lines() {
+        let l = line.trim();
+        if let Some(rest) = l.strip_prefix("inet6 ") {
+            if l.contains("secured") && !l.contains("temporary") {
+                let tok = rest.split_whitespace().next().unwrap_or("");
+                let tok = tok.split('%').next().unwrap_or(tok);
+                if let Ok(a) = tok.parse::<std::net::Ipv6Addr>() {
+                    if (a.segments()[0] & 0xe000) == 0x2000 {
+                        return Some(a.to_string());
+                    }
+                }
             }
         }
     }
-    Ok(out)
+    None
 }
 
 fn parse_ifaddr_hex(hex: &str) -> Result<std::net::Ipv6Addr, std::num::ParseIntError> {
@@ -1072,20 +1134,6 @@ fn parse_ifaddr_hex(hex: &str) -> Result<std::net::Ipv6Addr, std::num::ParseIntE
     Ok(std::net::Ipv6Addr::new(
         segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7],
     ))
-}
-
-fn hostname_via_uname() -> Option<String> {
-    // POSIX: gethostname via libc. Avoid a libc dep — use the `whoami`-style
-    // approach via std env. macOS sets `HOSTNAME` only sporadically; fall
-    // back to the OS-level via `uname -n` shell-out (rare path, best-effort).
-    use std::process::Command;
-    let out = Command::new("uname").arg("-n").output().ok()?;
-    let s = String::from_utf8(out.stdout).ok()?.trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
 }
 
 fn is_privacy_v6(addr: &str) -> bool {

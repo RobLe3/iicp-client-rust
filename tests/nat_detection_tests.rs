@@ -112,15 +112,24 @@ async fn test_detect_nat_tier_0_falls_through_when_non_routable() {
         operator_public_endpoint: Some("http://localhost:8080".into()),
         timeout: Duration::from_millis(50), // UPnP discovery times out fast
         transport_port: None,
+        detect_v6: false, // isolate the v4/operator-endpoint path from the #416 IPv6 elect
         ..DetectNatOptions::default()
     };
     let p = detect_nat(opts).await;
-    assert_eq!(p.tier, 4);
-    assert_eq!(p.transport_method, TransportMethod::Unreachable);
+    // Invariant under test: the non-routable operator endpoint is NOT used — it
+    // falls through. The FINAL tier is host-dependent (#416: a host with a stable
+    // global IPv6 GUA + open v6 listener now reaches tier-0 Direct via IPv6
+    // auto-elect; a host with none lands on tier-4), so assert the fall-through
+    // invariant rather than a host-specific tier.
     assert!(p
         .detection_log
         .iter()
         .any(|line| line.contains("non-routable")));
+    assert_ne!(
+        p.public_endpoint.as_deref(),
+        Some("http://localhost:8080"),
+        "non-routable operator endpoint must never be advertised"
+    );
 }
 
 #[tokio::test]
@@ -130,6 +139,7 @@ async fn test_detect_nat_no_operator_endpoint_runs_tier_1() {
         bind_port: 8080,
         timeout: Duration::from_millis(50),
         transport_port: None,
+        detect_v6: false, // isolate the v4/UPnP path from the #416 IPv6 elect
         ..DetectNatOptions::default()
     };
     let p = detect_nat(opts).await;
