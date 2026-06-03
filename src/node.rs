@@ -136,6 +136,9 @@ pub struct NodeConfig {
     pub endpoint: String,
     pub intent: String,
     pub model: Option<String>,
+    /// Detected backend server flavor advertised at register (node-detail field):
+    /// `ollama` / `lmstudio` / `vllm` / `llamacpp` / `anthropic` / `custom`.
+    pub backend: Option<String>,
     pub region: Option<String>,
     pub capabilities: Vec<String>,
     pub directory_url: String,
@@ -215,6 +218,7 @@ impl NodeConfig {
             endpoint: endpoint.into(),
             intent: intent.into(),
             model: None,
+            backend: None,
             region: None,
             capabilities: vec![],
             directory_url: DEFAULT_DIRECTORY.into(),
@@ -880,6 +884,9 @@ impl IicpNode {
         }
         payload["sdk_language"] = json!("rust");
         payload["sdk_version"] = json!(env!("CARGO_PKG_VERSION"));
+        if let Some(b) = &self.cfg.backend {
+            payload["backend"] = json!(b);
+        }
         let policy_arc = self
             .cfg
             .cip_policy

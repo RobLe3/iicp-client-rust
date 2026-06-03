@@ -436,6 +436,79 @@ async fn probe_backend_models(backend_url: &str, api_key: &str) -> Vec<String> {
     vec![]
 }
 
+/// Detect the backend server flavor for the `backend` node-detail field:
+/// `ollama` / `lmstudio` / `vllm` / `llamacpp` / `anthropic` / `custom`. For the
+/// non-OpenAI dialects the configured `backend_type` is authoritative; for
+/// `openai_compat` it probes distinguishing endpoints/headers (best-effort —
+/// Ollama's proprietary `/api/version`, then `/v1/models` Server / X-Powered-By),
+/// defaulting to `custom` for an unrecognised OpenAI-compatible server.
+async fn detect_backend_flavor(backend_url: &str, api_key: &str, backend_type: &str) -> String {
+    match backend_type {
+        "anthropic" => return "anthropic".into(),
+        "vllm" => return "vllm".into(),
+        "llamacpp" => return "llamacpp".into(),
+        _ => {}
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return "custom".into(),
+    };
+    let auth = |req: reqwest::RequestBuilder| {
+        if api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(api_key)
+        }
+    };
+    let base = backend_url.trim_end_matches('/');
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    // Fingerprint by /v1/models response headers FIRST. Order matters: LM Studio
+    // also implements Ollama-compatible /api/version + /api/tags, so /api/version
+    // is NOT an Ollama discriminator — but LM Studio always stamps
+    // `X-Powered-By: Express`, which Ollama never sets.
+    if let Ok(r) = auth(client.get(format!("{root}/v1/models"))).send().await {
+        if r.status().is_success() {
+            let h = r.headers();
+            let server = h
+                .get("server")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            let powered = h
+                .get("x-powered-by")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            if powered.contains("express") {
+                return "lmstudio".into(); // LM Studio serves via Express
+            }
+            if server.contains("vllm") || server.contains("uvicorn") {
+                return "vllm".into(); // vLLM runs on uvicorn
+            }
+            if server.contains("llama.cpp") || server.contains("llama-server") {
+                return "llamacpp".into();
+            }
+            // No Express / uvicorn / llama header → real Ollama exposes /api/version.
+            if let Ok(rv) = auth(client.get(format!("{root}/api/version"))).send().await {
+                if rv.status().is_success() {
+                    return "ollama".into();
+                }
+            }
+            return "custom".into();
+        }
+    }
+    // No /v1/models (older Ollama) — fall back to the proprietary endpoint.
+    if let Ok(rv) = auth(client.get(format!("{root}/api/version"))).send().await {
+        if rv.status().is_success() {
+            return "ollama".into();
+        }
+    }
+    "custom".into()
+}
+
 // ── #346 — dependency checker (no auto-install on Rust — cargo would need a rebuild) ─
 
 struct DepIssue {
@@ -835,6 +908,12 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
     cfg.model = Some(opts.model.clone());
+    // Detect the backend server flavor (ollama/lmstudio/vllm/llamacpp/anthropic/custom)
+    // so it surfaces in the directory node detail.
+    let backend_flavor =
+        detect_backend_flavor(&opts.backend_url, &opts.backend_api_key, &opts.backend_type).await;
+    eprintln!("[iicp-node] backend detected: {backend_flavor}");
+    cfg.backend = Some(backend_flavor);
     cfg.region = Some(opts.region.clone());
     cfg.directory_url = opts.directory_url.clone();
     cfg.max_concurrent = opts.max_concurrent;
