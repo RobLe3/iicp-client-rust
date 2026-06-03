@@ -303,6 +303,59 @@ async fn test_node_heartbeat_ok() {
         .expect("heartbeat should succeed against local server");
 }
 
+/// ADR-047 Part A (#411) — the node answers the directory's liveness challenge:
+/// beat 1 captures the nonce, beat 2 returns HMAC-SHA256(node_hmac_key, nonce).
+#[tokio::test]
+async fn test_heartbeat_answers_liveness_challenge() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+
+    tokio::spawn(async move {
+        let mk_resp = |body: &str| {
+            format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+        };
+        // Beat 1 — issue a nonce.
+        let (mut s1, _) = listener.accept().await.unwrap();
+        let mut b1 = [0u8; 4096];
+        let _ = s1.read(&mut b1).await;
+        let _ = s1
+            .write_all(mk_resp("{\"ok\":true,\"challenge\":\"nonce-abc\"}").as_bytes())
+            .await;
+        // Beat 2 — capture the request so the test can assert challenge_response.
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let mut b2 = vec![0u8; 8192];
+        let n = s2.read(&mut b2).await.unwrap();
+        let _ = s2.write_all(mk_resp("{\"ok\":true}").as_bytes()).await;
+        let _ = tx.send(String::from_utf8_lossy(&b2[..n]).to_string());
+    });
+
+    let mut cfg = NodeConfig::new(
+        "n-1",
+        "https://h.example.com",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = format!("http://{addr}");
+    cfg.node_hmac_key = "secret-key".to_string();
+    let node = IicpNode::new(cfg);
+    node.heartbeat("tok").await.unwrap(); // beat 1 → captures nonce
+    node.heartbeat("tok").await.unwrap(); // beat 2 → answers
+
+    let req2 = rx.await.unwrap();
+    let expected = iicp_client::pricing::sign_body(b"nonce-abc", "secret-key");
+    assert!(
+        req2.contains(&format!("\"challenge_response\":\"{expected}\"")),
+        "beat 2 must carry challenge_response=HMAC(key,nonce); got: {req2}"
+    );
+}
+
 /// iter-1413: register payload matches spec/iicp-dir.md §3.1 —
 /// capabilities is an array of {intent, models, max_tokens} objects, not a flat intent string.
 #[tokio::test]

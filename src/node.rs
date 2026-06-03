@@ -650,6 +650,9 @@ pub struct IicpNode {
     pinhole_uid: std::sync::RwLock<Option<u32>>,
     #[allow(dead_code)]
     pinhole_lease_seconds: std::sync::RwLock<u32>,
+    /// ADR-047 Part A (#411) — latest liveness nonce from the heartbeat response,
+    /// answered (HMAC) on the next beat. None until the first response.
+    liveness_challenge: std::sync::RwLock<Option<String>>,
 }
 
 impl IicpNode {
@@ -667,6 +670,7 @@ impl IicpNode {
             runtime_token: Arc::new(std::sync::RwLock::new(String::new())),
             pinhole_uid: std::sync::RwLock::new(None),
             pinhole_lease_seconds: std::sync::RwLock::new(3600),
+            liveness_challenge: std::sync::RwLock::new(None),
         }
     }
 
@@ -930,6 +934,28 @@ impl IicpNode {
 
     /// Send a single heartbeat to the directory.
     pub async fn heartbeat(&self, node_token: &str) -> Result<()> {
+        let mut body = json!({
+            "node_id": self.cfg.node_id,
+            "node_token": node_token,
+            "status": "available",
+            // Live capacity after availability shaping (ADR-006).
+            "max_concurrent": crate::availability::AvailabilityEvaluator::new(
+                self.cfg.availability_windows.clone(),
+            )
+            .effective_max_concurrent(self.cfg.max_concurrent),
+        });
+        // ADR-047 Part A (#411) — answer the directory's liveness challenge from the
+        // previous beat: HMAC the nonce with node_hmac_key (proves key control with
+        // no dial-back; works for CGNAT/IPv6). No-op until both nonce + key exist.
+        let hmac_key = self.node_hmac_key();
+        let stored = self.liveness_challenge.read().expect("poisoned").clone();
+        if let Some(ch) = &stored {
+            if !hmac_key.is_empty() {
+                body["challenge_response"] =
+                    json!(crate::pricing::sign_body(ch.as_bytes(), &hmac_key));
+            }
+        }
+
         let resp = self
             .http
             // /v1/heartbeat — default directory_url already ends in /api;
@@ -942,16 +968,7 @@ impl IicpNode {
             // NodeTokenAuth middleware requires Bearer auth; the body
             // token is retained for back-compat with older directory builds.
             .bearer_auth(node_token)
-            .json(&json!({
-                "node_id": self.cfg.node_id,
-                "node_token": node_token,
-                "status": "available",
-                // Live capacity after availability shaping (ADR-006).
-                "max_concurrent": crate::availability::AvailabilityEvaluator::new(
-                    self.cfg.availability_windows.clone(),
-                )
-                .effective_max_concurrent(self.cfg.max_concurrent),
-            }))
+            .json(&body)
             .send()
             .await
             .map_err(|e| IicpError::Node(e.to_string()))?;
@@ -961,6 +978,12 @@ impl IicpNode {
                 "heartbeat failed: {}",
                 resp.status()
             )));
+        }
+        // Capture the fresh nonce to answer on the next beat (ADR-047 Part A).
+        if let Ok(data) = resp.json::<Value>().await {
+            if let Some(ch) = data["challenge"].as_str() {
+                *self.liveness_challenge.write().expect("poisoned") = Some(ch.to_string());
+            }
         }
         Ok(())
     }
