@@ -54,12 +54,16 @@ impl Default for OpenAiCompatOptions {
     }
 }
 
+/// #414 — speech-to-text. Multipart file upload (distinct path below), not JSON.
+const AUDIO_TRANSCRIBE_INTENT: &str = "urn:iicp:intent:audio:transcribe:v1";
+
 /// Map IICP intent URN → OpenAI-compatible HTTP path.
 fn intent_to_path(intent: &str) -> Option<&'static str> {
     match intent {
         "urn:iicp:intent:llm:chat:v1" => Some("/chat/completions"),
         "urn:iicp:intent:llm:completion:v1" => Some("/completions"),
         "urn:iicp:intent:llm:embedding:v1" => Some("/embeddings"),
+        AUDIO_TRANSCRIBE_INTENT => Some("/audio/transcriptions"),
         _ => None,
     }
 }
@@ -69,6 +73,7 @@ pub const SUPPORTED_INTENTS: &[&str] = &[
     "urn:iicp:intent:llm:chat:v1",
     "urn:iicp:intent:llm:completion:v1",
     "urn:iicp:intent:llm:embedding:v1",
+    AUDIO_TRANSCRIBE_INTENT,
 ];
 
 /// Build a task handler closure that proxies CALLs to an OpenAI-compatible
@@ -164,6 +169,11 @@ async fn handle_task_inner(engine: &'static str, opts: OpenAiCompatOptions, task
         }
     };
 
+    // #414 — audio:transcribe is a multipart file upload, not a JSON body.
+    if intent == AUDIO_TRANSCRIBE_INTENT {
+        return handle_transcription(engine, &opts, path, &payload).await;
+    }
+
     let mut body = match payload {
         Value::Object(o) => o,
         Value::Null => serde_json::Map::new(),
@@ -248,6 +258,144 @@ async fn handle_task_inner(engine: &'static str, opts: OpenAiCompatOptions, task
             "error_code": 502,
             "error_message": format!("{engine}: upstream returned non-JSON: {e}"),
         }),
+    }
+}
+
+/// #414 — audio:transcribe multipart upload. The body is hand-built so we don't
+/// enable reqwest's `multipart` feature (which surfaces new transitive deps → the
+/// TC-11 third-party gate). Audio rides as base64 in `payload.audio`; `model` is
+/// OPTIONAL (whisper.cpp ignores it, vLLM/OpenAI use it).
+async fn handle_transcription(
+    engine: &'static str,
+    opts: &OpenAiCompatOptions,
+    path: &str,
+    payload: &Value,
+) -> Value {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let obj = match payload {
+        Value::Object(o) => o,
+        _ => {
+            return json!({
+                "error_code": 400,
+                "error_message": format!("{engine}: audio:transcribe payload must be a JSON object"),
+            });
+        }
+    };
+    let audio_b64 = obj
+        .get("audio")
+        .or_else(|| obj.get("audio_b64"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if audio_b64.is_empty() {
+        return json!({
+            "error_code": 400,
+            "error_message": format!(
+                "{engine}: audio:transcribe requires payload.audio (base64-encoded audio bytes)"
+            ),
+        });
+    }
+    let audio_bytes = match STANDARD.decode(audio_b64) {
+        Ok(b) => b,
+        Err(e) => {
+            return json!({
+                "error_code": 400,
+                "error_message": format!("{engine}: payload.audio is not valid base64: {e}"),
+            });
+        }
+    };
+    let filename = obj
+        .get("filename")
+        .and_then(Value::as_str)
+        .unwrap_or("audio.wav");
+
+    // Build the form fields (model optional, response_format defaults to json).
+    let mut fields: Vec<(String, String)> = Vec::new();
+    let model = obj
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| opts.model.clone());
+    if let Some(m) = model {
+        fields.push(("model".to_string(), m));
+    }
+    let mut have_rf = false;
+    for k in ["language", "response_format", "prompt", "temperature"] {
+        if let Some(v) = obj.get(k) {
+            if k == "response_format" {
+                have_rf = true;
+            }
+            let s = match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+            fields.push((k.to_string(), s));
+        }
+    }
+    if !have_rf {
+        fields.push(("response_format".to_string(), "json".to_string()));
+    }
+
+    // Hand-build multipart/form-data.
+    let boundary = format!("----iicp{}", uuid::Uuid::new_v4().simple());
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    buf.extend_from_slice(&audio_bytes);
+    buf.extend_from_slice(b"\r\n");
+    for (k, v) in &fields {
+        buf.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n")
+                .as_bytes(),
+        );
+    }
+    buf.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+    let base = opts.base_url.trim_end_matches('/');
+    let url = format!("{base}{path}");
+    let client = match reqwest::Client::builder().timeout(opts.timeout).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({"error_code": 500, "error_message": format!("{engine}: client build failed: {e}")});
+        }
+    };
+    let mut req = client
+        .post(&url)
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={boundary}"),
+        )
+        .body(buf);
+    if let Some(key) = &opts.api_key {
+        if !key.is_empty() {
+            req = req.bearer_auth(key);
+        }
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            return json!({"error_code": 408, "error_message": format!("{engine}: backend timed out")});
+        }
+        Err(e) => {
+            return json!({"error_code": 502, "error_message": format!("{engine}: HTTP transport error: {e}")});
+        }
+    };
+    let status = resp.status().as_u16();
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let truncated: String = text.chars().take(512).collect();
+        return json!({"error_code": status, "error_message": format!("{engine}: upstream {status}: {truncated}")});
+    }
+    // Prefer JSON; fall back to {"text": <body>} for response_format=text.
+    let text = resp.text().await.unwrap_or_default();
+    match serde_json::from_str::<Value>(&text) {
+        Ok(data) => json!({ "result": data }),
+        Err(_) => json!({ "result": { "text": text } }),
     }
 }
 

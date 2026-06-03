@@ -330,3 +330,100 @@ async fn test_invoke_backend_dispatches_and_rejects_unknown() {
     assert!(bad.is_err());
     assert!(bad.unwrap_err().contains("unknown backend_type"));
 }
+
+// ── #414 audio:transcribe (STT) — multipart file upload ──────────────────────
+
+#[tokio::test]
+async fn test_audio_transcribe_posts_multipart_and_returns_text() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/audio/transcriptions")
+        .match_header(
+            "content-type",
+            mockito::Matcher::Regex("multipart/form-data".into()),
+        )
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"text":"hello world"}"#)
+        .create_async()
+        .await;
+
+    let payload = json!({
+        "audio": STANDARD.encode(b"RIFF....fake-wav-bytes"),
+        "filename": "clip.wav",
+        "language": "en",
+    });
+    let result = invoke(
+        &opts(server.url(), Some("whisper-1")),
+        "urn:iicp:intent:audio:transcribe:v1",
+        &payload,
+    )
+    .await;
+    assert!(
+        result.get("error_code").is_none(),
+        "unexpected error: {result}"
+    );
+    assert_eq!(
+        result["result"]["text"].as_str().unwrap_or(""),
+        "hello world"
+    );
+}
+
+#[tokio::test]
+async fn test_audio_transcribe_rejects_invalid_base64() {
+    let result = invoke(
+        &opts("http://127.0.0.1:1".into(), Some("whisper-1")),
+        "urn:iicp:intent:audio:transcribe:v1",
+        &json!({"audio": "!!not-base64!!"}),
+    )
+    .await;
+    assert_eq!(result["error_code"].as_u64(), Some(400));
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("base64"));
+}
+
+#[tokio::test]
+async fn test_audio_transcribe_requires_audio_field() {
+    let result = invoke(
+        &opts("http://127.0.0.1:1".into(), Some("whisper-1")),
+        "urn:iicp:intent:audio:transcribe:v1",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(result["error_code"].as_u64(), Some(400));
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("audio"));
+}
+
+/// Live end-to-end ratification (#414, #408 discipline). Requires a running
+/// whisper.cpp `whisper-server` on :8090 serving /v1/audio/transcriptions:
+///   whisper-server -m ggml-tiny.en.bin --port 8090 \
+///     --inference-path /v1/audio/transcriptions
+/// Run with: cargo test --test backends_tests -- --ignored audio_transcribe_live
+#[tokio::test]
+#[ignore]
+async fn test_audio_transcribe_live_whisper_server() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let wav = std::fs::read("/opt/homebrew/Cellar/whisper-cpp/1.8.6/share/whisper-cpp/jfk.wav")
+        .expect("jfk.wav sample");
+    let payload = json!({"audio": STANDARD.encode(&wav), "filename": "jfk.wav"});
+    let result = invoke(
+        &opts("http://127.0.0.1:8090/v1".into(), None),
+        "urn:iicp:intent:audio:transcribe:v1",
+        &payload,
+    )
+    .await;
+    let text = result["result"]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_lowercase();
+    assert!(
+        text.contains("country"),
+        "expected transcription, got {result}"
+    );
+}
