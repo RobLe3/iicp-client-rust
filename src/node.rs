@@ -955,6 +955,12 @@ impl IicpNode {
             "node_id": self.cfg.node_id,
             "node_token": node_token,
             "status": "available",
+            // Explicit availability boolean. The directory keys discover eligibility
+            // off `available` (not the `status` string); sending it lets a node that
+            // briefly went dormant (host sleep) be restored on the very next beat —
+            // robust even against directory builds older than v1.10.17 whose heartbeat
+            // handler defaulted to the stored (possibly false) value.
+            "available": true,
             // Live capacity after availability shaping (ADR-006).
             "max_concurrent": crate::availability::AvailabilityEvaluator::new(
                 self.cfg.availability_windows.clone(),
@@ -1189,6 +1195,10 @@ impl IicpNode {
                             "node_id": &node_id,
                             "node_token": &token,
                             "status": "available",
+                            // Explicit availability boolean — see heartbeat() above.
+                            // Lets the directory restore a briefly-dormant node on the
+                            // next beat, even on directory builds older than v1.10.17.
+                            "available": true,
                             // Live capacity after availability shaping (ADR-006).
                             "max_concurrent": avail.effective_max_concurrent(max_c),
                             // Task outcome metrics — only sent when non-zero to

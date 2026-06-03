@@ -356,6 +356,48 @@ async fn test_heartbeat_answers_liveness_challenge() {
     );
 }
 
+/// The heartbeat body MUST carry an explicit `available: true` boolean (not only the
+/// `status: "available"` string). The directory keys discover eligibility off the
+/// `available` field, so sending it restores a briefly-dormant node on the next beat —
+/// robust even against directory builds older than v1.10.17.
+#[tokio::test]
+async fn test_heartbeat_payload_includes_available_true() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut b = vec![0u8; 8192];
+        let n = s.read(&mut b).await.unwrap();
+        let resp = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}";
+        let _ = s.write_all(resp.as_bytes()).await;
+        let _ = tx.send(String::from_utf8_lossy(&b[..n]).to_string());
+    });
+
+    let mut cfg = NodeConfig::new(
+        "n-1",
+        "https://h.example.com",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = format!("http://{addr}");
+    let node = IicpNode::new(cfg);
+    node.heartbeat("tok").await.unwrap();
+
+    let req = rx.await.unwrap();
+    assert!(
+        req.contains("\"available\":true"),
+        "heartbeat must carry available:true; got: {req}"
+    );
+    assert!(
+        req.contains("\"status\":\"available\""),
+        "heartbeat must keep status:available; got: {req}"
+    );
+}
+
 /// iter-1413: register payload matches spec/iicp-dir.md §3.1 —
 /// capabilities is an array of {intent, models, max_tokens} objects, not a flat intent string.
 #[tokio::test]
