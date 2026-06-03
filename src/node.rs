@@ -61,37 +61,59 @@ fn intent_for_model(model: &str, default_intent: &str) -> String {
     }
 }
 
-/// #409 — group detected backend models into one capability object per intent,
-/// so a single node advertises every intent its backend can serve (chat +
-/// embedding) instead of a hardcoded single intent. The directory already
-/// accepts and stores a multi-element `capabilities` array; serving works
-/// because the client picks the per-intent model from discover and it flows
-/// through the task payload. Back-compatible: a chat-only model set yields the
-/// same single capability as before. Order: first-seen intent first (the
-/// configured model — typically chat — leads).
+/// #408 / ADR-046 — input modalities a backend model accepts. Vision-language
+/// models (name contains `vl`/`vision`/`llava`) accept images; everything else
+/// is text-only. Conservative name-pattern detection — the verified real case
+/// (e.g. LM Studio `qwen/qwen3-vl-8b`). Vision is a modality of chat, not a
+/// separate intent (ADR-046).
+fn modalities_for_model(model: &str) -> Vec<&'static str> {
+    let m = model.to_lowercase();
+    if m.contains("-vl-") || m.ends_with("-vl") || m.contains("vision") || m.contains("llava") {
+        vec!["text", "image"]
+    } else {
+        vec!["text"]
+    }
+}
+
+/// #409 + #408 — group detected backend models into one capability object per
+/// (intent, input_modalities), so a single node advertises every intent its
+/// backend can serve (chat + embedding) AND distinguishes text-only vs
+/// image-capable (vision) chat. The directory accepts a multi-element
+/// `capabilities` array; clients pick the per-(intent,modality) model from
+/// discover. Back-compatible: a single text chat model yields the same single
+/// `["text"]` capability as before. Order: first-seen group leads (configured
+/// model — typically chat/text — first).
 fn build_capabilities(models: &[String], default_intent: &str, max_tokens: u32) -> Vec<Value> {
     if models.is_empty() {
-        return vec![json!({"intent": default_intent, "models": [], "max_tokens": max_tokens})];
+        return vec![json!({
+            "intent": default_intent, "models": [], "max_tokens": max_tokens,
+            "input_modalities": ["text"],
+        })];
     }
+    // Group key = "intent\0modalities" to keep (intent, modality) groups distinct + ordered.
     let mut order: Vec<String> = Vec::new();
-    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+    let mut groups: HashMap<String, (String, Vec<&'static str>, Vec<String>)> = HashMap::new();
     for m in models {
         let intent = intent_for_model(m, default_intent);
-        let entry = groups.entry(intent.clone()).or_insert_with(|| {
-            order.push(intent.clone());
-            Vec::new()
+        let modalities = modalities_for_model(m);
+        let key = format!("{intent}\u{0}{}", modalities.join(","));
+        let entry = groups.entry(key.clone()).or_insert_with(|| {
+            order.push(key.clone());
+            (intent.clone(), modalities.clone(), Vec::new())
         });
-        if !entry.contains(m) {
-            entry.push(m.clone());
+        if !entry.2.contains(m) {
+            entry.2.push(m.clone());
         }
     }
     order
         .into_iter()
-        .map(|intent| {
+        .map(|key| {
+            let (intent, modalities, models) = groups.remove(&key).expect("key from order");
             json!({
                 "intent": intent,
-                "models": groups.remove(&intent).unwrap_or_default(),
+                "models": models,
                 "max_tokens": max_tokens,
+                "input_modalities": modalities,
             })
         })
         .collect()
@@ -1360,13 +1382,39 @@ mod capability_tests {
         );
     }
 
-    // Back-compat: a chat-only model set yields exactly one capability (unchanged wire shape).
+    // Back-compat: a chat-only model set yields exactly one text capability.
     #[test]
     fn chat_only_yields_single_capability() {
         let caps = build_capabilities(&["qwen2.5:0.5b".to_string()], CHAT, 4096);
         assert_eq!(caps.len(), 1);
         assert_eq!(caps[0]["intent"], CHAT);
         assert_eq!(caps[0]["models"], serde_json::json!(["qwen2.5:0.5b"]));
+        assert_eq!(caps[0]["input_modalities"], serde_json::json!(["text"]));
+    }
+
+    // #408/ADR-046 — a vision model advertises a chat capability with image input,
+    // SEPARATE from the text-only chat capability. Fails without modality grouping.
+    #[test]
+    fn vision_model_advertises_image_modality_chat_capability() {
+        let models = vec![
+            "qwen2.5-coder-14b".to_string(),
+            "qwen/qwen3-vl-8b".to_string(),
+        ];
+        let caps = build_capabilities(&models, CHAT, 4096);
+        assert_eq!(
+            caps.len(),
+            2,
+            "text-chat and vision-chat are distinct capabilities"
+        );
+        assert_eq!(caps[0]["intent"], CHAT);
+        assert_eq!(caps[0]["input_modalities"], serde_json::json!(["text"]));
+        assert_eq!(caps[0]["models"], serde_json::json!(["qwen2.5-coder-14b"]));
+        assert_eq!(caps[1]["intent"], CHAT);
+        assert_eq!(
+            caps[1]["input_modalities"],
+            serde_json::json!(["text", "image"])
+        );
+        assert_eq!(caps[1]["models"], serde_json::json!(["qwen/qwen3-vl-8b"]));
     }
 
     // No models → single default-intent capability with empty models (unchanged).
