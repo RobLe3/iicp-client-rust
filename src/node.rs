@@ -61,18 +61,28 @@ fn intent_for_model(model: &str, default_intent: &str) -> String {
     }
 }
 
-/// #408 / ADR-046 — input modalities a backend model accepts. Vision-language
-/// models (name contains `vl`/`vision`/`llava`) accept images; everything else
-/// is text-only. Conservative name-pattern detection — the verified real case
-/// (e.g. LM Studio `qwen/qwen3-vl-8b`). Vision is a modality of chat, not a
-/// separate intent (ADR-046).
+/// #408 / ADR-046 (B1/#414 — audio-in added) — input modalities a backend model
+/// accepts. Vision-language models (name contains `vl`/`vision`/`llava`) accept
+/// images; `omni` models accept image and audio; audio models (`audio`/`voxtral`)
+/// accept audio; everything else is text-only. Conservative name-pattern detection.
+/// Each is a modality of chat, not a separate intent (ADR-046). The directory + spec
+/// accept text/image/audio/video in `input_modalities` (v0.10.0).
 fn modalities_for_model(model: &str) -> Vec<&'static str> {
     let m = model.to_lowercase();
-    if m.contains("-vl-") || m.ends_with("-vl") || m.contains("vision") || m.contains("llava") {
-        vec!["text", "image"]
-    } else {
-        vec!["text"]
+    let has_image = m.contains("-vl-")
+        || m.ends_with("-vl")
+        || m.contains("vision")
+        || m.contains("llava")
+        || m.contains("omni");
+    let has_audio = m.contains("audio") || m.contains("voxtral") || m.contains("omni");
+    let mut mods = vec!["text"];
+    if has_image {
+        mods.push("image");
     }
+    if has_audio {
+        mods.push("audio");
+    }
+    mods
 }
 
 /// #409 + #408 — group detected backend models into one capability object per
@@ -1438,6 +1448,33 @@ mod capability_tests {
             serde_json::json!(["text", "image"])
         );
         assert_eq!(caps[1]["models"], serde_json::json!(["qwen/qwen3-vl-8b"]));
+    }
+
+    // B1/#414 — an audio-in chat model advertises a chat capability with audio input,
+    // SEPARATE from the text-only chat capability. Mirrors the vision (image) case.
+    #[test]
+    fn audio_model_advertises_audio_modality_chat_capability() {
+        let models = vec!["qwen2.5:0.5b".to_string(), "qwen2-audio-7b".to_string()];
+        let caps = build_capabilities(&models, CHAT, 4096);
+        assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0]["input_modalities"], serde_json::json!(["text"]));
+        assert_eq!(caps[1]["intent"], CHAT);
+        assert_eq!(
+            caps[1]["input_modalities"],
+            serde_json::json!(["text", "audio"])
+        );
+        assert_eq!(caps[1]["models"], serde_json::json!(["qwen2-audio-7b"]));
+    }
+
+    // B1 — an "omni" model accepts both image and audio in chat.
+    #[test]
+    fn omni_model_advertises_image_and_audio_modalities() {
+        let caps = build_capabilities(&["qwen2.5-omni-7b".to_string()], CHAT, 4096);
+        assert_eq!(caps.len(), 1);
+        assert_eq!(
+            caps[0]["input_modalities"],
+            serde_json::json!(["text", "image", "audio"])
+        );
     }
 
     // No models → single default-intent capability with empty models (unchanged).
