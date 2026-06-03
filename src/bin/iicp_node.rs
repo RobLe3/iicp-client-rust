@@ -378,7 +378,7 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
 // ── GAP-6 — probe backend for all available models ─────────────────────────
 /// Best-effort: returns all model names from Ollama `/api/tags` or OpenAI `/v1/models`.
 /// Empty vec on any error — caller falls back to the single configured model.
-async fn probe_backend_models(backend_url: &str) -> Vec<String> {
+async fn probe_backend_models(backend_url: &str, api_key: &str) -> Vec<String> {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(3))
         .build()
@@ -386,9 +386,25 @@ async fn probe_backend_models(backend_url: &str) -> Vec<String> {
         Ok(c) => c,
         Err(_) => return vec![],
     };
+    // #409/#5 — an auth-requiring backend (LM Studio, hosted) returns 401 on
+    // /v1/models without the Bearer key; attach it so GAP-6 model discovery
+    // (and thus multi-intent advertising) works against auth'd backends.
+    let auth = |req: reqwest::RequestBuilder| {
+        if api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(api_key)
+        }
+    };
+    // #409 — strip a trailing `/v1` so both probe URLs are well-formed whether the
+    // operator passed `http://host:11434` (Ollama) or `http://host:1234/v1` (LM Studio /
+    // OpenAI-compat). Without this, a /v1 backend_url produced `…/v1/api/tags` and
+    // `…/v1/v1/models` — both 404 — so no models were discovered and multi-intent (#409)
+    // never fired for OpenAI-compat backends.
     let base = backend_url.trim_end_matches('/');
+    let root = base.strip_suffix("/v1").unwrap_or(base);
     // Try Ollama /api/tags first
-    if let Ok(resp) = client.get(format!("{base}/api/tags")).send().await {
+    if let Ok(resp) = auth(client.get(format!("{root}/api/tags"))).send().await {
         if resp.status().is_success() {
             if let Ok(data) = resp.json::<serde_json::Value>().await {
                 let models: Vec<String> = data["models"]
@@ -404,7 +420,7 @@ async fn probe_backend_models(backend_url: &str) -> Vec<String> {
         }
     }
     // Fallback: OpenAI-compat /v1/models
-    if let Ok(resp) = client.get(format!("{base}/v1/models")).send().await {
+    if let Ok(resp) = auth(client.get(format!("{root}/v1/models"))).send().await {
         if resp.status().is_success() {
             if let Ok(data) = resp.json::<serde_json::Value>().await {
                 let models: Vec<String> = data["data"]
@@ -736,7 +752,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // Onboarding: if no --model given, auto-select the first model the backend advertises
     // (Ollama /api/tags or OpenAI /v1/models) so a bare `iicp-node serve` just works.
     if opts.model.is_empty() && !opts.backend_url.is_empty() {
-        let models = probe_backend_models(&opts.backend_url).await;
+        let models = probe_backend_models(&opts.backend_url, &opts.backend_api_key).await;
         if let Some(first) = models.first() {
             eprintln!(
                 "[iicp-node] no --model given — auto-selected '{first}' from backend {}",
@@ -815,7 +831,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     // GAP-6: probe backend for all available models so the directory registration
     // advertises the full model list — not just the single configured model.
-    let discovered_models = probe_backend_models(&opts.backend_url).await;
+    let discovered_models = probe_backend_models(&opts.backend_url, &opts.backend_api_key).await;
 
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
     cfg.model = Some(opts.model.clone());
