@@ -58,6 +58,8 @@ impl Default for OpenAiCompatOptions {
 const AUDIO_TRANSCRIBE_INTENT: &str = "urn:iicp:intent:audio:transcribe:v1";
 /// #414 — text-to-speech. JSON request but a *binary* audio response (distinct path).
 const AUDIO_SPEECH_INTENT: &str = "urn:iicp:intent:audio:speech:v1";
+/// #414 — content moderation. Plain JSON in/out (shared path), but model-OPTIONAL.
+const SAFETY_MODERATE_INTENT: &str = "urn:iicp:intent:safety:moderate:v1";
 
 /// Map IICP intent URN → OpenAI-compatible HTTP path.
 fn intent_to_path(intent: &str) -> Option<&'static str> {
@@ -67,6 +69,7 @@ fn intent_to_path(intent: &str) -> Option<&'static str> {
         "urn:iicp:intent:llm:embedding:v1" => Some("/embeddings"),
         AUDIO_TRANSCRIBE_INTENT => Some("/audio/transcriptions"),
         AUDIO_SPEECH_INTENT => Some("/audio/speech"),
+        SAFETY_MODERATE_INTENT => Some("/moderations"),
         _ => None,
     }
 }
@@ -78,6 +81,7 @@ pub const SUPPORTED_INTENTS: &[&str] = &[
     "urn:iicp:intent:llm:embedding:v1",
     AUDIO_TRANSCRIBE_INTENT,
     AUDIO_SPEECH_INTENT,
+    SAFETY_MODERATE_INTENT,
 ];
 
 /// Build a task handler closure that proxies CALLs to an OpenAI-compatible
@@ -203,11 +207,13 @@ async fn handle_task_inner(engine: &'static str, opts: OpenAiCompatOptions, task
             body.insert("model".into(), json!(m));
         }
     }
-    if body
-        .get("model")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .is_empty()
+    // moderation is model-optional (the backend supplies a fixed moderation model).
+    if intent != SAFETY_MODERATE_INTENT
+        && body
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .is_empty()
     {
         return json!({
             "error_code": 400,

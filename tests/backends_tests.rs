@@ -499,3 +499,64 @@ async fn test_audio_speech_live_espeak_server() {
     assert_eq!(&audio[..4], b"RIFF", "expected wav audio, got {result}");
     assert!(audio.len() > 1000, "expected real audio bytes");
 }
+
+// ── #414 safety:moderate (content moderation) — JSON in/out, model-optional ──
+
+#[tokio::test]
+async fn test_safety_moderate_routes_without_model() {
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/moderations")
+        .match_body(mockito::Matcher::PartialJson(json!({"input": "bad text"})))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"results":[{"flagged":true,"categories":{"harassment":true},"category_scores":{"harassment":0.99}}]}"#)
+        .create_async()
+        .await;
+
+    // NO model configured — moderation must still route (model-optional).
+    let result = invoke(
+        &opts(server.url(), None),
+        "urn:iicp:intent:safety:moderate:v1",
+        &json!({"input": "bad text"}),
+    )
+    .await;
+    assert!(
+        result.get("error_code").is_none(),
+        "unexpected error: {result}"
+    );
+    assert_eq!(
+        result["result"]["results"][0]["flagged"].as_bool(),
+        Some(true)
+    );
+}
+
+/// Live ratification (#414): requires an OpenAI-compat /v1/moderations backend on
+/// :8092 (e.g. the unitary/toxic-bert shim documented in FORGE_STATE iter-2027).
+/// Run with: cargo test --test backends_tests -- --ignored safety_moderate_live
+#[tokio::test]
+#[ignore]
+async fn test_safety_moderate_live_toxicbert() {
+    let toxic = invoke(
+        &opts("http://127.0.0.1:8092/v1".into(), None),
+        "urn:iicp:intent:safety:moderate:v1",
+        &json!({"input": "I will hurt you, you idiot"}),
+    )
+    .await;
+    let benign = invoke(
+        &opts("http://127.0.0.1:8092/v1".into(), None),
+        "urn:iicp:intent:safety:moderate:v1",
+        &json!({"input": "the weather is lovely today"}),
+    )
+    .await;
+    assert_eq!(
+        toxic["result"]["results"][0]["flagged"].as_bool(),
+        Some(true),
+        "{toxic}"
+    );
+    assert_eq!(
+        benign["result"]["results"][0]["flagged"].as_bool(),
+        Some(false),
+        "{benign}"
+    );
+}
