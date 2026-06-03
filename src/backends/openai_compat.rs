@@ -56,6 +56,8 @@ impl Default for OpenAiCompatOptions {
 
 /// #414 — speech-to-text. Multipart file upload (distinct path below), not JSON.
 const AUDIO_TRANSCRIBE_INTENT: &str = "urn:iicp:intent:audio:transcribe:v1";
+/// #414 — text-to-speech. JSON request but a *binary* audio response (distinct path).
+const AUDIO_SPEECH_INTENT: &str = "urn:iicp:intent:audio:speech:v1";
 
 /// Map IICP intent URN → OpenAI-compatible HTTP path.
 fn intent_to_path(intent: &str) -> Option<&'static str> {
@@ -64,6 +66,7 @@ fn intent_to_path(intent: &str) -> Option<&'static str> {
         "urn:iicp:intent:llm:completion:v1" => Some("/completions"),
         "urn:iicp:intent:llm:embedding:v1" => Some("/embeddings"),
         AUDIO_TRANSCRIBE_INTENT => Some("/audio/transcriptions"),
+        AUDIO_SPEECH_INTENT => Some("/audio/speech"),
         _ => None,
     }
 }
@@ -74,6 +77,7 @@ pub const SUPPORTED_INTENTS: &[&str] = &[
     "urn:iicp:intent:llm:completion:v1",
     "urn:iicp:intent:llm:embedding:v1",
     AUDIO_TRANSCRIBE_INTENT,
+    AUDIO_SPEECH_INTENT,
 ];
 
 /// Build a task handler closure that proxies CALLs to an OpenAI-compatible
@@ -172,6 +176,10 @@ async fn handle_task_inner(engine: &'static str, opts: OpenAiCompatOptions, task
     // #414 — audio:transcribe is a multipart file upload, not a JSON body.
     if intent == AUDIO_TRANSCRIBE_INTENT {
         return handle_transcription(engine, &opts, path, &payload).await;
+    }
+    // #414 — audio:speech is a JSON request with a binary audio response.
+    if intent == AUDIO_SPEECH_INTENT {
+        return handle_speech(engine, &opts, path, &payload).await;
     }
 
     let mut body = match payload {
@@ -397,6 +405,105 @@ async fn handle_transcription(
         Ok(data) => json!({ "result": data }),
         Err(_) => json!({ "result": { "text": text } }),
     }
+}
+
+/// #414 — audio:speech (TTS): JSON request, binary audio response. The audio bytes
+/// are base64-encoded into `result.audio` so the result rides the JSON task pipe.
+async fn handle_speech(
+    engine: &'static str,
+    opts: &OpenAiCompatOptions,
+    path: &str,
+    payload: &Value,
+) -> Value {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    let obj = match payload {
+        Value::Object(o) => o,
+        _ => {
+            return json!({
+                "error_code": 400,
+                "error_message": format!("{engine}: audio:speech payload must be a JSON object"),
+            });
+        }
+    };
+    let text = obj.get("input").and_then(Value::as_str).unwrap_or("");
+    if text.is_empty() {
+        return json!({
+            "error_code": 400,
+            "error_message": format!("{engine}: audio:speech requires payload.input (text to synthesize)"),
+        });
+    }
+    let mut body = serde_json::Map::new();
+    body.insert("input".to_string(), json!(text));
+    let model = obj
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| opts.model.clone());
+    if let Some(m) = model {
+        body.insert("model".to_string(), json!(m));
+    }
+    for k in ["voice", "response_format", "speed"] {
+        if let Some(v) = obj.get(k) {
+            body.insert(k.to_string(), v.clone());
+        }
+    }
+    // OpenAI-dialect servers require a voice (ignored by engines like espeak-ng).
+    body.entry("voice".to_string()).or_insert(json!("alloy"));
+
+    let base = opts.base_url.trim_end_matches('/');
+    let url = format!("{base}{path}");
+    let client = match reqwest::Client::builder().timeout(opts.timeout).build() {
+        Ok(c) => c,
+        Err(e) => {
+            return json!({"error_code": 500, "error_message": format!("{engine}: client build failed: {e}")});
+        }
+    };
+    let mut req = client.post(&url).json(&Value::Object(body));
+    if let Some(key) = &opts.api_key {
+        if !key.is_empty() {
+            req = req.bearer_auth(key);
+        }
+    }
+    let resp = match req.send().await {
+        Ok(r) => r,
+        Err(e) if e.is_timeout() => {
+            return json!({"error_code": 408, "error_message": format!("{engine}: backend timed out")});
+        }
+        Err(e) => {
+            return json!({"error_code": 502, "error_message": format!("{engine}: HTTP transport error: {e}")});
+        }
+    };
+    let status = resp.status().as_u16();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("audio/mpeg")
+        .to_string();
+    if !resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let truncated: String = text.chars().take(512).collect();
+        return json!({"error_code": status, "error_message": format!("{engine}: upstream {status}: {truncated}")});
+    }
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return json!({"error_code": 502, "error_message": format!("{engine}: failed reading audio response: {e}")});
+        }
+    };
+    let format = content_type
+        .rsplit('/')
+        .next()
+        .unwrap_or("mpeg")
+        .to_string();
+    json!({
+        "result": {
+            "audio": STANDARD.encode(&bytes),
+            "content_type": content_type,
+            "format": format,
+        }
+    })
 }
 
 fn type_name(v: &Value) -> &'static str {

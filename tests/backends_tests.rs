@@ -427,3 +427,75 @@ async fn test_audio_transcribe_live_whisper_server() {
         "expected transcription, got {result}"
     );
 }
+
+// ── #414 audio:speech (TTS) — JSON request, binary audio response ────────────
+
+#[tokio::test]
+async fn test_audio_speech_returns_base64_audio() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut server = mockito::Server::new_async().await;
+    let _m = server
+        .mock("POST", "/audio/speech")
+        .match_body(mockito::Matcher::PartialJson(
+            json!({"input": "hello world"}),
+        ))
+        .with_status(200)
+        .with_header("content-type", "audio/wav")
+        .with_body(b"RIFF....fake-wav-audio")
+        .create_async()
+        .await;
+
+    let result = invoke(
+        &opts(server.url(), Some("tts-1")),
+        "urn:iicp:intent:audio:speech:v1",
+        &json!({"input": "hello world", "voice": "alloy"}),
+    )
+    .await;
+    assert!(
+        result.get("error_code").is_none(),
+        "unexpected error: {result}"
+    );
+    assert_eq!(
+        result["result"]["content_type"].as_str().unwrap_or(""),
+        "audio/wav"
+    );
+    let decoded = STANDARD
+        .decode(result["result"]["audio"].as_str().unwrap_or(""))
+        .unwrap();
+    assert_eq!(decoded, b"RIFF....fake-wav-audio");
+}
+
+#[tokio::test]
+async fn test_audio_speech_requires_input_field() {
+    let result = invoke(
+        &opts("http://127.0.0.1:1".into(), Some("tts-1")),
+        "urn:iicp:intent:audio:speech:v1",
+        &json!({}),
+    )
+    .await;
+    assert_eq!(result["error_code"].as_u64(), Some(400));
+    assert!(result["error_message"]
+        .as_str()
+        .unwrap_or("")
+        .contains("input"));
+}
+
+/// Live ratification (#414): requires an OpenAI-compat /v1/audio/speech backend on
+/// :8091 (e.g. the espeak-ng shim documented in FORGE_STATE iter-2026).
+/// Run with: cargo test --test backends_tests -- --ignored audio_speech_live
+#[tokio::test]
+#[ignore]
+async fn test_audio_speech_live_espeak_server() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let result = invoke(
+        &opts("http://127.0.0.1:8091/v1".into(), None),
+        "urn:iicp:intent:audio:speech:v1",
+        &json!({"input": "Ask not what your country can do for you.", "voice": "en"}),
+    )
+    .await;
+    let audio = STANDARD
+        .decode(result["result"]["audio"].as_str().unwrap_or(""))
+        .expect("base64 audio");
+    assert_eq!(&audio[..4], b"RIFF", "expected wav audio, got {result}");
+    assert!(audio.len() > 1000, "expected real audio bytes");
+}
