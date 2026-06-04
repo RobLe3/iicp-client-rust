@@ -83,7 +83,10 @@ async fn test_task_endpoint_returns_200() {
         .unwrap();
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["status"], "completed");
+    // Spec iicp-dir.md task status ∈ {success, failure, timeout}; the node returns
+    // "success" (was "completed" — fixed in ddd002a; this assertion was a missed
+    // loose end from that fix, surfaced by #453).
+    assert_eq!(body["status"], "success");
     assert_eq!(body["task_id"], "t-001");
 
     handle.abort();
