@@ -436,7 +436,7 @@ async fn relay_endpoint(
                     .unwrap_or("");
                 return Json(json!({
                     "task_id": task_id,
-                    "status": "completed",
+                    "status": "success", // spec status (was "completed"); parity with direct path + adapter
                     "result": result
                 }))
                 .into_response();
@@ -621,7 +621,10 @@ async fn task_endpoint(
             state.tasks_success.fetch_add(1, Ordering::Relaxed);
             Json(TaskResponse {
                 task_id,
-                status: "completed".into(),
+                // Spec iicp-dir.md §task response: status ∈ {success, failure, timeout};
+                // matches the Python adapter ("success"). Was "completed" — a cross-flavour
+                // drift (spec-violating) surfaced by the first real client-inference test.
+                status: "success".into(),
                 result: Some(value),
                 error: None,
             })
