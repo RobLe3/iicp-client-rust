@@ -39,6 +39,7 @@ pub mod cip_policy;
 pub mod concurrency;
 pub mod confidentiality;
 pub mod conformance;
+pub mod delegation;
 pub mod idempotency;
 pub mod identity;
 pub mod instance_lock;

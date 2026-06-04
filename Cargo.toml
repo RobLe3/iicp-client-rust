@@ -61,6 +61,10 @@ sha2 = "0.10"
 subtle = "2"
 # IICP-CX S.16 E2E confidentiality: X25519-HKDF-SHA256 + AES-256-GCM
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+# ADR-045 Phase A: operator→node delegation signing (Ed25519). Same dalek-cryptography
+# org as x25519-dalek (curve25519-dalek already in the tree → minimal new surface);
+# BSD-3; v2 is post-RUSTSEC-2022-0093. TC-11 cleared 2026-06-04.
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 aes-gcm = "0.10"
 hkdf = "0.12"
 rand = "0.8"
