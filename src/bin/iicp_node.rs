@@ -311,7 +311,12 @@ async fn verify_credit_awards(
                 format!("{}://{}{}", u.scheme(), h, port)
             })
         })
-        .unwrap_or_else(|| directory_url.trim_end_matches("/api").trim_end_matches('/').to_string());
+        .unwrap_or_else(|| {
+            directory_url
+                .trim_end_matches("/api")
+                .trim_end_matches('/')
+                .to_string()
+        });
     let did: serde_json::Value = client
         .get(format!("{origin}/.well-known/did.json"))
         .send()
@@ -387,11 +392,17 @@ async fn verify_credit_awards(
             let sig_ok = hex::decode(sig_hex)
                 .ok()
                 .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
-                .map(|arr| vk.verify(msg.as_slice(), &Signature::from_bytes(&arr)).is_ok())
+                .map(|arr| {
+                    vk.verify(msg.as_slice(), &Signature::from_bytes(&arr))
+                        .is_ok()
+                })
                 .unwrap_or(false);
             if sig_ok {
                 verified += 1;
-                verified_sum += payload.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.0);
+                verified_sum += payload
+                    .get("amount")
+                    .and_then(|a| a.as_f64())
+                    .unwrap_or(0.0);
             } else {
                 failed += 1;
             }
@@ -1870,6 +1881,92 @@ mod tests {
         assert!(
             run_credits(&bad_args).await.is_err(),
             "a forged/wrong token must be rejected — local config cannot fabricate credits"
+        );
+    }
+
+    /// 2-path mock: serves /.well-known/did.json (with `did_x` as the Ed25519 JWK x) and
+    /// /v1/events (with `events_body`). Handles several requests on a daemon thread.
+    fn spawn_verify_mock(did_x: String, events_body: String) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let did_body = format!(
+                r#"{{"verificationMethod":[{{"publicKeyJwk":{{"kty":"OKP","crv":"Ed25519","x":"{did_x}"}}}}]}}"#
+            );
+            for _ in 0..8 {
+                let Ok((mut s, _)) = listener.accept() else {
+                    break;
+                };
+                let mut buf = [0u8; 1024];
+                let n = s.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if req.contains("did.json") {
+                    &did_body
+                } else {
+                    &events_body
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// #456 --verify: a properly-signed CREDIT_AWARD verifies; a tampered `amount` (same sig)
+    /// MUST fail verification — the heart of "you can't fake earnings." Fails without the
+    /// canonical_json + Ed25519 verify in verify_credit_awards (#404).
+    #[tokio::test]
+    async fn verify_accepts_valid_award_and_rejects_tampered_amount() {
+        use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+        use ed25519_dalek::{Signer, SigningKey};
+        use sha2::{Digest, Sha256};
+
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let pubkey_b64 = URL_SAFE_NO_PAD.encode(sk.verifying_key().to_bytes());
+        let event_id = "11111111-1111-1111-1111-111111111111";
+        let seq = 2i64;
+        let ts_ms = 1_700_000_000_000i64;
+        let payload = serde_json::json!({"amount": 5.0, "new_balance": 5.0, "task_id": "t1"});
+        // Sign exactly as the directory does (§3.4 / federation.rs event_message).
+        let payload_hash = hex::encode(Sha256::digest(canonical_json(&payload).as_bytes()));
+        let input = format!("{event_id}:CREDIT_AWARD:{seq}:{ts_ms}:{payload_hash}");
+        let msg = Sha256::digest(input.as_bytes());
+        let sig_hex = hex::encode(sk.sign(msg.as_slice()).to_bytes());
+        let mk_events = |pl: &serde_json::Value| {
+            serde_json::json!({"events":[{
+                "event_id": event_id, "event_type": "CREDIT_AWARD", "seq": seq, "ts_ms": ts_ms,
+                "node_id": "n1", "payload": pl, "sig": sig_hex,
+            }]})
+            .to_string()
+        };
+
+        // Valid → verifies.
+        let port = spawn_verify_mock(pubkey_b64.clone(), mk_events(&payload));
+        let (sum, ok, failed) = verify_credit_awards(&format!("http://127.0.0.1:{port}"), "n1")
+            .await
+            .unwrap();
+        assert_eq!(
+            (sum, ok, failed),
+            (5.0, 1, 0),
+            "valid signed award must verify"
+        );
+
+        // Tampered amount (same sig over the original payload) → MUST fail.
+        let tampered = serde_json::json!({"amount": 9999.0, "new_balance": 5.0, "task_id": "t1"});
+        let port2 = spawn_verify_mock(pubkey_b64, mk_events(&tampered));
+        let (_s, ok2, failed2) = verify_credit_awards(&format!("http://127.0.0.1:{port2}"), "n1")
+            .await
+            .unwrap();
+        assert_eq!(ok2, 0, "a tampered amount must NOT verify");
+        assert!(
+            failed2 >= 1,
+            "a tampered amount must count as a failed signature"
         );
     }
 }
