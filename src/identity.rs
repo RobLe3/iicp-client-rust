@@ -85,6 +85,13 @@ fn shellexpand_home(s: &str) -> String {
     s.to_string()
 }
 
+/// #464 — the operator identity is an ed25519 keypair: `operator_id` IS the base64 public
+/// key (== the directory's `operator_pubkey` via the ADR-045 delegation), so it is
+/// cryptographically verifiable rather than a random UUID. `operator_secret` is the base64
+/// 32-byte private seed — LOCAL ONLY (0600 file), never sent to the directory (password-at-rest
+/// = #460). `operator_integrity_hash` binds the immutable fields (pinned by the directory on
+/// first-use; the directory's own clock — not `created_at` — is authoritative for founder
+/// ordinals). `display_name` is the public, mutable handle; `contact` is private.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OperatorIdentity {
     pub operator_id: String,
@@ -93,16 +100,63 @@ pub struct OperatorIdentity {
     pub display_name: String,
     #[serde(default)]
     pub contact: String,
+    /// base64 ed25519 private key (32-byte seed). Local-only secret.
+    #[serde(default)]
+    pub operator_secret: String,
+    /// SHA256(operator_id ':' created_at), pinned by the directory on first use.
+    #[serde(default)]
+    pub operator_integrity_hash: String,
 }
 
 impl OperatorIdentity {
     pub fn generate(display_name: &str, contact: &str) -> Self {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use ed25519_dalek::SigningKey;
+
+        let sk = SigningKey::generate(&mut rand::rngs::OsRng);
+        let operator_id = STANDARD.encode(sk.verifying_key().to_bytes());
+        let operator_secret = STANDARD.encode(sk.to_bytes());
+        let created_at = now_iso();
+        let operator_integrity_hash = Self::compute_integrity_hash(&operator_id, &created_at);
         Self {
-            operator_id: format!("op-{}", Uuid::new_v4()),
-            created_at: now_iso(),
+            operator_id,
+            created_at,
             display_name: display_name.to_string(),
             contact: contact.to_string(),
+            operator_secret,
+            operator_integrity_hash,
         }
+    }
+
+    /// SHA256(operator_id ':' created_at), hex.
+    pub fn compute_integrity_hash(operator_id: &str, created_at: &str) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(
+            format!("{operator_id}:{created_at}").as_bytes(),
+        ))
+    }
+
+    /// True when operator_id is a real ed25519 pubkey (not a legacy `op-<uuid>`).
+    pub fn is_key_backed(&self) -> bool {
+        !self.operator_secret.is_empty() && !self.operator_id.starts_with("op-")
+    }
+
+    /// The ed25519 signing key for delegations / mutations. Err on a legacy keyless identity.
+    pub fn signing_key(&self) -> Result<ed25519_dalek::SigningKey, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        if self.operator_secret.is_empty() {
+            return Err(
+                "legacy operator identity has no key (operator_id is a UUID, not a public key) — regenerate (#464)".into(),
+            );
+        }
+        let bytes = STANDARD
+            .decode(&self.operator_secret)
+            .map_err(|e| format!("bad operator_secret base64: {e}"))?;
+        let arr: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "operator_secret is not 32 bytes".to_string())?;
+        Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
     }
 }
 
@@ -293,4 +347,67 @@ pub fn generate_node(
         node_token: None, // cached on first register (#456)
         created_at: now_iso(),
     })
+}
+
+#[cfg(test)]
+mod operator_identity_tests {
+    //! #464 — OperatorIdentity is the ed25519 operator key: operator_id is the verifiable
+    //! public key (== the directory's operator_pubkey via the ADR-045 delegation), not a
+    //! random UUID. Fails without the fix (old operator_id was `op-<uuid>` with no key).
+    use super::OperatorIdentity;
+    use crate::delegation::{issue_delegation, operator_pub_b64, verify_delegation};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    #[test]
+    fn operator_id_is_the_base64_ed25519_pubkey() {
+        let op = OperatorIdentity::generate("Rebel One", "me@example.com");
+        assert!(!op.operator_id.starts_with("op-"));
+        assert_eq!(STANDARD.decode(&op.operator_id).unwrap().len(), 32);
+        assert_eq!(STANDARD.decode(&op.operator_secret).unwrap().len(), 32);
+        assert!(op.is_key_backed());
+    }
+
+    #[test]
+    fn signing_key_public_matches_operator_id() {
+        let op = OperatorIdentity::generate("", "");
+        let sk = op.signing_key().unwrap();
+        assert_eq!(operator_pub_b64(&sk), op.operator_id);
+    }
+
+    #[test]
+    fn delegation_uses_the_identity_key_and_verifies() {
+        let op = OperatorIdentity::generate("", "");
+        let token = issue_delegation(&op.signing_key().unwrap(), "node-123", 3600);
+        assert_eq!(token.operator_pub, op.operator_id);
+        // now=0 ≤ not_after (issued now+3600) → not expired; node_id check is independent.
+        assert!(verify_delegation(&token, "node-123", 0).is_ok());
+        assert!(verify_delegation(&token, "other-node", 0).is_err());
+    }
+
+    #[test]
+    fn integrity_hash_binds_operator_id_and_created_at() {
+        let op = OperatorIdentity::generate("", "");
+        assert_eq!(
+            op.operator_integrity_hash,
+            OperatorIdentity::compute_integrity_hash(&op.operator_id, &op.created_at)
+        );
+        assert_ne!(
+            OperatorIdentity::compute_integrity_hash(&op.operator_id, "1999-01-01T00:00:00Z"),
+            op.operator_integrity_hash
+        );
+    }
+
+    #[test]
+    fn legacy_uuid_identity_is_not_key_backed() {
+        let legacy = OperatorIdentity {
+            operator_id: "op-deadbeef".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            display_name: String::new(),
+            contact: String::new(),
+            operator_secret: String::new(),
+            operator_integrity_hash: String::new(),
+        };
+        assert!(!legacy.is_key_backed());
+        assert!(legacy.signing_key().is_err());
+    }
 }
