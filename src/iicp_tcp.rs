@@ -356,7 +356,10 @@ impl IicpTcpServer {
         }
     }
 
-    async fn handle_connection(&self, mut socket: TcpStream) -> std::io::Result<()> {
+    /// Handle one already-accepted socket as a native IICP connection (#457). Public so a
+    /// single-port multiplexer in `IicpNode::serve` can route native connections here
+    /// (the HTTP control plane and native transport share one port via first-byte detection).
+    pub async fn handle_connection(&self, mut socket: TcpStream) -> std::io::Result<()> {
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
 
         // Stage 1 + magic byte validation. Read until we have the 12-byte header.

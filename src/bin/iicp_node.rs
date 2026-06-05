@@ -1493,6 +1493,19 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         // probe listener dropped here; port is immediately available for serve()
     }
 
+    // #457 / ADR-040 — advertise the native IICP binary transport. serve() multiplexes it
+    // onto the SAME socket as HTTP (first-byte detection), so transport_endpoint shares the
+    // endpoint's host:port with the iicp:// scheme. Derived from the FINAL endpoint (after NAT
+    // detection); only sent when registering (skip_registration gates the non-routable case)
+    // → advertise-when-reachable. Opt out with IICP_DISABLE_NATIVE_TRANSPORT=1.
+    if !opts.skip_registration
+        && std::env::var("IICP_DISABLE_NATIVE_TRANSPORT").as_deref() != Ok("1")
+    {
+        if let Some(tep) = iicp_client::node::derive_native_endpoint(&opts.public_endpoint) {
+            node.set_transport_endpoint(tep);
+        }
+    }
+
     // #404 — register with bounded backoff retry. On persistent failure, still
     // start the heartbeat loop with an empty token: its first heartbeat 401s and
     // the #399 re-register path recovers once the directory is reachable. This is

@@ -258,6 +258,26 @@ pub struct TaskRequest {
     pub _trace: Option<Value>,
 }
 
+/// #457 / ADR-040 — derive the native binary `transport_endpoint` from the HTTP `endpoint`.
+/// They share one host:port (serve() multiplexes both planes on one socket via first-byte
+/// detection), so the native URI is the same authority with the `iicp` scheme (`iicpsec`
+/// for TLS). Authority only — any path on the HTTP endpoint is dropped. Returns None if the
+/// endpoint is not http(s).
+pub fn derive_native_endpoint(endpoint: &str) -> Option<String> {
+    let (scheme, rest) = if let Some(r) = endpoint.strip_prefix("http://") {
+        ("iicp", r)
+    } else if let Some(r) = endpoint.strip_prefix("https://") {
+        ("iicpsec", r)
+    } else {
+        return None;
+    };
+    let authority = rest.split('/').next().unwrap_or(rest);
+    if authority.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}://{authority}"))
+}
+
 #[derive(Debug, Serialize)]
 pub struct TaskResponse {
     pub task_id: String,
@@ -711,6 +731,12 @@ impl IicpNode {
         self.cfg.relay_worker_endpoint = Some(endpoint);
     }
 
+    /// #457 / ADR-040 — set the native binary `transport_endpoint` advertised at register
+    /// (the single-port multiplexer serves it on the same socket as the HTTP endpoint).
+    pub fn set_transport_endpoint(&mut self, endpoint: String) {
+        self.cfg.transport_endpoint = Some(endpoint);
+    }
+
     /// Populate `endpoint`, `transport_endpoint`, and the NAT observability
     /// fields from a `NatProfile` produced by [`crate::nat_detection::detect_nat`].
     ///
@@ -1032,6 +1058,9 @@ impl IicpNode {
         // Clone before handler is potentially moved into the relay worker closure (iicp-tcp only).
         #[cfg(feature = "iicp-tcp")]
         let handler_for_relay = Arc::clone(&handler);
+        // #457 — clone for the native IICP transport handler in the single-port multiplexer.
+        #[cfg(feature = "iicp-tcp")]
+        let handler_for_native = Arc::clone(&handler);
         // Extract bind host before `addr` is shadowed by SocketAddr (iicp-tcp only).
         #[cfg(feature = "iicp-tcp")]
         let bind_host: String = addr.split(':').next().unwrap_or("0.0.0.0").to_string();
@@ -1399,9 +1428,89 @@ impl IicpNode {
             });
         }
 
-        axum::serve(listener, app)
-            .await
-            .map_err(|e| IicpError::Node(e.to_string()))
+        // #457 / ADR-040 — single-port multiplexer: the HTTP control plane and the native
+        // IICP binary transport share ONE socket. The public listener peeks the first 4
+        // bytes of each connection — the IICP frame magic "IICP" routes to the native
+        // handler (the SAME backend task handler as HTTP), anything else is spliced to the
+        // real axum server on an internal loopback listener. One socket ⇒ one pinhole ⇒
+        // native is reachable exactly when HTTP is (advertise-when-reachable); a CGNAT node
+        // needs no second hole. (axum 0.7 serve() takes a concrete TcpListener, so the HTTP
+        // side runs unmodified behind a loopback splice — no client-IP use in handlers.)
+        #[cfg(feature = "iicp-tcp")]
+        {
+            let native = crate::iicp_tcp::IicpTcpServer::new(&bind_host, addr.port())
+                .with_node_id(self.cfg.node_id.clone())
+                .with_handler(Arc::new(move |t: crate::iicp_tcp::TcpTask| {
+                    let h = Arc::clone(&handler_for_native);
+                    Box::pin(async move {
+                        let req = TaskRequest {
+                            task_id: t.task_id,
+                            intent: t.intent,
+                            payload: t.payload,
+                            constraints: None,
+                            auth: None,
+                            nonce: None,
+                            _trace: None,
+                        };
+                        h(req)
+                            .await
+                            .unwrap_or_else(|e| json!({"error": e.to_string()}))
+                    })
+                        as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
+                }));
+
+            let internal = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| IicpError::Node(e.to_string()))?;
+            let internal_addr = internal
+                .local_addr()
+                .map_err(|e| IicpError::Node(e.to_string()))?;
+            tokio::spawn(async move {
+                let _ = axum::serve(internal, app).await;
+            });
+
+            loop {
+                let (stream, _peer) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let native = native.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    let mut got = 0usize;
+                    // Peek (non-consuming) until the 4-byte prefix arrives; the chosen
+                    // consumer then parses from the start. Bounded so a stalled client
+                    // can't pin the task.
+                    for _ in 0..20 {
+                        match stream.peek(&mut buf).await {
+                            Ok(n) => {
+                                got = n;
+                                if n >= 4 {
+                                    break;
+                                }
+                            }
+                            Err(_) => return,
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    if got >= 4 && &buf == crate::iicp_tcp::IICP_MAGIC {
+                        let _ = native.handle_connection(stream).await;
+                    } else if let Ok(mut inner) =
+                        tokio::net::TcpStream::connect(internal_addr).await
+                    {
+                        let mut stream = stream;
+                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut inner).await;
+                    }
+                });
+            }
+        }
+
+        #[cfg(not(feature = "iicp-tcp"))]
+        {
+            axum::serve(listener, app)
+                .await
+                .map_err(|e| IicpError::Node(e.to_string()))
+        }
     }
 }
 
