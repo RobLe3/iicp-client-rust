@@ -69,6 +69,9 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 rand = "0.8"
 base64 = "0.22"
+# Hex decode of signed-event-log signatures for `credits --verify` (#456). Ubiquitous,
+# already in the tree as a dev-dep; promoted to a runtime dep (TC-11: trivial, no new surface).
+hex = "0.4"
 # Local time-of-day for availability windows (ADR-006). "clock" only — no serde/format.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 

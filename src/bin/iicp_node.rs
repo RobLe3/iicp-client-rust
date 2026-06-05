@@ -251,12 +251,165 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Recursive canonical JSON — byte-identical to the directory's signing form
+/// (iicp-directory-rs federation.rs `canonical_json`: recursive key-sort, no whitespace,
+/// scalars via serde_json's compact repr which leaves `/` and unicode unescaped). This MUST
+/// match exactly or every signature verification fails. (#456 --verify)
+fn canonical_json(v: &serde_json::Value) -> String {
+    use serde_json::Value;
+    match v {
+        Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            let parts: Vec<String> = keys
+                .iter()
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::to_string(k).unwrap_or_default(),
+                        canonical_json(&map[*k])
+                    )
+                })
+                .collect();
+            format!("{{{}}}", parts.join(","))
+        }
+        Value::Array(arr) => {
+            format!(
+                "[{}]",
+                arr.iter().map(canonical_json).collect::<Vec<_>>().join(",")
+            )
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// #456 `--verify`: cryptographically confirm this node's CREDIT_AWARD income against the
+/// directory's **signed event log** — defends against a lying directory, on top of the
+/// tampered-local-file defense the base command already provides. Resolves the directory's
+/// Ed25519 key from `/.well-known/did.json`, fetches the signed CREDIT_AWARD events, and
+/// re-derives + verifies each signature. Returns `(verified_sum, verified_count, failed_count)`.
+async fn verify_credit_awards(
+    directory_url: &str,
+    node_id: &str,
+) -> Result<(f64, u64, u64), String> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Digest, Sha256};
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+
+    // 1. Resolve the directory signing key from /.well-known/did.json at the ORIGIN
+    //    (did.json sits at the host root, not under any /api path).
+    let origin = reqwest::Url::parse(directory_url)
+        .ok()
+        .and_then(|u| {
+            u.host_str().map(|h| {
+                let port = u.port().map(|p| format!(":{p}")).unwrap_or_default();
+                format!("{}://{}{}", u.scheme(), h, port)
+            })
+        })
+        .unwrap_or_else(|| directory_url.trim_end_matches("/api").trim_end_matches('/').to_string());
+    let did: serde_json::Value = client
+        .get(format!("{origin}/.well-known/did.json"))
+        .send()
+        .await
+        .map_err(|e| format!("did.json fetch: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("did.json parse: {e}"))?;
+    let x = did
+        .get("verificationMethod")
+        .and_then(|v| v.get(0))
+        .and_then(|m| m.get("publicKeyJwk"))
+        .and_then(|j| j.get("x"))
+        .and_then(|s| s.as_str())
+        .ok_or("directory did.json has no Ed25519 verification key (publicKeyJwk.x)")?;
+    let pub_bytes = URL_SAFE_NO_PAD
+        .decode(x)
+        .map_err(|_| "bad did.json key (base64url)")?;
+    let pub_arr: [u8; 32] = pub_bytes
+        .as_slice()
+        .try_into()
+        .map_err(|_| "did.json key is not 32 bytes")?;
+    let vk = VerifyingKey::from_bytes(&pub_arr).map_err(|_| "bad Ed25519 verifying key")?;
+
+    // 2. Fetch + verify the signed CREDIT_AWARD events for this node (paginated by seq).
+    let (mut verified_sum, mut verified, mut failed) = (0.0_f64, 0u64, 0u64);
+    let mut since: u64 = 0;
+    loop {
+        let url = format!(
+            "{}/v1/events?event_types=CREDIT_AWARD&since_seq={}&limit=500",
+            directory_url.trim_end_matches('/'),
+            since
+        );
+        let body: serde_json::Value = client
+            .get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("events fetch: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("events parse: {e}"))?;
+        let events = body
+            .get("events")
+            .and_then(|e| e.as_array())
+            .cloned()
+            .unwrap_or_default();
+        if events.is_empty() {
+            break;
+        }
+        let mut max_seq = since;
+        for e in &events {
+            let seq = e.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
+            if seq as u64 > max_seq {
+                max_seq = seq as u64;
+            }
+            if e.get("event_type").and_then(|v| v.as_str()) != Some("CREDIT_AWARD") {
+                continue;
+            }
+            if e.get("node_id").and_then(|v| v.as_str()) != Some(node_id) {
+                continue;
+            }
+            let Some(sig_hex) = e.get("sig").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let event_id = e.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
+            let ts_ms = e.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+            let payload = e.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            // Re-derive the directory's signing message (§3.4 / federation.rs event_message):
+            //   sha256( event_id:event_type:seq:ts_ms : sha256_hex(canonical_json(payload)) )
+            let payload_hash = hex::encode(Sha256::digest(canonical_json(&payload).as_bytes()));
+            let input = format!("{event_id}:CREDIT_AWARD:{seq}:{ts_ms}:{payload_hash}");
+            let msg = Sha256::digest(input.as_bytes());
+            let sig_ok = hex::decode(sig_hex)
+                .ok()
+                .and_then(|b| <[u8; 64]>::try_from(b.as_slice()).ok())
+                .map(|arr| vk.verify(msg.as_slice(), &Signature::from_bytes(&arr)).is_ok())
+                .unwrap_or(false);
+            if sig_ok {
+                verified += 1;
+                verified_sum += payload.get("amount").and_then(|a| a.as_f64()).unwrap_or(0.0);
+            } else {
+                failed += 1;
+            }
+        }
+        if events.len() < 500 || max_seq <= since {
+            break;
+        }
+        since = max_seq;
+    }
+    Ok((verified_sum, verified, failed))
+}
+
 /// `iicp-node credits [--node NAME] [--token T] [--directory-url U] [--json] [--verify]`
 /// — show this node's lifetime earned / spent / balance from the directory's
 /// reconcile-checked GET /v1/credits/summary (#456). The displayed figures come from the
 /// directory (not the local file), so editing the saved config cannot inflate them; the
-/// `reconciles` flag flags a ledger that doesn't add up. `--verify` (cryptographic audit
-/// against the signed CREDIT_AWARD log) is the next slice.
+/// `reconciles` flag flags a ledger that doesn't add up. `--verify` cryptographically audits
+/// each award against the directory's signed CREDIT_AWARD log.
 async fn run_credits(args: &[String]) -> Result<(), String> {
     let mut node_name: Option<String> = None;
     let mut directory_url: Option<String> = None;
@@ -395,9 +548,30 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
         );
     }
     if verify {
-        eprintln!(
-            "[iicp-node] note: --verify (cryptographic audit of each award against the signed CREDIT_AWARD log) is the next slice (#456). The figures above are from the directory's reconcile-checked summary and are independent of the local config."
+        let (vsum, vcount, vfailed) = verify_credit_awards(&directory_url, &node_id).await?;
+        println!("  ── cryptographic verification (signed CREDIT_AWARD log) ──");
+        if vfailed > 0 {
+            eprintln!(
+                "[iicp-node] ✗ {vfailed} award event(s) FAILED Ed25519 verification — tampered or \
+                 inconsistent event log. Do NOT trust these figures."
+            );
+            return Err(format!(
+                "{vfailed} CREDIT_AWARD signature(s) failed verification"
+            ));
+        }
+        println!(
+            "  ✓ {vcount} award(s) cryptographically verified · {vsum:.3} credits (Ed25519, signed by the directory)"
         );
+        let free_tier = earned - vsum;
+        if free_tier > 0.0001 {
+            println!(
+                "  · {free_tier:.3} credits are free-tier allocation (directory-granted, not signed task awards)"
+            );
+        } else if vsum > earned + 0.0001 {
+            eprintln!(
+                "[iicp-node] WARNING: verified awards ({vsum:.3}) exceed the summary's total_earned ({earned:.3}) — inconsistent; investigate."
+            );
+        }
     }
 
     Ok(())
