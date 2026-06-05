@@ -1775,8 +1775,67 @@ fn urlencoding_simple(s: &str) -> String {
 /// key, so the directory authenticates the change by signature alone (no node token); one
 /// signed call updates the single operator record, reflected on every node + the leaderboard.
 /// Updates the local operator.json on success. Never sends the secret/contact.
+/// Resolve a passphrase: $IICP_OPERATOR_PASSPHRASE if set (headless/CI), else an interactive
+/// prompt (this command is operator-run, so a prompt is fine here — only `serve` stays
+/// non-interactive). NOTE: the prompt echoes (no `rpassword` dep, to avoid a TC-11 gate).
+fn operator_passphrase(prompt: &str, confirm: bool) -> Result<String, String> {
+    if let Some(pw) = iicp_client::operator_crypto::passphrase_from_env() {
+        return Ok(pw);
+    }
+    let pw = ask(prompt, "");
+    if pw.is_empty() {
+        return Err("a passphrase is required".into());
+    }
+    if confirm && pw != ask("Confirm passphrase", "") {
+        return Err("passphrases do not match".into());
+    }
+    Ok(pw)
+}
+
+/// `iicp-node operator encrypt` (#460) — seal the operator secret at rest under a passphrase.
+fn run_operator_encrypt() -> Result<(), String> {
+    let op = load_operator()
+        .map_err(|e| e.to_string())?
+        .ok_or("no operator identity — run `iicp-node init` first")?;
+    if op.is_encrypted() {
+        println!("Operator secret is already encrypted at rest.");
+        return Ok(());
+    }
+    if !op.is_key_backed() {
+        return Err("legacy keyless operator identity has nothing to encrypt (#464)".into());
+    }
+    let pw = operator_passphrase("New operator passphrase", true)?;
+    save_operator(&op.encrypt_at_rest(&pw)?).map_err(|e| e.to_string())?;
+    println!(
+        "Operator secret encrypted at rest (AES-256-GCM / PBKDF2). Set $IICP_OPERATOR_PASSPHRASE \
+         to unlock it headlessly during `serve`."
+    );
+    Ok(())
+}
+
+/// `iicp-node operator decrypt` (#460) — restore the plaintext secret at rest.
+fn run_operator_decrypt() -> Result<(), String> {
+    let op = load_operator()
+        .map_err(|e| e.to_string())?
+        .ok_or("no operator identity — run `iicp-node init` first")?;
+    if !op.is_encrypted() {
+        println!("Operator secret is already stored in plaintext.");
+        return Ok(());
+    }
+    let pw = operator_passphrase("Operator passphrase", false)?;
+    save_operator(&op.decrypt_at_rest(&pw)?).map_err(|e| e.to_string())?;
+    println!("Operator secret decrypted (now stored in plaintext at rest).");
+    Ok(())
+}
+
 async fn run_operator(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
+    if sub == "encrypt" {
+        return run_operator_encrypt();
+    }
+    if sub == "decrypt" {
+        return run_operator_decrypt();
+    }
     if sub != "rename" {
         return Err(format!("unknown operator subcommand: {sub}"));
     }

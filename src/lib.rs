@@ -43,6 +43,7 @@ pub mod delegation;
 pub mod idempotency;
 pub mod identity;
 pub mod instance_lock;
+pub mod operator_crypto;
 pub mod peer_manager;
 pub mod pricing;
 #[cfg(feature = "iicp-tcp")]

@@ -106,6 +106,10 @@ pub struct OperatorIdentity {
     /// SHA256(operator_id ':' created_at), pinned by the directory on first use.
     #[serde(default)]
     pub operator_integrity_hash: String,
+    /// #460 — AES-256-GCM-sealed seed when the operator opts into at-rest encryption; None for
+    /// a plaintext (default/legacy) identity. Omitted from the file when None (clean plaintext).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_secret_enc: Option<crate::operator_crypto::EncryptedSecret>,
 }
 
 impl OperatorIdentity {
@@ -125,6 +129,7 @@ impl OperatorIdentity {
             contact: contact.to_string(),
             operator_secret,
             operator_integrity_hash,
+            operator_secret_enc: None,
         }
     }
 
@@ -138,25 +143,82 @@ impl OperatorIdentity {
 
     /// True when operator_id is a real ed25519 pubkey (not a legacy `op-<uuid>`).
     pub fn is_key_backed(&self) -> bool {
-        !self.operator_secret.is_empty() && !self.operator_id.starts_with("op-")
+        (!self.operator_secret.is_empty() || self.operator_secret_enc.is_some())
+            && !self.operator_id.starts_with("op-")
     }
 
-    /// The ed25519 signing key for delegations / mutations. Err on a legacy keyless identity.
-    pub fn signing_key(&self) -> Result<ed25519_dalek::SigningKey, String> {
-        use base64::{engine::general_purpose::STANDARD, Engine};
-        if self.operator_secret.is_empty() {
-            return Err(
-                "legacy operator identity has no key (operator_id is a UUID, not a public key) — regenerate (#464)".into(),
-            );
+    /// #460 — true when the seed is sealed at rest and a passphrase is needed to sign.
+    pub fn is_encrypted(&self) -> bool {
+        self.operator_secret_enc.is_some() && self.operator_secret.is_empty()
+    }
+
+    /// Resolve the base64 seed: plaintext if present, else decrypt the sealed seed with
+    /// `passphrase` (falling back to `$IICP_OPERATOR_PASSPHRASE` for headless serve).
+    fn seed_b64(&self, passphrase: Option<&str>) -> Result<String, String> {
+        if !self.operator_secret.is_empty() {
+            return Ok(self.operator_secret.clone());
         }
+        if let Some(enc) = &self.operator_secret_enc {
+            let pw = passphrase
+                .map(str::to_string)
+                .or_else(crate::operator_crypto::passphrase_from_env)
+                .ok_or_else(|| {
+                    "operator secret is encrypted — set $IICP_OPERATOR_PASSPHRASE (or pass a \
+                     passphrase) to unlock it (#460)"
+                        .to_string()
+                })?;
+            return crate::operator_crypto::decrypt_seed(&pw, enc, &self.operator_id);
+        }
+        Err(
+            "legacy operator identity has no key (operator_id is a UUID, not a public key) — regenerate (#464)".into(),
+        )
+    }
+
+    /// The ed25519 signing key for delegations / mutations. Decrypts the sealed seed when the
+    /// identity is encrypted (via `$IICP_OPERATOR_PASSPHRASE`). Err on a legacy keyless identity.
+    pub fn signing_key(&self) -> Result<ed25519_dalek::SigningKey, String> {
+        self.signing_key_with(None)
+    }
+
+    /// Like [`signing_key`](Self::signing_key) but with an explicit unlock passphrase (#460).
+    pub fn signing_key_with(
+        &self,
+        passphrase: Option<&str>,
+    ) -> Result<ed25519_dalek::SigningKey, String> {
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        let seed_b64 = self.seed_b64(passphrase)?;
         let bytes = STANDARD
-            .decode(&self.operator_secret)
+            .decode(&seed_b64)
             .map_err(|e| format!("bad operator_secret base64: {e}"))?;
         let arr: [u8; 32] = bytes
             .as_slice()
             .try_into()
             .map_err(|_| "operator_secret is not 32 bytes".to_string())?;
         Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
+    }
+
+    /// #460 — return a copy with the seed sealed under `passphrase` (operator_secret cleared).
+    pub fn encrypt_at_rest(&self, passphrase: &str) -> Result<Self, String> {
+        let enc = crate::operator_crypto::encrypt_seed(
+            passphrase,
+            &self.seed_b64(None)?,
+            &self.operator_id,
+        )?;
+        Ok(Self {
+            operator_secret: String::new(),
+            operator_secret_enc: Some(enc),
+            ..self.clone()
+        })
+    }
+
+    /// #460 — return a copy with the plaintext seed restored (operator_secret_enc cleared).
+    pub fn decrypt_at_rest(&self, passphrase: &str) -> Result<Self, String> {
+        let seed = self.seed_b64(Some(passphrase))?;
+        Ok(Self {
+            operator_secret: seed,
+            operator_secret_enc: None,
+            ..self.clone()
+        })
     }
 }
 
@@ -406,8 +468,31 @@ mod operator_identity_tests {
             contact: String::new(),
             operator_secret: String::new(),
             operator_integrity_hash: String::new(),
+            operator_secret_enc: None,
         };
         assert!(!legacy.is_key_backed());
         assert!(legacy.signing_key().is_err());
+    }
+
+    // #460 — encrypt at rest → sign once unlocked (same pubkey) → decrypt restores plaintext.
+    #[test]
+    fn operator_encrypt_sign_decrypt_cycle() {
+        let op = OperatorIdentity::generate("Padme", "");
+        assert!(!op.is_encrypted());
+        let pub_before = op.signing_key().unwrap().verifying_key().to_bytes();
+
+        let enc = op.encrypt_at_rest("s3cret").unwrap();
+        assert!(enc.is_encrypted());
+        assert!(enc.operator_secret.is_empty()); // plaintext seed gone from the record
+        assert!(enc.is_key_backed());
+
+        // Signs once unlocked; the recovered key matches the original.
+        let sk = enc.signing_key_with(Some("s3cret")).unwrap();
+        assert_eq!(sk.verifying_key().to_bytes(), pub_before);
+        assert!(enc.signing_key_with(Some("WRONG")).is_err());
+
+        let back = enc.decrypt_at_rest("s3cret").unwrap();
+        assert!(!back.is_encrypted());
+        assert_eq!(back.operator_secret, op.operator_secret);
     }
 }
