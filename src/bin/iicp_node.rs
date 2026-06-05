@@ -251,6 +251,158 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `iicp-node credits [--node NAME] [--token T] [--directory-url U] [--json] [--verify]`
+/// — show this node's lifetime earned / spent / balance from the directory's
+/// reconcile-checked GET /v1/credits/summary (#456). The displayed figures come from the
+/// directory (not the local file), so editing the saved config cannot inflate them; the
+/// `reconciles` flag flags a ledger that doesn't add up. `--verify` (cryptographic audit
+/// against the signed CREDIT_AWARD log) is the next slice.
+async fn run_credits(args: &[String]) -> Result<(), String> {
+    let mut node_name: Option<String> = None;
+    let mut directory_url: Option<String> = None;
+    let mut token: Option<String> = env::var("IICP_NODE_TOKEN").ok();
+    let mut node_id: Option<String> = None;
+    let mut as_json = false;
+    let mut verify = false;
+
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        match a.as_str() {
+            "--json" => {
+                as_json = true;
+                i += 1;
+            }
+            "--verify" => {
+                verify = true;
+                i += 1;
+            }
+            _ if a.starts_with('-') => {
+                if i + 1 >= args.len() {
+                    return Err(format!("flag {a} needs a value"));
+                }
+                let v = args[i + 1].clone();
+                match a.as_str() {
+                    "--node" => node_name = Some(v),
+                    "--token" => token = Some(v),
+                    "--directory-url" => directory_url = Some(v),
+                    "--node-id" => node_id = Some(v),
+                    _ => return Err(format!("unknown flag: {a}")),
+                }
+                i += 2;
+            }
+            _ => return Err(format!("unexpected argument: {a}")),
+        }
+    }
+
+    if let Some(ref name) = node_name {
+        match load_node(name) {
+            Ok(Some(ni)) => {
+                directory_url.get_or_insert(ni.directory_url.clone());
+                node_id.get_or_insert(ni.node_id.clone());
+                if token.is_none() {
+                    token = ni.node_token.clone();
+                }
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "no saved config at ~/.iicp/nodes/{name}.json — run `iicp-node init` / `serve` first"
+                ))
+            }
+            Err(e) => return Err(format!("load node {name}: {e}")),
+        }
+    }
+
+    let directory_url = directory_url.unwrap_or_else(|| {
+        env::var("IICP_DIRECTORY_URL").unwrap_or_else(|_| "https://iicp.network/api".to_string())
+    });
+    let node_id = node_id.ok_or("node_id required (use --node NAME or --node-id ID)")?;
+    let token = token.ok_or(
+        "no node_token — run `iicp-node serve` once (it caches the token), or pass --token / $IICP_NODE_TOKEN",
+    )?;
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+
+    let url = format!("{}/v1/credits/summary", directory_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Node-Id", &node_id)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("bad response: {e}"))?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("request rejected");
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    let num = |k: &str| body.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let earned = num("total_earned");
+    let spent = num("total_spent");
+    let balance = num("balance");
+    let tx = body.get("tx_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let reconciles = body
+        .get("reconciles")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tpc = body
+        .get("tokens_per_credit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000);
+
+    println!(
+        "IICP credits — {}",
+        node_name.as_deref().unwrap_or(&node_id)
+    );
+    println!("  Earned (income)   {earned:>12.3}");
+    println!("  Spent             {spent:>12.3}");
+    println!("  ─────────────────────────────");
+    let check = if reconciles {
+        "✓ reconciles"
+    } else {
+        "✗ DOES NOT RECONCILE"
+    };
+    println!(
+        "  Balance           {balance:>12.3}   {check}   (≈ {} tokens)",
+        (balance * tpc as f64) as i64
+    );
+    println!("  {tx} transactions · `iicp-node credits --json` for raw");
+    if !reconciles {
+        eprintln!(
+            "[iicp-node] WARNING: balance != earned − spent — the ledger does not reconcile; do not trust these figures."
+        );
+    }
+    if verify {
+        eprintln!(
+            "[iicp-node] note: --verify (cryptographic audit of each award against the signed CREDIT_AWARD log) is the next slice (#456). The figures above are from the directory's reconcile-checked summary and are independent of the local config."
+        );
+    }
+
+    Ok(())
+}
+
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
     let mut opts = ServeOpts {
         node: env_or("IICP_NODE_NAME", None).unwrap_or_default(),
@@ -1174,6 +1326,14 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                             &format!("endpoint={}", opts.public_endpoint),
                         );
                     }
+                    // #456 — cache the token in the saved config so `iicp-node credits`
+                    // can authenticate later without re-registering (best-effort).
+                    if !opts.node.is_empty() {
+                        if let Ok(Some(mut ni)) = load_node(&opts.node) {
+                            ni.node_token = Some(t.clone());
+                            let _ = save_node(&ni);
+                        }
+                    }
                     break Some(t);
                 }
                 Err(e) if attempt >= 3 => {
@@ -1414,6 +1574,13 @@ async fn main() {
         }
         return;
     }
+    if cmd == "credits" {
+        if let Err(e) = run_credits(&args[2..]).await {
+            eprintln!("ERROR: {e}");
+            process::exit(1);
+        }
+        return;
+    }
     if cmd != "serve" {
         eprintln!("unknown command: {cmd}");
         print_help();
@@ -1470,5 +1637,65 @@ mod tests {
         };
         apply_saved_node(&mut opts, &saved);
         assert_eq!(opts.backend_url, "http://flag:9999/v1");
+    }
+
+    /// Single-shot mock of GET /v1/credits/summary — std-only, no test deps.
+    fn spawn_mock_summary(status_line: &'static str, body: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut b = [0u8; 2048];
+                let _ = s.read(&mut b);
+                let resp = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = s.write_all(resp.as_bytes());
+            }
+        });
+        port
+    }
+
+    /// #456 — `iicp-node credits` renders a 200 summary and, crucially, ERRORS on 401:
+    /// a wrong/forged token cannot produce credit figures (the amounts come authenticated
+    /// from the directory, not from the local config). Fails without the run_credits command.
+    #[tokio::test]
+    async fn credits_renders_on_200_and_errs_on_401() {
+        let ok_body = r#"{"node_id":"n1","total_earned":142.5,"total_spent":38.25,"balance":104.25,"tx_count":2,"reconciles":true,"unit":"credit","tokens_per_credit":1000}"#;
+        let port = spawn_mock_summary("200 OK", ok_body);
+        let ok_args: Vec<String> = vec![
+            "--node-id".into(),
+            "n1".into(),
+            "--token".into(),
+            "t".into(),
+            "--directory-url".into(),
+            format!("http://127.0.0.1:{port}"),
+            "--json".into(),
+        ];
+        assert!(
+            run_credits(&ok_args).await.is_ok(),
+            "valid 200 summary must render"
+        );
+
+        let port2 = spawn_mock_summary(
+            "401 Unauthorized",
+            r#"{"error":{"code":"unauthorized","message":"invalid node_token"}}"#,
+        );
+        let bad_args: Vec<String> = vec![
+            "--node-id".into(),
+            "n1".into(),
+            "--token".into(),
+            "forged".into(),
+            "--directory-url".into(),
+            format!("http://127.0.0.1:{port2}"),
+        ];
+        assert!(
+            run_credits(&bad_args).await.is_err(),
+            "a forged/wrong token must be rejected — local config cannot fabricate credits"
+        );
     }
 }

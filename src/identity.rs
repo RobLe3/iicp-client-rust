@@ -155,6 +155,12 @@ pub struct NodeIdentity {
     pub auto_detect_nat: bool,
     #[serde(default)]
     pub external_ip_probe_url: String,
+    /// #456 — node_token cached after register so read-only commands (`iicp-node credits`)
+    /// can authenticate without re-registering. Bearer credential, not a secret key;
+    /// stored in the chmod-600 config alongside the operator identity. Absent until the
+    /// node first registers (via `serve`).
+    #[serde(default)]
+    pub node_token: Option<String>,
     pub created_at: String,
 }
 
@@ -284,6 +290,7 @@ pub fn generate_node(
         public_endpoint: public_endpoint.to_string(),
         auto_detect_nat,
         external_ip_probe_url: external_ip_probe_url.to_string(),
+        node_token: None, // cached on first register (#456)
         created_at: now_iso(),
     })
 }
