@@ -42,6 +42,38 @@ pub fn canonical_bytes(node_id: &str, operator_pub_b64: &str, not_after: u64) ->
     .expect("canonical delegation json is infallible")
 }
 
+/// #460 — exact bytes the operator signs to rename their public `display_name`. Key order is
+/// `display_name < operator_pub < ts` (alphabetical), no spaces — byte-identical to PHP
+/// `OperatorController::canonicalBytes`, the Rust directory `canonical_rename_bytes`, and the
+/// Python/TS signers (cross-impl rename KAT). Do NOT reorder.
+pub fn canonical_rename_bytes(display_name: &str, operator_pub_b64: &str, ts: i64) -> Vec<u8> {
+    #[derive(Serialize)]
+    struct Canonical<'a> {
+        display_name: &'a str,
+        operator_pub: &'a str,
+        ts: i64,
+    }
+    serde_json::to_vec(&Canonical {
+        display_name,
+        operator_pub: operator_pub_b64,
+        ts,
+    })
+    .expect("canonical rename json is infallible")
+}
+
+/// #460 — operator signs a display_name rename; returns base64 of the Ed25519 signature. Only
+/// the operator key-holder can produce this, so the directory authenticates the mutation by
+/// the signature alone (no node token).
+pub fn sign_rename(
+    key: &SigningKey,
+    display_name: &str,
+    operator_pub_b64: &str,
+    ts: i64,
+) -> String {
+    let sig = key.sign(&canonical_rename_bytes(display_name, operator_pub_b64, ts));
+    STANDARD.encode(sig.to_bytes())
+}
+
 /// Base64 (standard, padded) of the operator's raw 32-byte Ed25519 public key — the form the
 /// directory stores and the token carries.
 pub fn operator_pub_b64(key: &SigningKey) -> String {
@@ -125,6 +157,33 @@ mod tests {
         assert_eq!(STANDARD.decode(&tok.operator_pub).unwrap().len(), 32);
         assert_eq!(STANDARD.decode(&tok.sig).unwrap().len(), 64);
         assert_eq!(verify_delegation(&tok, "node-1", now_unix()), Ok(()));
+    }
+
+    // #460 rename KAT — MUST equal PHP OperatorController::canonicalBytes / the Rust directory
+    // delegation::canonical_rename_bytes / the Python+TS signers for the same inputs.
+    const RENAME_KAT: &str =
+        r#"{"display_name":"New Name","operator_pub":"T3BQdWI=","ts":1893456000}"#;
+
+    #[test]
+    fn canonical_rename_bytes_match_cross_language_kat() {
+        let b = canonical_rename_bytes("New Name", "T3BQdWI=", 1_893_456_000);
+        assert_eq!(String::from_utf8(b).unwrap(), RENAME_KAT);
+    }
+
+    #[test]
+    fn sign_rename_verifies_with_operator_pubkey() {
+        // The operator_pub used to sign IS the operator_id (== base64 ed25519 pubkey, #464).
+        let key = SigningKey::generate(&mut OsRng);
+        let pub_b64 = operator_pub_b64(&key);
+        let sig_b64 = sign_rename(&key, "Rebel Two", &pub_b64, 1_893_456_000);
+        let sig_raw: [u8; 64] = STANDARD.decode(&sig_b64).unwrap().try_into().unwrap();
+        let sig = Signature::from_bytes(&sig_raw);
+        key.verifying_key()
+            .verify(
+                &canonical_rename_bytes("Rebel Two", &pub_b64, 1_893_456_000),
+                &sig,
+            )
+            .expect("operator pubkey verifies its own rename signature");
     }
 
     #[test]

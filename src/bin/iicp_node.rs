@@ -114,7 +114,9 @@ fn print_help() {
          \x20 init                       Interactive wizard — set up operator + first node\n\
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
          \x20 serve                      Register and serve a node\n\
-         \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\n\
+         \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\
+         \x20 credits                    Show this node's earned / spent / balance credits\n\
+         \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\n\
          Global flags:\n\
          \x20 --version, -V              Print version and exit\n\
          \x20 --help, -h                 Print this help\n\n\
@@ -1768,6 +1770,96 @@ fn urlencoding_simple(s: &str) -> String {
         .collect()
 }
 
+/// `iicp-node operator rename <name>` (#460) — change the public, mutable display_name over
+/// the immutable operator_id. The operator signs the canonical rename bytes with their own
+/// key, so the directory authenticates the change by signature alone (no node token); one
+/// signed call updates the single operator record, reflected on every node + the leaderboard.
+/// Updates the local operator.json on success. Never sends the secret/contact.
+async fn run_operator(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    if sub != "rename" {
+        return Err(format!("unknown operator subcommand: {sub}"));
+    }
+    let mut name: Option<String> = None;
+    let mut directory_url: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--directory-url" {
+            i += 1;
+            directory_url = args.get(i).cloned();
+        } else if let Some(v) = a.strip_prefix("--directory-url=") {
+            directory_url = Some(v.to_string());
+        } else if !a.starts_with("--") && name.is_none() {
+            name = Some(a.clone());
+        }
+        i += 1;
+    }
+    let name = name.ok_or("usage: iicp-node operator rename <name>")?;
+    if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {
+        return Err("display name must be 1-64 chars with no control characters".into());
+    }
+
+    let mut op = load_operator()
+        .map_err(|e| e.to_string())?
+        .ok_or("no operator identity — run `iicp-node init` first")?;
+    if !op.is_key_backed() {
+        return Err(
+            "legacy keyless operator identity (operator_id is a UUID, not a key) — \
+                    cannot sign a rename. Regenerate with a key-backed identity (#464)"
+                .into(),
+        );
+    }
+
+    let directory_url = directory_url.unwrap_or_else(|| {
+        env::var("IICP_DIRECTORY_URL").unwrap_or_else(|_| "https://iicp.network/api".to_string())
+    });
+    let sk = op.signing_key()?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let sig = iicp_client::delegation::sign_rename(&sk, &name, &op.operator_id, ts);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let url = format!("{}/v1/operator/rename", directory_url.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "operator_pub": op.operator_id.clone(),
+            "display_name": name.clone(),
+            "ts": ts,
+            "sig": sig,
+        }))
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("request rejected");
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+
+    // Persist the new name locally so the next `serve` re-asserts it at register.
+    op.display_name = body
+        .get("display_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&name)
+        .to_string();
+    save_operator(&op).map_err(|e| e.to_string())?;
+    println!("Renamed operator display_name to {:?}.", op.display_name);
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -1803,6 +1895,13 @@ async fn main() {
     }
     if cmd == "credits" {
         if let Err(e) = run_credits(&args[2..]).await {
+            eprintln!("ERROR: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if cmd == "operator" {
+        if let Err(e) = run_operator(&args[2..]).await {
             eprintln!("ERROR: {e}");
             process::exit(1);
         }
