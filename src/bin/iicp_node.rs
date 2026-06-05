@@ -384,10 +384,17 @@ async fn verify_credit_awards(
             let event_id = e.get("event_id").and_then(|v| v.as_str()).unwrap_or("");
             let ts_ms = e.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0);
             let payload = e.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            // #458 hash-chain genesis root: SHA256_hex("iicp:dir:event-log:genesis:v1"). The
+            // directory serves prev_hash per event; default to this for a genesis/legacy event.
+            let prev_hash = e
+                .get("prev_hash")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("c44802bedf3e63b5a3f1634c5d19263634f92f26dd15401b09b06dd53a80cf9d");
             // Re-derive the directory's signing message (§3.4 / federation.rs event_message):
-            //   sha256( event_id:event_type:seq:ts_ms : sha256_hex(canonical_json(payload)) )
+            //   sha256( event_id:event_type:seq:ts_ms : sha256_hex(canonical_json(payload)) : prev_hash )
             let payload_hash = hex::encode(Sha256::digest(canonical_json(&payload).as_bytes()));
-            let input = format!("{event_id}:CREDIT_AWARD:{seq}:{ts_ms}:{payload_hash}");
+            let input = format!("{event_id}:CREDIT_AWARD:{seq}:{ts_ms}:{payload_hash}:{prev_hash}");
             let msg = Sha256::digest(input.as_bytes());
             let sig_ok = hex::decode(sig_hex)
                 .ok()
@@ -1933,15 +1940,17 @@ mod tests {
         let seq = 2i64;
         let ts_ms = 1_700_000_000_000i64;
         let payload = serde_json::json!({"amount": 5.0, "new_balance": 5.0, "task_id": "t1"});
+        // #458: genesis-case hash-chain link, bound into the signing input.
+        let prev_hash = "c44802bedf3e63b5a3f1634c5d19263634f92f26dd15401b09b06dd53a80cf9d";
         // Sign exactly as the directory does (§3.4 / federation.rs event_message).
         let payload_hash = hex::encode(Sha256::digest(canonical_json(&payload).as_bytes()));
-        let input = format!("{event_id}:CREDIT_AWARD:{seq}:{ts_ms}:{payload_hash}");
+        let input = format!("{event_id}:CREDIT_AWARD:{seq}:{ts_ms}:{payload_hash}:{prev_hash}");
         let msg = Sha256::digest(input.as_bytes());
         let sig_hex = hex::encode(sk.sign(msg.as_slice()).to_bytes());
         let mk_events = |pl: &serde_json::Value| {
             serde_json::json!({"events":[{
                 "event_id": event_id, "event_type": "CREDIT_AWARD", "seq": seq, "ts_ms": ts_ms,
-                "node_id": "n1", "payload": pl, "sig": sig_hex,
+                "node_id": "n1", "payload": pl, "prev_hash": prev_hash, "sig": sig_hex,
             }]})
             .to_string()
         };
