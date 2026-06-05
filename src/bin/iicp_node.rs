@@ -1264,6 +1264,28 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     if !opts.relay_worker_endpoint.is_empty() {
         cfg.relay_worker_endpoint = Some(opts.relay_worker_endpoint.clone());
     }
+    // #463/#464 — bind the operator identity: issue a delegation FROM the (key-backed) operator
+    // identity for this node and advertise the public display_name. The directory verifies the
+    // delegation (operator_pub == operator_id) and records the operator. Never sends secret/contact.
+    if let Ok(Some(op)) = load_operator() {
+        if op.is_key_backed() {
+            if let Ok(sk) = op.signing_key() {
+                let token = iicp_client::delegation::issue_delegation(&sk, &opts.node_id, 3600);
+                cfg.operator_delegation = serde_json::to_value(&token).ok();
+                cfg.operator_display_name = if op.display_name.is_empty() {
+                    None
+                } else {
+                    Some(op.display_name.clone())
+                };
+                cfg.operator_created_at = Some(op.created_at.clone());
+                cfg.operator_integrity_hash = if op.operator_integrity_hash.is_empty() {
+                    None
+                } else {
+                    Some(op.operator_integrity_hash.clone())
+                };
+            }
+        }
+    }
     // Resolve log directory: CLI flag > IICP_LOG_DIR > ~/.iicp/logs/
     cfg.log_dir = Some({
         let raw = opts.log_dir.clone().unwrap_or_else(|| {

@@ -205,6 +205,15 @@ pub struct NodeConfig {
     /// Directory for persistent log files (`<node_id>.log` + `events.jsonl`).
     /// `None` disables file logging (stderr only). Overridden by `IICP_LOG_DIR`.
     pub log_dir: Option<std::path::PathBuf>,
+    /// #463/#464 — operator-identity attributes advertised at register (bound only when the
+    /// delegation verifies). `operator_delegation` is the serialized ADR-045 token (built from
+    /// the operator identity for this node_id; operator_pub == operator_id). `display_name` is
+    /// the public handle (node detail + leaderboard); `created_at` + `integrity_hash` are
+    /// identity-integrity. NEVER the operator's contact/email or secret key.
+    pub operator_delegation: Option<serde_json::Value>,
+    pub operator_display_name: Option<String>,
+    pub operator_created_at: Option<String>,
+    pub operator_integrity_hash: Option<String>,
 }
 
 impl NodeConfig {
@@ -241,6 +250,10 @@ impl NodeConfig {
             relay_accept_port: 9485,
             relay_worker_endpoint: None,
             log_dir: None,
+            operator_delegation: None,
+            operator_display_name: None,
+            operator_created_at: None,
+            operator_integrity_hash: None,
         }
     }
 }
@@ -930,6 +943,20 @@ impl IicpNode {
         }
         if !self.cfg.node_hmac_key.is_empty() {
             payload["node_hmac_key"] = json!(self.cfg.node_hmac_key);
+        }
+        // #463/#464 — operator-identity attributes ride with the delegation (the directory
+        // binds them only when it verifies). Never the operator's contact/email or secret key.
+        if let Some(del) = &self.cfg.operator_delegation {
+            payload["operator_delegation"] = del.clone();
+            if let Some(dn) = &self.cfg.operator_display_name {
+                payload["operator_display_name"] = json!(dn);
+            }
+            if let Some(ca) = &self.cfg.operator_created_at {
+                payload["operator_created_at"] = json!(ca);
+            }
+            if let Some(ih) = &self.cfg.operator_integrity_hash {
+                payload["operator_integrity_hash"] = json!(ih);
+            }
         }
         payload
     }
@@ -1652,5 +1679,59 @@ mod reregister_tests {
         let url = format!("{}/v1/register", server.url());
         let tok = reregister(&http, &url, &json!({})).await;
         assert_eq!(tok, None);
+    }
+}
+
+#[cfg(test)]
+mod operator_wiring_tests {
+    //! #463/#464 — the register payload carries the operator identity (delegation +
+    //! display_name) so the directory records the operator + surfaces display_name on node
+    //! detail; it NEVER sends the operator's secret key or contact/email.
+    use super::{IicpNode, NodeConfig};
+    use crate::delegation::issue_delegation;
+    use crate::identity::OperatorIdentity;
+
+    const CHAT: &str = "urn:iicp:intent:llm:chat:v1";
+
+    #[test]
+    fn register_payload_carries_operator_fields_never_secret() {
+        let op = OperatorIdentity::generate("Rebel One", "me@example.com");
+        let node_id = "test-node-1";
+        let token = issue_delegation(&op.signing_key().unwrap(), node_id, 3600);
+        let mut cfg = NodeConfig::new(node_id, "http://h.test:9484", CHAT);
+        cfg.operator_delegation = serde_json::to_value(&token).ok();
+        cfg.operator_display_name = Some(op.display_name.clone());
+        cfg.operator_created_at = Some(op.created_at.clone());
+        cfg.operator_integrity_hash = Some(op.operator_integrity_hash.clone());
+        let p = IicpNode::new(cfg).build_register_payload();
+        // operator_pub IS operator_id (#464).
+        assert_eq!(
+            p["operator_delegation"]["operator_pub"],
+            serde_json::json!(op.operator_id)
+        );
+        assert_eq!(p["operator_display_name"], serde_json::json!("Rebel One"));
+        assert_eq!(
+            p["operator_integrity_hash"],
+            serde_json::json!(op.operator_integrity_hash)
+        );
+        let raw = p.to_string();
+        assert!(
+            !raw.contains(&op.operator_secret),
+            "secret key must never be sent"
+        );
+        assert!(
+            !raw.contains("me@example.com"),
+            "contact/email must never be sent"
+        );
+        assert!(!raw.contains("operator_secret"));
+        assert!(!raw.contains("contact"));
+    }
+
+    #[test]
+    fn register_payload_omits_operator_fields_when_unbound() {
+        let p = IicpNode::new(NodeConfig::new("n2", "http://h.test:9484", CHAT))
+            .build_register_payload();
+        assert!(p.get("operator_delegation").is_none());
+        assert!(p.get("operator_display_name").is_none());
     }
 }
