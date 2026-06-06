@@ -116,7 +116,9 @@ fn print_help() {
          \x20 serve                      Register and serve a node\n\
          \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\
          \x20 credits                    Show this node's earned / spent / balance credits\n\
-         \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\n\
+         \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\
+         \x20 operator encrypt           Password-encrypt the operator secret at rest ($IICP_OPERATOR_PASSPHRASE)\n\
+         \x20 operator decrypt           Remove at-rest encryption of the operator secret\n\n\
          Global flags:\n\
          \x20 --version, -V              Print version and exit\n\
          \x20 --help, -h                 Print this help\n\n\
