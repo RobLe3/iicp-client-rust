@@ -222,7 +222,9 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     eprintln!("[iicp-node] Discovering nodes for {}...", intent);
     let resp = client.submit(request).await.map_err(|e| format!("{e}"))?;
 
-    if resp.status == "completed" {
+    // Spec iicp-dir.md §task response: terminal success status is "success" (was "completed";
+    // the node + adapter emit "success"). Accept both so the CLI doesn't reject a successful task.
+    if resp.status == "success" || resp.status == "completed" {
         let content = resp
             .result
             .as_ref()
