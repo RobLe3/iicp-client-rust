@@ -331,7 +331,7 @@ Conformance tier: `iicp:sdk:v1` (spec S.14) · [Request a badge](https://iicp.ne
 ## Development
 
 ```bash
-cargo test          # 157 tests
+cargo test          # run the unit suite
 cargo clippy        # lint
 cargo build --release
 cargo run --example quickstart
