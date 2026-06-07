@@ -39,6 +39,10 @@ iicp-tcp = ["dep:ciborium"]
 # ADR-041 UPnP NAT detection — auto-discover the public endpoint on operator
 # networks behind a UPnP-capable router.
 nat = ["dep:igd-next"]
+# ADR-050 unified client — the local OpenAI/Ollama/Anthropic-compat proxy gateway
+# (`iicp-node proxy`). Kept OUT of `default` so a plain library/consumer build stays
+# lean; the `iicp-node` bin enables it. axum + tokio are already deps for the node.
+proxy = []
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }

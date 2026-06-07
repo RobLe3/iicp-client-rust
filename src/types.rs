@@ -120,6 +120,10 @@ pub struct TaskResponse {
     pub status: String,
     pub result: Option<serde_json::Value>,
     pub metrics: Option<TaskMetrics>,
+    /// Structured error block on a non-success node response (carries the IICP error
+    /// code the proxy surfaces). Defaults to None for success responses / older nodes.
+    #[serde(default)]
+    pub error: Option<serde_json::Value>,
 }
 
 /// Task execution metrics.

@@ -1923,6 +1923,52 @@ async fn run_operator(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+// ── proxy (ADR-050) — local compat gateway; consumer, loopback, no registration ──
+#[cfg(feature = "proxy")]
+async fn run_proxy_cmd(args: &[String]) -> Result<(), String> {
+    let mut host = env::var("IICP_PROXY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let mut port: u16 = env::var("IICP_PROXY_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9483);
+    let mut directory_url = env::var("IICP_DIRECTORY_URL").ok();
+    let mut region = env::var("IICP_PROXY_PREFERRED_REGION").ok();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--host" => {
+                i += 1;
+                host = args.get(i).cloned().ok_or("--host needs a value")?;
+            }
+            "--port" => {
+                i += 1;
+                port = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--port needs a number")?;
+            }
+            "--directory-url" => {
+                i += 1;
+                directory_url = args.get(i).cloned();
+            }
+            "--region" => {
+                i += 1;
+                region = args.get(i).cloned();
+            }
+            other => return Err(format!("unknown proxy flag: {other}")),
+        }
+        i += 1;
+    }
+    iicp_client::proxy::run_proxy(iicp_client::proxy::ProxyConfig {
+        host,
+        port,
+        directory_url,
+        region,
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
@@ -1969,6 +2015,24 @@ async fn main() {
             process::exit(1);
         }
         return;
+    }
+    if cmd == "proxy" {
+        #[cfg(feature = "proxy")]
+        {
+            if let Err(e) = run_proxy_cmd(&args[2..]).await {
+                eprintln!("ERROR: {e}");
+                process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(feature = "proxy"))]
+        {
+            eprintln!(
+                "iicp-node was built without the proxy gateway. \
+                 Reinstall with: cargo install iicp-client --features proxy"
+            );
+            process::exit(2);
+        }
     }
     if cmd != "serve" {
         eprintln!("unknown command: {cmd}");

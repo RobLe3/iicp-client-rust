@@ -30,6 +30,10 @@ pub mod iicp_tcp;
 #[cfg(feature = "nat")]
 pub mod nat_detection;
 
+// ADR-050 unified client — the compat proxy gateway (`iicp-node proxy`).
+#[cfg(feature = "proxy")]
+pub mod proxy;
+
 #[cfg(feature = "nat")]
 pub mod qualify;
 

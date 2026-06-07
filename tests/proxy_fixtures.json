@@ -1,0 +1,118 @@
+{
+  "version": 1,
+  "contract": "project/proxy-unification-contract.md",
+  "issue": 477,
+  "epic": 476,
+  "intent": "urn:iicp:intent:llm:chat:v1",
+  "note": "Parity oracle for `iicp-node proxy` across Python/TS/Rust (ADR-050). Each case sends `request` to the proxy with the IICP client/node mocked per `mock`, and asserts `expect`. `mock.kind`: 'iicp_response' = the mocked IICP node response the proxy translates; 'raise' = inject the named exception from compute_cip_envelope (value 'Exception:CODE'); 'no_nodes' = directory discover returns []. `expect.body_path` keys are dotted paths (numeric segments index arrays); `body_prefix` asserts a string body starts-with. Full parity = every case passes identically in all three languages.",
+  "cases": [
+    {
+      "name": "openai_chat_success",
+      "request": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "iicp", "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "success", "result": {"choices": [{"message": {"role": "assistant", "content": "Hi there"}}], "usage": {"prompt_tokens": 1, "completion_tokens": 2}}}},
+      "expect": {"status": 200, "content_type": "application/json", "body_path": {"object": "chat.completion", "choices.0.message.role": "assistant", "choices.0.message.content": "Hi there"}}
+    },
+    {
+      "name": "openai_upstream_error",
+      "request": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "iicp", "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "error", "error": {"code": "IICP-E007"}}},
+      "expect": {"status": 502, "body_path": {"error.code": "IICP-E007"}}
+    },
+    {
+      "name": "openai_insufficient_credits",
+      "request": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "iicp", "messages": [{"role": "user", "content": "Hi"}], "cip": {"strategy": "remote-first"}}},
+      "mock": {"kind": "raise", "value": "CIPInsufficientCredits:IICP-E036"},
+      "expect": {"status": 402, "body_path": {"error.code": "IICP-E036"}}
+    },
+    {
+      "name": "openai_no_eligible_workers",
+      "request": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "iicp", "messages": [{"role": "user", "content": "Hi"}], "cip": {"strategy": "remote-first"}}},
+      "mock": {"kind": "raise", "value": "CIPNoEligibleWorkers:IICP-E022"},
+      "expect": {"status": 503, "body_path": {"error.code": "IICP-E022"}}
+    },
+    {
+      "name": "openai_no_nodes",
+      "request": {"method": "POST", "path": "/v1/chat/completions", "body": {"model": "iicp", "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "no_nodes"},
+      "expect": {"status": 502, "body_path": {"error.code": "IICP-E033"}}
+    },
+    {
+      "name": "ollama_chat_success_nonstream",
+      "request": {"method": "POST", "path": "/api/chat", "body": {"model": "iicp", "stream": false, "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "success", "result": {"choices": [{"message": {"role": "assistant", "content": "Hi there"}}], "usage": {}}}},
+      "expect": {"status": 200, "content_type": "application/json", "body_path": {"model": "iicp", "message.role": "assistant", "message.content": "Hi there", "done": true}}
+    },
+    {
+      "name": "ollama_chat_success_stream_default_true",
+      "request": {"method": "POST", "path": "/api/chat", "body": {"model": "iicp", "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "success", "result": {"choices": [{"message": {"role": "assistant", "content": "Hi there"}}], "usage": {}}}},
+      "expect": {"status": 200, "content_type": "application/x-ndjson", "ndjson_last_path": {"done": true, "message.content": "Hi there"}}
+    },
+    {
+      "name": "ollama_generate_success_nonstream",
+      "request": {"method": "POST", "path": "/api/generate", "body": {"model": "iicp", "stream": false, "prompt": "Hi"}},
+      "mock": {"kind": "iicp_response", "value": {"status": "success", "result": {"choices": [{"message": {"role": "assistant", "content": "Hi there"}}], "usage": {}}}},
+      "expect": {"status": 200, "content_type": "application/json", "body_path": {"model": "iicp", "response": "Hi there", "done": true}}
+    },
+    {
+      "name": "ollama_upstream_error",
+      "request": {"method": "POST", "path": "/api/chat", "body": {"model": "iicp", "stream": false, "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "error", "error": {"code": "IICP-E007"}}},
+      "expect": {"status": 502, "content_type": "application/json", "body_prefix": {"error": "IICP-E007:"}}
+    },
+    {
+      "name": "ollama_insufficient_credits",
+      "request": {"method": "POST", "path": "/api/chat", "body": {"model": "iicp", "stream": false, "messages": [{"role": "user", "content": "Hi"}], "cip": {"strategy": "remote-first"}}},
+      "mock": {"kind": "raise", "value": "CIPInsufficientCredits:IICP-E036"},
+      "expect": {"status": 402, "body_prefix": {"error": "IICP-E036:"}}
+    },
+    {
+      "name": "ollama_api_version",
+      "request": {"method": "GET", "path": "/api/version"},
+      "mock": {"kind": "none"},
+      "expect": {"status": 200, "body_path": {"version": "0.1.0"}}
+    },
+    {
+      "name": "ollama_api_tags",
+      "request": {"method": "GET", "path": "/api/tags"},
+      "mock": {"kind": "none"},
+      "expect": {"status": 200, "body_path": {"models.0.model": "iicp"}}
+    },
+    {
+      "name": "anthropic_messages_success_nonstream",
+      "request": {"method": "POST", "path": "/v1/messages", "body": {"model": "iicp", "max_tokens": 64, "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "success", "result": {"choices": [{"message": {"role": "assistant", "content": "Hi there"}}], "usage": {}}}},
+      "expect": {"status": 200, "content_type": "application/json", "body_path": {"type": "message", "role": "assistant", "model": "iicp", "content.0.text": "Hi there"}}
+    },
+    {
+      "name": "anthropic_messages_stream_true",
+      "request": {"method": "POST", "path": "/v1/messages", "body": {"model": "iicp", "max_tokens": 64, "stream": true, "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "success", "result": {"choices": [{"message": {"role": "assistant", "content": "Hi there"}}], "usage": {}}}},
+      "expect": {"status": 200, "content_type": "text/event-stream", "sse_event_types": ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"]}
+    },
+    {
+      "name": "anthropic_upstream_error",
+      "request": {"method": "POST", "path": "/v1/messages", "body": {"model": "iicp", "max_tokens": 64, "messages": [{"role": "user", "content": "Hi"}]}},
+      "mock": {"kind": "iicp_response", "value": {"status": "error", "error": {"code": "IICP-E007"}}},
+      "expect": {"status": 502, "content_type": "application/json", "body_path": {"type": "error", "error.type": "api_error"}}
+    },
+    {
+      "name": "anthropic_no_eligible_workers",
+      "request": {"method": "POST", "path": "/v1/messages", "body": {"model": "iicp", "max_tokens": 64, "messages": [{"role": "user", "content": "Hi"}], "cip": {"strategy": "remote-first"}}},
+      "mock": {"kind": "raise", "value": "CIPNoEligibleWorkers:IICP-E022"},
+      "expect": {"status": 503, "body_path": {"type": "error", "error.type": "api_error"}}
+    },
+    {
+      "name": "anthropic_v1_models",
+      "request": {"method": "GET", "path": "/v1/models"},
+      "mock": {"kind": "none"},
+      "expect": {"status": 200, "body_path": {"data.0.id": "iicp"}}
+    },
+    {
+      "name": "ops_status",
+      "request": {"method": "GET", "path": "/status"},
+      "mock": {"kind": "none"},
+      "expect": {"status": 200}
+    }
+  ]
+}
