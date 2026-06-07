@@ -98,6 +98,8 @@ struct ServeOpts {
     host: String,
     skip_registration: bool,
     auto_detect_nat: bool,
+    /// True when `--no-auto-detect-nat` was passed — suppresses the saved-config re-enable.
+    no_auto_detect_nat: bool,
     external_ip_probe_url: String,
     relay_worker_endpoint: String,
     log_dir: Option<String>,
@@ -120,7 +122,9 @@ fn print_help() {
          \x20 credits                    Show this node's earned / spent / balance credits\n\
          \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\
          \x20 operator encrypt           Password-encrypt the operator secret at rest ($IICP_OPERATOR_PASSPHRASE)\n\
-         \x20 operator decrypt           Remove at-rest encryption of the operator secret\n\n\
+         \x20 operator decrypt           Remove at-rest encryption of the operator secret\n\
+         \x20 proxy                      Run the local OpenAI/Ollama/Anthropic compat gateway (loopback)\n\
+         \x20 help                       Print this help\n\n\
          Global flags:\n\
          \x20 --version, -V              Print version and exit\n\
          \x20 --help, -h                 Print this help\n\n\
@@ -141,19 +145,112 @@ fn print_help() {
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
          \x20 --force                    IICP_FORCE — take over the single-instance lock for this node_id\n\
          \x20 --backend-api-key KEY      IICP_BACKEND_API_KEY — Bearer key for an auth'd backend (LM Studio, hosted)\n\
-         \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup\n\
+         \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup (default on)\n\
+         \x20 --no-auto-detect-nat       disable NAT detection (overrides IICP_AUTO_DETECT_NAT)\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
+         \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
+         \x20 --with-proxy               IICP_WITH_PROXY — also run the compat proxy gateway (loopback 9483)\n\
          \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\n\
          query optional:\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
          \x20 --model NAME               Pin to a specific model on the remote node\n\
          \x20 --max-tokens N             Limit response length\n\
-         \x20 --timeout-ms N             Request timeout (default 60000)\n"
+         \x20 --timeout-ms N             Request timeout (default 60000)\n\n\
+         credits optional:\n\
+         \x20 --node NAME                Load saved node config (~/.iicp/nodes/<NAME>.json)\n\
+         \x20 --node-id ID               Node id to query (alternative to --node)\n\
+         \x20 --token T                  Node token (default $IICP_NODE_TOKEN or cached)\n\
+         \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 --json                     Emit the raw summary JSON\n\
+         \x20 --verify                   Cryptographically audit awards against the signed log\n\n\
+         proxy optional:\n\
+         \x20 --host HOST                IICP_PROXY_HOST (default 127.0.0.1)\n\
+         \x20 --port N                   IICP_PROXY_PORT (default 9483)\n\
+         \x20 --directory-url URL        IICP_DIRECTORY_URL\n\
+         \x20 --region REGION            IICP_PROXY_PREFERRED_REGION\n"
+    );
+}
+
+/// True when any arg is `-h`/`--help`. Per-subcommand handlers call this at the TOP,
+/// before their parse loop, so `--help` prints usage + exits 0 instead of erroring as
+/// an "unknown flag" (mirrors the `serve`/parse_args `--help` short-circuit).
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-h" || a == "--help")
+}
+
+fn print_query_help() {
+    print!(
+        "usage: iicp-node query <prompt> [options]\n\n\
+         Discover mesh nodes for an intent and submit a chat task.\n\n\
+         Options:\n\
+         \x20 --directory-url URL   IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 --intent URN          IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
+         \x20 --model NAME          Pin to a specific model on the remote node\n\
+         \x20 --max-tokens N        Limit response length\n\
+         \x20 --timeout-ms N        Request timeout (default 60000)\n\
+         \x20 -h, --help            Print this help\n"
+    );
+}
+
+fn print_credits_help() {
+    print!(
+        "usage: iicp-node credits [options]\n\n\
+         Show this node's earned / spent / balance from the directory's reconcile-checked\n\
+         summary. With no --node/--node-id, a single saved node (or `default`) is used.\n\n\
+         Options:\n\
+         \x20 --node NAME           Load saved node config (~/.iicp/nodes/<NAME>.json)\n\
+         \x20 --node-id ID          Node id to query (alternative to --node)\n\
+         \x20 --token T             Node token (default $IICP_NODE_TOKEN or cached)\n\
+         \x20 --directory-url URL   IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 --json                Emit the raw summary JSON\n\
+         \x20 --verify              Cryptographically audit awards against the signed log\n\
+         \x20 -h, --help            Print this help\n"
+    );
+}
+
+fn print_operator_help() {
+    print!(
+        "usage: iicp-node operator <subcommand> [options]\n\n\
+         Subcommands:\n\
+         \x20 rename <name>   Change your public display_name (signed by your operator key)\n\
+         \x20 encrypt         Password-encrypt the operator secret at rest ($IICP_OPERATOR_PASSPHRASE)\n\
+         \x20 decrypt         Remove at-rest encryption of the operator secret\n\n\
+         rename options:\n\
+         \x20 --directory-url URL   IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 -h, --help            Print this help\n"
+    );
+}
+
+fn print_proxy_help() {
+    print!(
+        "usage: iicp-node proxy [options]\n\n\
+         Run the local OpenAI/Ollama/Anthropic compat gateway on loopback. Consumer-side,\n\
+         no directory registration.\n\n\
+         Options:\n\
+         \x20 --host HOST           IICP_PROXY_HOST (default 127.0.0.1)\n\
+         \x20 --port N              IICP_PROXY_PORT (default 9483)\n\
+         \x20 --directory-url URL   IICP_DIRECTORY_URL\n\
+         \x20 --region REGION       IICP_PROXY_PREFERRED_REGION\n\
+         \x20 -h, --help            Print this help\n"
+    );
+}
+
+fn print_init_help() {
+    print!(
+        "usage: iicp-node init\n\n\
+         Interactive wizard — set up an operator identity and your first node config under\n\
+         ~/.iicp/. Takes no flags; run with no arguments to start the wizard.\n\n\
+         Options:\n\
+         \x20 -h, --help   Print this help (does NOT start the wizard)\n"
     );
 }
 
 async fn run_query(args: &[String]) -> Result<(), String> {
+    if wants_help(args) {
+        print_query_help();
+        return Ok(());
+    }
     // Collect positional args and flags
     let mut prompt = String::new();
     let mut directory_url =
@@ -437,12 +534,20 @@ async fn verify_credit_awards(
 /// `reconciles` flag flags a ledger that doesn't add up. `--verify` cryptographically audits
 /// each award against the directory's signed CREDIT_AWARD log.
 async fn run_credits(args: &[String]) -> Result<(), String> {
+    if wants_help(args) {
+        print_credits_help();
+        return Ok(());
+    }
     let mut node_name: Option<String> = None;
     let mut directory_url: Option<String> = None;
     let mut token: Option<String> = env::var("IICP_NODE_TOKEN").ok();
     let mut node_id: Option<String> = None;
     let mut as_json = false;
     let mut verify = false;
+
+    // Value-taking flags — anything else with a leading `-` is an unknown flag (not a
+    // "needs a value" error). This keeps `--bogus` honest (item 8).
+    const VALUE_FLAGS: &[&str] = &["--node", "--token", "--directory-url", "--node-id"];
 
     let mut i = 0;
     while i < args.len() {
@@ -457,6 +562,9 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                 i += 1;
             }
             _ if a.starts_with('-') => {
+                if !VALUE_FLAGS.contains(&a.as_str()) {
+                    return Err(format!("unknown flag: {a}"));
+                }
                 if i + 1 >= args.len() {
                     return Err(format!("flag {a} needs a value"));
                 }
@@ -466,11 +574,39 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                     "--token" => token = Some(v),
                     "--directory-url" => directory_url = Some(v),
                     "--node-id" => node_id = Some(v),
-                    _ => return Err(format!("unknown flag: {a}")),
+                    _ => unreachable!("VALUE_FLAGS guard above is exhaustive"),
                 }
                 i += 2;
             }
             _ => return Err(format!("unexpected argument: {a}")),
+        }
+    }
+
+    // No-arg UX (item 7): when neither --node nor --node-id was given, fall back to a
+    // single saved node (or one named `default`) so a bare `iicp-node credits` works.
+    if node_name.is_none() && node_id.is_none() {
+        let saved = list_nodes().unwrap_or_default();
+        let pick = if saved.len() == 1 {
+            Some(saved[0].name.clone())
+        } else {
+            saved
+                .iter()
+                .find(|n| n.name == "default")
+                .map(|n| n.name.clone())
+        };
+        match pick {
+            Some(name) => {
+                eprintln!("[iicp-node] no --node/--node-id given — using saved node '{name}'");
+                node_name = Some(name);
+            }
+            None if !saved.is_empty() => {
+                let names: Vec<&str> = saved.iter().map(|n| n.name.as_str()).collect();
+                return Err(format!(
+                    "node required: pass --node NAME or --node-id ID. Saved nodes: {}",
+                    names.join(", ")
+                ));
+            }
+            None => {} // no saved nodes — fall through to the node_id-required error below
         }
     }
 
@@ -625,6 +761,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         auto_detect_nat: std::env::var("IICP_AUTO_DETECT_NAT")
             .map(|v| v.to_lowercase() != "false" && v.to_lowercase() != "0")
             .unwrap_or(true),
+        no_auto_detect_nat: false,
         // Default to api.ipify.org so FRITZ!Box/CGNAT detection works out of the box.
         external_ip_probe_url: env_or("IICP_EXTERNAL_IP_PROBE_URL", None)
             .unwrap_or_else(|| "https://api.ipify.org".to_string()),
@@ -654,6 +791,13 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             }
             "--auto-detect-nat" => {
                 opts.auto_detect_nat = true;
+                i += 1;
+            }
+            // Explicit off-switch (parity with Python `--no-auto-detect-nat`). Overrides the
+            // env default; also prevents apply_saved_node from re-enabling it (see node_supplied).
+            "--no-auto-detect-nat" => {
+                opts.auto_detect_nat = false;
+                opts.no_auto_detect_nat = true;
                 i += 1;
             }
             _ => {
@@ -724,7 +868,8 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
             opts.host = saved.host.clone();
         }
     }
-    if !opts.auto_detect_nat {
+    // Saved-config may re-enable NAT detection only if the user did not explicitly disable it.
+    if !opts.auto_detect_nat && !opts.no_auto_detect_nat {
         opts.auto_detect_nat = saved.auto_detect_nat;
     }
     if opts.external_ip_probe_url.is_empty() {
@@ -1018,7 +1163,13 @@ fn ask(prompt: &str, fallback: &str) -> String {
     }
 }
 
-async fn run_init() -> Result<(), String> {
+async fn run_init(args: &[String]) -> Result<(), String> {
+    // Short-circuit `-h`/`--help` BEFORE touching ~/.iicp or prompting — otherwise
+    // `iicp-node init --help` would launch the wizard and prompt to overwrite configs.
+    if wants_help(args) {
+        print_init_help();
+        return Ok(());
+    }
     println!("iicp-node init — IICP Rust SDK");
     let dir = config_dir().map_err(|e| e.to_string())?;
     println!("Config dir: {}", dir.display());
@@ -1196,8 +1347,13 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         );
     }
 
+    // Did the operator name a saved node? (--node, or IICP_NODE_NAME env). Captured before
+    // apply_saved_node so the model-required guard below can tell "load from disk" apart from
+    // "serve a one-off node from flags".
+    let node_supplied = !opts.node.is_empty();
+
     // Load persisted node config if --node was provided.
-    if !opts.node.is_empty() {
+    if node_supplied {
         match load_node(&opts.node).map_err(|e| e.to_string())? {
             Some(saved) => apply_saved_node(&mut opts, &saved),
             None => {
@@ -1209,10 +1365,15 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
     }
 
-    // #410 — built-in fallback applied LAST (after flag/env/saved-config), so the
-    // Ollama default never shadows a saved-node backend_url.
+    // #410 — built-in fallback applied LAST (after flag/env/saved-config), so the default
+    // never shadows a saved-node backend_url. #414/C1 (parity with Python) — an `anthropic`
+    // backend defaults to the Anthropic API, not localhost Ollama.
     if opts.backend_url.is_empty() {
-        opts.backend_url = "http://localhost:11434".to_string();
+        opts.backend_url = if opts.backend_type == "anthropic" {
+            "https://api.anthropic.com".to_string()
+        } else {
+            "http://localhost:11434".to_string()
+        };
     }
 
     // Onboarding: if no --model given, auto-select the first model the backend advertises
@@ -1227,11 +1388,24 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             opts.model = first.clone();
         }
     }
-    if opts.backend_url.is_empty() || opts.model.is_empty() {
+    // A node MUST serve a concrete model. If we still have none and the operator didn't load
+    // a saved node, fail with a clear, actionable message rather than serving an empty model.
+    if opts.model.is_empty() {
+        if node_supplied {
+            return Err(format!(
+                "saved node '{}' has no model set, and the backend {} advertised none. Set --model NAME or re-run `iicp-node init`.",
+                opts.node, opts.backend_url
+            ));
+        }
         return Err(format!(
-            "no --model given and backend {} advertised no models. Pass --model NAME, or check the backend is running (e.g. `ollama pull qwen2.5:0.5b`).",
+            "--model NAME or --node NAME required: no model given and backend {} advertised none. \
+             Pass --model NAME, load a saved node with --node NAME, or check the backend is running \
+             (e.g. `ollama pull qwen2.5:0.5b`).",
             opts.backend_url
         ));
+    }
+    if opts.backend_url.is_empty() {
+        return Err("backend URL is empty — pass --backend-url URL or $IICP_BACKEND_URL".into());
     }
     if !BACKEND_TYPES.contains(&opts.backend_type.as_str()) {
         return Err(format!("--backend-type must be one of {BACKEND_TYPES:?}"));
@@ -1876,12 +2050,22 @@ fn run_operator_decrypt() -> Result<(), String> {
 }
 
 async fn run_operator(args: &[String]) -> Result<(), String> {
+    // `-h`/`--help` anywhere prints usage + exits 0 (covers the sub-dispatch too).
+    if wants_help(args) {
+        print_operator_help();
+        return Ok(());
+    }
     let sub = args.first().map(String::as_str).unwrap_or("");
     if sub == "encrypt" {
         return run_operator_encrypt();
     }
     if sub == "decrypt" {
         return run_operator_decrypt();
+    }
+    if sub.is_empty() {
+        // No subcommand — print usage rather than "unknown operator subcommand: " (item 8).
+        print_operator_help();
+        return Ok(());
     }
     if sub != "rename" {
         return Err(format!("unknown operator subcommand: {sub}"));
@@ -1969,6 +2153,10 @@ async fn run_operator(args: &[String]) -> Result<(), String> {
 // ── proxy (ADR-050) — local compat gateway; consumer, loopback, no registration ──
 #[cfg(feature = "proxy")]
 async fn run_proxy_cmd(args: &[String]) -> Result<(), String> {
+    if wants_help(args) {
+        print_proxy_help();
+        return Ok(());
+    }
     let mut host = env::var("IICP_PROXY_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
     let mut port: u16 = env::var("IICP_PROXY_PORT")
         .ok()
@@ -2015,8 +2203,9 @@ async fn run_proxy_cmd(args: &[String]) -> Result<(), String> {
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" {
+    if args.len() < 2 || args[1] == "--help" || args[1] == "-h" || args[1] == "help" {
         print_help();
+        // No args at all → usage error (exit 2). Explicit help request → success (exit 0).
         process::exit(if args.len() < 2 { 2 } else { 0 });
     }
     if args[1] == "--version" || args[1] == "-V" {
@@ -2025,7 +2214,7 @@ async fn main() {
     }
     let cmd = &args[1];
     if cmd == "init" {
-        if let Err(e) = run_init().await {
+        if let Err(e) = run_init(&args[2..]).await {
             eprintln!("ERROR: {e}");
             process::exit(1);
         }
@@ -2118,6 +2307,60 @@ mod tests {
         apply_saved_node(&mut opts, &saved);
         assert_eq!(opts.backend_url, "http://localhost:1234/v1");
         assert_eq!(opts.model, "qwen2.5-coder-14b-instruct-mlx");
+    }
+
+    // CLI-friction fixes — every command's `-h`/`--help` is detected before its parse loop.
+    #[test]
+    fn wants_help_detects_short_and_long() {
+        assert!(wants_help(&["-h".to_string()]));
+        assert!(wants_help(&["foo".to_string(), "--help".to_string()]));
+        assert!(!wants_help(&["foo".to_string(), "--bar".to_string()]));
+        assert!(!wants_help(&[]));
+    }
+
+    // --no-auto-detect-nat is parsed as an off-switch (parity with Python) and flips the
+    // env-default ON value to OFF, recording the explicit-disable marker.
+    #[test]
+    fn no_auto_detect_nat_flag_disables_and_marks() {
+        let opts = parse_args(&["--no-auto-detect-nat".to_string()]).unwrap();
+        assert!(!opts.auto_detect_nat);
+        assert!(opts.no_auto_detect_nat);
+    }
+
+    // A saved-node with auto_detect_nat=true must NOT re-enable detection once the operator
+    // explicitly passed --no-auto-detect-nat (the off-switch wins over saved config).
+    #[test]
+    fn explicit_no_auto_detect_nat_survives_saved_node() {
+        let mut opts = ServeOpts {
+            no_auto_detect_nat: true,
+            auto_detect_nat: false,
+            ..Default::default()
+        };
+        let saved = NodeIdentity {
+            auto_detect_nat: true,
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert!(
+            !opts.auto_detect_nat,
+            "explicit --no-auto-detect-nat must win over saved config"
+        );
+    }
+
+    // Without the off-switch, a saved-node CAN re-enable NAT detection (unchanged behavior).
+    #[test]
+    fn saved_node_reenables_auto_detect_nat_without_off_switch() {
+        let mut opts = ServeOpts {
+            no_auto_detect_nat: false,
+            auto_detect_nat: false,
+            ..Default::default()
+        };
+        let saved = NodeIdentity {
+            auto_detect_nat: true,
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert!(opts.auto_detect_nat);
     }
 
     // An explicit flag/env value (non-empty before apply_saved_node) must win.
