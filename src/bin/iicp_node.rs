@@ -105,6 +105,8 @@ struct ServeOpts {
     force: bool,
     /// #5 — Bearer key for an auth-requiring OpenAI-compat backend (LM Studio, hosted). Empty = none.
     backend_api_key: String,
+    /// ADR-050 2-C — also run the compat proxy gateway (loopback 9483) in this process.
+    with_proxy: bool,
 }
 
 fn print_help() {
@@ -630,6 +632,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         log_dir: env_or("IICP_LOG_DIR", None),
         force: env_bool("IICP_FORCE"),
         backend_api_key: env_or("IICP_BACKEND_API_KEY", Some("")).unwrap(),
+        with_proxy: env_bool("IICP_WITH_PROXY"),
     };
 
     let mut i = 0;
@@ -643,6 +646,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             }
             "--force" => {
                 opts.force = true;
+                i += 1;
+            }
+            "--with-proxy" => {
+                opts.with_proxy = true;
                 i += 1;
             }
             "--auto-detect-nat" => {
@@ -1151,6 +1158,42 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             allow_coordinator: true,
             ..Default::default()
         });
+    }
+
+    // ADR-050 2-C: co-host the compat proxy on loopback alongside the node, supervised
+    // so a proxy failure logs but never drops the network-facing node. Forced to 127.0.0.1.
+    if opts.with_proxy {
+        #[cfg(feature = "proxy")]
+        {
+            let pport: u16 = std::env::var("IICP_PROXY_PORT")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(9483);
+            let dir = opts.directory_url.clone();
+            let region = if opts.region.is_empty() {
+                None
+            } else {
+                Some(opts.region.clone())
+            };
+            println!("co-hosted proxy → http://127.0.0.1:{pport} (OpenAI/Ollama/Anthropic compat)");
+            tokio::spawn(async move {
+                if let Err(e) = iicp_client::proxy::run_proxy(iicp_client::proxy::ProxyConfig {
+                    host: "127.0.0.1".to_string(),
+                    port: pport,
+                    directory_url: Some(dir),
+                    region,
+                })
+                .await
+                {
+                    eprintln!("[iicp-node] co-hosted proxy error (node continues): {e}");
+                }
+            });
+        }
+        #[cfg(not(feature = "proxy"))]
+        eprintln!(
+            "[iicp-node] --with-proxy ignored: built without the proxy gateway. \
+             Reinstall with: cargo install iicp-client --features proxy"
+        );
     }
 
     // Load persisted node config if --node was provided.
