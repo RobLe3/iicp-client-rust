@@ -136,7 +136,7 @@ fn print_help() {
          \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp | anthropic (default openai_compat)\n\
          \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
-         \x20 --region REGION            IICP_REGION (default eu-central)\n\
+         \x20 --region REGION            IICP_REGION (e.g. us-east; unknown if unset)\n\
          \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
          \x20 --max-concurrent N         IICP_MAX_CONCURRENT (default 4)\n\
          \x20 --node-id ID               IICP_NODE_ID (auto-generated if absent)\n\
@@ -750,7 +750,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         model: env_or("IICP_BACKEND_MODEL", None).unwrap_or_default(),
         public_endpoint: env_or("IICP_PUBLIC_ENDPOINT", None).unwrap_or_default(),
         directory_url: env_or("IICP_DIRECTORY_URL", Some("https://iicp.network/api")).unwrap(),
-        region: env_or("IICP_REGION", Some("eu-central")).unwrap(),
+        region: env_or("IICP_REGION", Some("")).unwrap(),
         intent: env_or("IICP_INTENT", Some("urn:iicp:intent:llm:chat:v1")).unwrap(),
         max_concurrent: env_int("IICP_MAX_CONCURRENT", 4) as usize,
         node_id: env_or("IICP_NODE_ID", None).unwrap_or_default(),
@@ -847,7 +847,7 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
     if opts.directory_url == "https://iicp.network/api" {
         opts.directory_url = saved.directory_url.clone();
     }
-    if opts.region == "eu-central" {
+    if opts.region.is_empty() {
         opts.region = saved.region.clone();
     }
     if opts.intent == "urn:iicp:intent:llm:chat:v1" {
@@ -1211,7 +1211,7 @@ async fn run_init(args: &[String]) -> Result<(), String> {
     );
     let model = ask("Backend model", "qwen2.5:0.5b");
     let directory = ask("IICP directory URL", "https://iicp.network/api");
-    let region = ask("Region tag", "eu-central");
+    let region = ask("Region tag (e.g. us-east; blank = unknown)", "unknown");
     let intent = ask("Intent URN", "urn:iicp:intent:llm:chat:v1");
     let port_s = ask("Listen port", "9484");
     let port: u16 = port_s.parse().unwrap_or(9484);
@@ -1481,7 +1481,11 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         detect_backend_flavor(&opts.backend_url, &opts.backend_api_key, &opts.backend_type).await;
     eprintln!("[iicp-node] backend detected: {backend_flavor}");
     cfg.backend = Some(backend_flavor);
-    cfg.region = Some(opts.region.clone());
+    cfg.region = if opts.region.is_empty() {
+        None
+    } else {
+        Some(opts.region.clone())
+    };
     cfg.directory_url = opts.directory_url.clone();
     cfg.max_concurrent = opts.max_concurrent;
     if !opts.relay_worker_endpoint.is_empty() {
@@ -2307,6 +2311,39 @@ mod tests {
         apply_saved_node(&mut opts, &saved);
         assert_eq!(opts.backend_url, "http://localhost:1234/v1");
         assert_eq!(opts.model, "qwen2.5-coder-14b-instruct-mlx");
+    }
+
+    // region: an unset region (empty after parse) must restore the saved region and never
+    // silently register as "eu-central". Regression for the first external operator (@shaal:
+    // set us-east, the directory showed eu-central — --region defaulted to the truthy
+    // "eu-central", which both mislabeled non-EU operators and shadowed this restore). See #484.
+    #[test]
+    fn saved_region_applies_when_unset() {
+        let mut opts = ServeOpts::default(); // region == "" (the fix; parse default was "eu-central")
+        let saved = NodeIdentity {
+            region: "us-east".to_string(),
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert_eq!(
+            opts.region, "us-east",
+            "saved region must be restored when --region is unset"
+        );
+    }
+
+    // An explicit --region/IICP_REGION value must win over a saved region.
+    #[test]
+    fn explicit_region_overrides_saved() {
+        let mut opts = ServeOpts {
+            region: "us-west".to_string(),
+            ..Default::default()
+        };
+        let saved = NodeIdentity {
+            region: "us-east".to_string(),
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert_eq!(opts.region, "us-west");
     }
 
     // CLI-friction fixes — every command's `-h`/`--help` is detected before its parse loop.

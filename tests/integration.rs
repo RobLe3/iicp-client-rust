@@ -27,7 +27,10 @@ async fn live_discover_returns_routable_nodes() {
         .discover("urn:iicp:intent:llm:chat:v1", None, None)
         .await
         .expect("discover failed");
-    assert!(!nodes.nodes.is_empty(), "live directory returned no chat nodes");
+    assert!(
+        !nodes.nodes.is_empty(),
+        "live directory returned no chat nodes"
+    );
     assert!(
         nodes.nodes[0].endpoint.starts_with("http"),
         "node endpoint is not routable: {}",
@@ -45,7 +48,10 @@ async fn live_chat_returns_reply() {
                 role: "user".into(),
                 content: "Reply with the single word: OK".into(),
             }],
-            Some(ChatOptions { max_tokens: Some(16), ..Default::default() }),
+            Some(ChatOptions {
+                max_tokens: Some(16),
+                ..Default::default()
+            }),
         )
         .await
         .expect("chat failed");
