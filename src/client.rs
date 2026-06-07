@@ -45,6 +45,17 @@ fn is_ssrf_safe(url: &str) -> bool {
     if host.is_empty() {
         return false;
     }
+    // Dev/test escape hatch (default OFF): allow loopback/private node endpoints so a
+    // node + proxy can run on one host (local mesh) and for E2E tests. NEVER enable in
+    // production — it re-opens the SSRF surface this guard exists to close.
+    if matches!(
+        std::env::var("IICP_PROXY_ALLOW_LOOPBACK_NODES")
+            .as_deref()
+            .map(str::trim),
+        Ok("1") | Ok("true") | Ok("yes")
+    ) {
+        return true;
+    }
     if matches!(host, "localhost" | "0.0.0.0" | "::1" | "::") {
         return false;
     }
