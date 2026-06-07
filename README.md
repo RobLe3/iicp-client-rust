@@ -86,6 +86,25 @@ let node  = nodes.nodes.into_iter().next().expect("no nodes available");
 
 ---
 
+## Use as a local API proxy (OpenAI / Ollama / Anthropic compat)
+
+Run a local gateway that speaks the OpenAI, Ollama, and Anthropic HTTP APIs and routes
+every request across the IICP mesh — point any tool you already use at it, no code changes.
+
+```bash
+cargo install iicp-client --features proxy
+iicp-node proxy                       # → http://127.0.0.1:9483
+
+export OPENAI_BASE_URL=http://127.0.0.1:9483/v1   # OpenAI SDK / LangChain / Cursor / liteLLM
+export OLLAMA_HOST=http://127.0.0.1:9483          # Open WebUI / Continue.dev / aider / Jan
+```
+
+Loopback-only consumer (never registers with the directory). The proxy is behind the
+`proxy` Cargo feature (kept out of `default` so library builds stay lean). Override the
+port with `--port` / `IICP_PROXY_PORT`; co-host next to a node with
+`iicp-node serve --with-proxy`. Every response carries `Server: iicp-proxy`. Full guide:
+<https://iicp.network/docs/proxy>
+
 ## Configuration
 
 ```rust
