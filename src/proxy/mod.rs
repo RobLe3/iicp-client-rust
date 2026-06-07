@@ -24,14 +24,27 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use std::sync::LazyLock;
+
 use crate::client::IicpClient;
 use crate::errors::IicpError;
 use crate::types::{TaskRequest, TaskResponse};
+
+pub mod cip;
+use cip::{cip_config_from_env, compute_cip_envelope, CipConfig, CipError};
 
 const INTENT: &str = "urn:iicp:intent:llm:chat:v1";
 /// The proxy self-identifies as `iicp-proxy` on every response (Server header).
 const SERVER_ID: &str = "iicp-proxy";
 const OLLAMA_VERSION: &str = "0.1.0";
+/// CIP consumer config (env IICP_PROXY_CIP_*); enabled defaults OFF (§2.2 ¶1).
+static CIP_CONFIG: LazyLock<CipConfig> = LazyLock::new(cip_config_from_env);
+
+/// Dispatch error surfaced to the gateway — an IICP error or a CIP gating error.
+pub enum ProxyDispatchError {
+    Iicp(IicpError),
+    Cip(CipError),
+}
 
 /// Mockable IICP task surface — a boxed future avoids an `async-trait` dependency.
 pub trait ProxyBackend: Send + Sync {
@@ -39,7 +52,12 @@ pub trait ProxyBackend: Send + Sync {
         &self,
         intent: String,
         payload: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, IicpError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, ProxyDispatchError>> + Send + '_>>;
+
+    /// Discover nodes for CIP eligibility (used only when CIP is enabled). Default: none.
+    fn discover(&self, _intent: String) -> Pin<Box<dyn Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(async { Vec::new() })
+    }
 }
 
 impl ProxyBackend for IicpClient {
@@ -47,7 +65,7 @@ impl ProxyBackend for IicpClient {
         &self,
         intent: String,
         payload: Value,
-    ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, IicpError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, ProxyDispatchError>> + Send + '_>> {
         Box::pin(async move {
             self.submit(TaskRequest {
                 task_id: String::new(),
@@ -57,6 +75,26 @@ impl ProxyBackend for IicpClient {
                 auth: None,
             })
             .await
+            .map_err(ProxyDispatchError::Iicp)
+        })
+    }
+
+    fn discover(&self, intent: String) -> Pin<Box<dyn Future<Output = Vec<Value>> + Send + '_>> {
+        Box::pin(async move {
+            match self.discover(&intent, None, None).await {
+                Ok(list) => list
+                    .nodes
+                    .into_iter()
+                    .map(|n| {
+                        serde_json::json!({
+                            "node_id": n.node_id,
+                            "allow_remote_inference": n.cip_policy.map(|c| c.allow_remote_inference).unwrap_or(false),
+                            "reputation_score": n.score,
+                        })
+                    })
+                    .collect(),
+                Err(_) => Vec::new(),
+            }
         })
     }
 }
@@ -174,10 +212,36 @@ fn extras(body: &Value) -> serde_json::Map<String, Value> {
     m
 }
 
+fn cip_outcome(err: &CipError) -> Outcome {
+    match err {
+        CipError::InsufficientCredits(c) => Outcome::Err(StatusCode::PAYMENT_REQUIRED, c.clone()),
+        CipError::NoEligibleWorkers(c) => Outcome::Err(StatusCode::SERVICE_UNAVAILABLE, c.clone()),
+    }
+}
+
 async fn run_task(b: &Backend, messages: Value, model: &str, body: &Value) -> Outcome {
     let mut payload = json!({"messages": messages, "model": model});
     if let Some(obj) = payload.as_object_mut() {
         obj.extend(extras(body));
+    }
+    // CIP consumer gating (§2.2) — only when enabled; surfaces 402 (E036) / 503 (E022),
+    // else returns an envelope to attach. Pure consumer → Gate-4 local-first is skipped.
+    if CIP_CONFIG.enabled {
+        let nodes = b.discover(INTENT.to_string()).await;
+        let balance = body
+            .get("billing")
+            .and_then(|x| x.get("consumer_balance"))
+            .and_then(|v| v.as_f64());
+        let qos = body.get("qos").and_then(|q| q.as_str());
+        match compute_cip_envelope(&nodes, body, &CIP_CONFIG, "cip-task", qos, balance) {
+            Err(e) => return cip_outcome(&e),
+            Ok(Some(env)) => {
+                if let (Some(obj), Some(eo)) = (payload.as_object_mut(), env.as_object()) {
+                    obj.insert("cip".to_string(), Value::Object(eo.clone()));
+                }
+            }
+            Ok(None) => {}
+        }
     }
     match b.submit(INTENT.to_string(), payload).await {
         Ok(resp) if resp.status == "success" || resp.status == "completed" => Outcome::Ok(resp),
@@ -191,10 +255,11 @@ async fn run_task(b: &Backend, messages: Value, model: &str, body: &Value) -> Ou
                 .to_string();
             Outcome::Err(StatusCode::BAD_GATEWAY, code)
         }
-        Err(IicpError::NoNodes { .. }) => {
+        Err(ProxyDispatchError::Cip(e)) => cip_outcome(&e),
+        Err(ProxyDispatchError::Iicp(IicpError::NoNodes { .. })) => {
             Outcome::Err(StatusCode::BAD_GATEWAY, "IICP-E033".to_string())
         }
-        Err(e) => {
+        Err(ProxyDispatchError::Iicp(e)) => {
             // SDK-internal failures map to 502 with their code; truly unexpected → 500.
             let code = format!("{e}");
             if code.starts_with("SDK-") || code.starts_with("IICP-") {
@@ -405,7 +470,6 @@ pub async fn run_proxy(cfg: ProxyConfig) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     struct Mock {
         kind: String,
@@ -416,7 +480,8 @@ mod tests {
             &self,
             _intent: String,
             _payload: Value,
-        ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, IicpError>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, ProxyDispatchError>> + Send + '_>>
+        {
             let kind = self.kind.clone();
             let mut value = self.value.clone();
             Box::pin(async move {
@@ -428,9 +493,20 @@ mod tests {
                         }
                         Ok(serde_json::from_value::<TaskResponse>(value).unwrap())
                     }
-                    _ => Err(IicpError::NoNodes {
+                    "raise" => {
+                        // value e.g. "CIPInsufficientCredits:IICP-E036" — simulate the CIP
+                        // gate raising; the gateway maps it to 402/503.
+                        let v = value.as_str().unwrap_or("");
+                        let (name, code) = v.split_once(':').unwrap_or((v, ""));
+                        let code = code.to_string();
+                        Err(ProxyDispatchError::Cip(match name {
+                            "CIPInsufficientCredits" => CipError::InsufficientCredits(code),
+                            _ => CipError::NoEligibleWorkers(code),
+                        }))
+                    }
+                    _ => Err(ProxyDispatchError::Iicp(IicpError::NoNodes {
                         intent: INTENT.to_string(),
-                    }),
+                    })),
                 }
             })
         }
@@ -455,21 +531,11 @@ mod tests {
             "/tests/proxy_fixtures.json"
         ));
         let fixtures: Value = serde_json::from_str(raw).unwrap();
-        // CIP gating (402/503) needs the CIP-dispatch port — out of scope for the v1 gateway (#482).
-        let cip_skip: HashSet<&str> = [
-            "openai_insufficient_credits",
-            "openai_no_eligible_workers",
-            "ollama_insufficient_credits",
-            "anthropic_no_eligible_workers",
-        ]
-        .into_iter()
-        .collect();
+        // All 18 fixtures run — CIP gating (402/503) is ported (cip.rs); the "raise" mock
+        // drives the 4 CIP cases through the gateway's error mapping.
 
         for case in fixtures["cases"].as_array().unwrap() {
             let name = case["name"].as_str().unwrap();
-            if cip_skip.contains(name) {
-                continue;
-            }
             let m = &case["mock"];
             let backend: Backend = Arc::new(Mock {
                 kind: m["kind"].as_str().unwrap_or("none").to_string(),
