@@ -284,7 +284,7 @@ fn default_intent() -> String {
     "urn:iicp:intent:llm:chat:v1".to_string()
 }
 fn default_region() -> String {
-    "eu-central".to_string()
+    "unknown".to_string()
 }
 fn default_directory_url() -> String {
     "https://iicp.network/api".to_string()
@@ -494,5 +494,22 @@ mod operator_identity_tests {
         let back = enc.decrypt_at_rest("s3cret").unwrap();
         assert!(!back.is_encrypted());
         assert_eq!(back.operator_secret, op.operator_secret);
+    }
+}
+
+#[cfg(test)]
+mod node_identity_tests {
+    use super::NodeIdentity;
+
+    #[test]
+    fn node_identity_region_default_is_unknown() {
+        // NodeIdentity loaded from a config file missing the `region` field must
+        // default to "unknown", not "eu-central" (#484). Fails without the fix.
+        let json = r#"{"node_id":"n1","operator_id":"o1","name":"test","backend_url":"http://x","model":"llama3","created_at":"2026-01-01T00:00:00Z"}"#;
+        let identity: NodeIdentity = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            identity.region, "unknown",
+            "missing region field must default to 'unknown', not 'eu-central' (#484)"
+        );
     }
 }

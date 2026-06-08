@@ -892,7 +892,7 @@ impl IicpNode {
             .cfg
             .region
             .clone()
-            .unwrap_or_else(|| "eu-central".to_string());
+            .unwrap_or_else(|| "unknown".to_string());
 
         let mut payload = json!({
             "endpoint": self.cfg.endpoint,
