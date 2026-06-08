@@ -527,6 +527,99 @@ async fn verify_credit_awards(
     Ok((verified_sum, verified, failed))
 }
 
+/// Shared fetch+display logic for one node's credits summary.
+async fn fetch_and_display_credits(
+    directory_url: &str,
+    node_id: &str,
+    token: &str,
+    label: &str,
+    as_json: bool,
+    verify: bool,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+
+    let url = format!("{}/v1/credits/summary", directory_url.trim_end_matches('/'));
+    let resp = client
+        .get(&url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("X-Node-Id", node_id)
+        .send()
+        .await
+        .map_err(|e| format!("request failed: {e}"))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("bad response: {e}"))?;
+
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("request rejected");
+        return Err(format!("HTTP {status}: {msg}"));
+    }
+
+    if as_json {
+        println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        return Ok(());
+    }
+
+    let num = |k: &str| body.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let earned = num("total_earned");
+    let spent = num("total_spent");
+    let balance = num("balance");
+    let tx = body.get("tx_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let reconciles = body.get("reconciles").and_then(|v| v.as_bool()).unwrap_or(false);
+    let tpc = body.get("tokens_per_credit").and_then(|v| v.as_u64()).unwrap_or(1000);
+
+    println!("IICP credits — {label}");
+    println!("  Earned (income)   {earned:>12.3}");
+    println!("  Spent             {spent:>12.3}");
+    println!("  ─────────────────────────────");
+    let check = if reconciles { "✓ reconciles" } else { "✗ DOES NOT RECONCILE" };
+    println!(
+        "  Balance           {balance:>12.3}   {check}   (≈ {} tokens)",
+        (balance * tpc as f64) as i64
+    );
+    println!("  {tx} transactions · `iicp-node credits --json` for raw");
+    if !reconciles {
+        eprintln!(
+            "[iicp-node] WARNING: balance != earned − spent — the ledger does not reconcile; do not trust these figures."
+        );
+    }
+    if verify {
+        let (vsum, vcount, vfailed) = verify_credit_awards(directory_url, node_id).await?;
+        println!("  ── cryptographic verification (signed CREDIT_AWARD log) ──");
+        if vfailed > 0 {
+            eprintln!(
+                "[iicp-node] ✗ {vfailed} award event(s) FAILED Ed25519 verification — tampered or \
+                 inconsistent event log. Do NOT trust these figures."
+            );
+            return Err(format!("{vfailed} CREDIT_AWARD signature(s) failed verification"));
+        }
+        println!(
+            "  ✓ {vcount} award(s) cryptographically verified · {vsum:.3} credits (Ed25519, signed by the directory)"
+        );
+        let free_tier = earned - vsum;
+        if free_tier > 0.0001 {
+            println!(
+                "  · {free_tier:.3} credits are free-tier allocation (directory-granted, not signed task awards)"
+            );
+        } else if vsum > earned + 0.0001 {
+            eprintln!(
+                "[iicp-node] WARNING: verified awards ({vsum:.3}) exceed the summary's total_earned ({earned:.3}) — inconsistent; investigate."
+            );
+        }
+    }
+    Ok(())
+}
+
 /// `iicp-node credits [--node NAME] [--token T] [--directory-url U] [--json] [--verify]`
 /// — show this node's lifetime earned / spent / balance from the directory's
 /// reconcile-checked GET /v1/credits/summary (#456). The displayed figures come from the
@@ -608,14 +701,28 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                             Some(with_token[0].name.clone())
                         }
                         _ => {
-                            let names: Vec<&str> =
-                                with_token.iter().map(|n| n.name.as_str()).collect();
-                            return Err(format!(
-                                "'{}' has no cached token. Pass --node <NAME>.\n  \
-                                 Nodes with a cached token: {}",
-                                d.name,
-                                names.join(", ")
-                            ));
+                            // Multiple nodes have cached tokens — show all of them.
+                            let multi: Vec<(String, String, String)> = with_token
+                                .iter()
+                                .map(|n| (
+                                    n.name.clone(),
+                                    n.node_id.clone(),
+                                    n.node_token.clone().unwrap_or_default(),
+                                ))
+                                .collect();
+                            let dir = directory_url.take().unwrap_or_else(|| {
+                                env::var("IICP_DIRECTORY_URL")
+                                    .unwrap_or_else(|_| "https://iicp.network/api".to_string())
+                            });
+                            eprintln!(
+                                "[iicp-node] no --node given — showing credits for all {} nodes:",
+                                multi.len()
+                            );
+                            for (i, (name, nid, tok)) in multi.iter().enumerate() {
+                                if i > 0 { println!(); }
+                                fetch_and_display_credits(&dir, nid, tok, name, as_json, verify).await?;
+                            }
+                            return Ok(());
                         }
                     }
                 }
@@ -664,107 +771,8 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
         "no node_token — run `iicp-node serve` once (it caches the token), or pass --token / $IICP_NODE_TOKEN",
     )?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("client: {e}"))?;
-
-    let url = format!("{}/v1/credits/summary", directory_url.trim_end_matches('/'));
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .header("X-Node-Id", &node_id)
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-
-    let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("bad response: {e}"))?;
-
-    if !status.is_success() {
-        let msg = body
-            .get("error")
-            .and_then(|e| e.get("message"))
-            .and_then(|m| m.as_str())
-            .unwrap_or("request rejected");
-        return Err(format!("HTTP {status}: {msg}"));
-    }
-
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&body).unwrap_or_default()
-        );
-        return Ok(());
-    }
-
-    let num = |k: &str| body.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let earned = num("total_earned");
-    let spent = num("total_spent");
-    let balance = num("balance");
-    let tx = body.get("tx_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let reconciles = body
-        .get("reconciles")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let tpc = body
-        .get("tokens_per_credit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1000);
-
-    println!(
-        "IICP credits — {}",
-        node_name.as_deref().unwrap_or(&node_id)
-    );
-    println!("  Earned (income)   {earned:>12.3}");
-    println!("  Spent             {spent:>12.3}");
-    println!("  ─────────────────────────────");
-    let check = if reconciles {
-        "✓ reconciles"
-    } else {
-        "✗ DOES NOT RECONCILE"
-    };
-    println!(
-        "  Balance           {balance:>12.3}   {check}   (≈ {} tokens)",
-        (balance * tpc as f64) as i64
-    );
-    println!("  {tx} transactions · `iicp-node credits --json` for raw");
-    if !reconciles {
-        eprintln!(
-            "[iicp-node] WARNING: balance != earned − spent — the ledger does not reconcile; do not trust these figures."
-        );
-    }
-    if verify {
-        let (vsum, vcount, vfailed) = verify_credit_awards(&directory_url, &node_id).await?;
-        println!("  ── cryptographic verification (signed CREDIT_AWARD log) ──");
-        if vfailed > 0 {
-            eprintln!(
-                "[iicp-node] ✗ {vfailed} award event(s) FAILED Ed25519 verification — tampered or \
-                 inconsistent event log. Do NOT trust these figures."
-            );
-            return Err(format!(
-                "{vfailed} CREDIT_AWARD signature(s) failed verification"
-            ));
-        }
-        println!(
-            "  ✓ {vcount} award(s) cryptographically verified · {vsum:.3} credits (Ed25519, signed by the directory)"
-        );
-        let free_tier = earned - vsum;
-        if free_tier > 0.0001 {
-            println!(
-                "  · {free_tier:.3} credits are free-tier allocation (directory-granted, not signed task awards)"
-            );
-        } else if vsum > earned + 0.0001 {
-            eprintln!(
-                "[iicp-node] WARNING: verified awards ({vsum:.3}) exceed the summary's total_earned ({earned:.3}) — inconsistent; investigate."
-            );
-        }
-    }
-
-    Ok(())
+    let label = node_name.as_deref().unwrap_or(&node_id).to_string();
+    fetch_and_display_credits(&directory_url, &node_id, &token, &label, as_json, verify).await
 }
 
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
