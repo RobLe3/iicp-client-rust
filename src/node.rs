@@ -926,6 +926,10 @@ impl IicpNode {
         }
         payload["sdk_language"] = json!("rust");
         payload["sdk_version"] = json!(env!("CARGO_PKG_VERSION"));
+        if self.cfg.relay_capable {
+            payload["relay_capable"] = json!(true);
+            payload["relay_accept_port"] = json!(self.cfg.relay_accept_port);
+        }
         if let Some(b) = &self.cfg.backend {
             payload["backend"] = json!(b);
         }

@@ -640,3 +640,39 @@ async fn test_register_legacy_capabilities_folds_into_models() {
     // Verify the mock fired exactly once (= our body matched).
     _m.assert_async().await;
 }
+
+/// WQ-066 (0.7.45) — relay_capable=true must appear in the register payload so
+/// the directory can surface it in /v1/discover. Pre-fix: the Rust SDK wired
+/// relay_capable to the serve() relay server but never included it in the
+/// registration JSON → the directory always saw relay_capable=false.
+#[tokio::test]
+async fn test_register_payload_includes_relay_capable() {
+    use mockito::{Matcher, Server};
+
+    let mut server = Server::new_async().await;
+    let _m = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "relay_capable": true,
+            "relay_accept_port": 9490
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(json!({ "node_token": "tok-r", "node_id": "n-r" }).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-r",
+        "https://relay.example.com:9484",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("llama-3-8b".into());
+    cfg.relay_capable = true;
+    cfg.relay_accept_port = 9490;
+    let node = IicpNode::new(cfg);
+    node.register().await.unwrap();
+    _m.assert_async().await;
+}
