@@ -584,15 +584,43 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
 
     // No-arg UX (item 7): when neither --node nor --node-id was given, fall back to a
     // single saved node (or one named `default`) so a bare `iicp-node credits` works.
+    // If 'default' exists but has no cached token, auto-fall-through to the sole node
+    // with a token rather than failing with a confusing "run serve" error.
     if node_name.is_none() && node_id.is_none() {
         let saved = list_nodes().unwrap_or_default();
-        let pick = if saved.len() == 1 {
+        let pick: Option<String> = if saved.len() == 1 {
             Some(saved[0].name.clone())
         } else {
-            saved
-                .iter()
-                .find(|n| n.name == "default")
-                .map(|n| n.name.clone())
+            let default_node = saved.iter().find(|n| n.name == "default");
+            match default_node {
+                Some(d) if d.node_token.is_some() => Some(d.name.clone()),
+                Some(d) => {
+                    // Default exists but has no cached token — prefer a node that does.
+                    let with_token: Vec<_> =
+                        saved.iter().filter(|n| n.node_token.is_some()).collect();
+                    match with_token.len() {
+                        0 => Some(d.name.clone()), // fall through; "run serve" error fires below
+                        1 => {
+                            eprintln!(
+                                "[iicp-node] '{}' has no cached token — using '{}' instead",
+                                d.name, with_token[0].name
+                            );
+                            Some(with_token[0].name.clone())
+                        }
+                        _ => {
+                            let names: Vec<&str> =
+                                with_token.iter().map(|n| n.name.as_str()).collect();
+                            return Err(format!(
+                                "'{}' has no cached token. Pass --node <NAME>.\n  \
+                                 Nodes with a cached token: {}",
+                                d.name,
+                                names.join(", ")
+                            ));
+                        }
+                    }
+                }
+                None => None,
+            }
         };
         match pick {
             Some(name) => {
