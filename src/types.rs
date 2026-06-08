@@ -11,16 +11,25 @@ pub struct ClientConfig {
     pub node_token: Option<String>,
     /// IICP-CX S.16: encrypt task payloads when the node advertises cx_public_key. Default: false.
     pub use_confidentiality: bool,
+    /// ε-greedy exploration probability for provider selection (R4). Default: 0.05.
+    /// Override with IICP_ROUTING_EPSILON env var. Set to 0.0 to disable.
+    pub routing_epsilon: f64,
 }
 
 impl Default for ClientConfig {
     fn default() -> Self {
+        let epsilon = std::env::var("IICP_ROUTING_EPSILON")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(0.05);
         Self {
             directory_url: "https://iicp.network/api".into(),
             timeout_ms: 30_000,
             region: None,
             node_token: None,
             use_confidentiality: false,
+            routing_epsilon: epsilon,
         }
     }
 }

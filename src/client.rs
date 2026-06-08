@@ -2,6 +2,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
+use rand::Rng;
 use regex::Regex;
 
 use crate::confidentiality::encrypt_payload;
@@ -160,8 +161,8 @@ impl IicpClient {
 
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
         let nodes = self.discover(&request.intent, None, Some(&tp)).await?;
-        // Collect up to MAX_RETRIES candidates — fall back to the next on connection errors.
-        let candidates: Vec<_> = nodes
+        // Filter to safe, available nodes before candidate selection.
+        let safe_nodes: Vec<_> = nodes
             .nodes
             .into_iter()
             .filter(|n| {
@@ -177,8 +178,30 @@ impl IicpClient {
                 }
             })
             .filter(|n| n.available)
-            .take(MAX_RETRIES as usize)
             .collect();
+
+        // ε-greedy provider selection (R4): with probability ε pick a random node
+        // from the full set; otherwise use the directory-sorted top pick.
+        let candidates: Vec<_> = {
+            let mut rng = rand::thread_rng();
+            let epsilon = self.config.routing_epsilon;
+            if safe_nodes.len() > 1 && rng.gen::<f64>() < epsilon {
+                let explore_idx = rng.gen_range(0..safe_nodes.len());
+                let explore_node = safe_nodes[explore_idx].clone();
+                let mut c = vec![explore_node.clone()];
+                c.extend(
+                    safe_nodes
+                        .iter()
+                        .take(MAX_RETRIES as usize)
+                        .filter(|n| n.node_id != explore_node.node_id)
+                        .take(MAX_RETRIES as usize - 1)
+                        .cloned(),
+                );
+                c
+            } else {
+                safe_nodes.into_iter().take(MAX_RETRIES as usize).collect()
+            }
+        };
 
         if candidates.is_empty() {
             return Err(IicpError::NoNodes {
