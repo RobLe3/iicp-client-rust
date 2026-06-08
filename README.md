@@ -20,7 +20,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.40"
+iicp-client = "0.7.42"
 ```
 
 To run a provider node from the command line, install the `iicp-node` binary:
@@ -124,6 +124,7 @@ let config = ClientConfig {
 | `timeout_ms` | `30000` | Request timeout — max 120 000 ms |
 | `region` | `None` | Preferred node region |
 | `node_token` | `None` | Bearer token for authenticated nodes |
+| `routing_epsilon` | `0.05` | ε-greedy exploration probability — with this probability a random node is selected instead of the top-ranked one, promoting discovery of new providers; `0.0` disables; override with `IICP_ROUTING_EPSILON` |
 
 ---
 
