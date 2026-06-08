@@ -102,6 +102,8 @@ struct ServeOpts {
     no_auto_detect_nat: bool,
     external_ip_probe_url: String,
     relay_worker_endpoint: String,
+    relay_capable: bool,
+    relay_accept_port: u16,
     log_dir: Option<String>,
     /// #405 — take over the per-node_id single-instance lock if another process holds it.
     force: bool,
@@ -149,6 +151,8 @@ fn print_help() {
          \x20 --no-auto-detect-nat       disable NAT detection (overrides IICP_AUTO_DETECT_NAT)\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
+         \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
+         \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485)\n\
          \x20 --with-proxy               IICP_WITH_PROXY — also run the compat proxy gateway (loopback 9483)\n\
          \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\n\
          query optional:\n\
@@ -802,6 +806,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         external_ip_probe_url: env_or("IICP_EXTERNAL_IP_PROBE_URL", None)
             .unwrap_or_else(|| "https://api.ipify.org".to_string()),
         relay_worker_endpoint: env_or("IICP_RELAY_WORKER_ENDPOINT", None).unwrap_or_default(),
+        relay_capable: env_bool("IICP_RELAY_CAPABLE"),
+        relay_accept_port: env_or("IICP_RELAY_ACCEPT_PORT", None)
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(9485),
         log_dir: env_or("IICP_LOG_DIR", None),
         force: env_bool("IICP_FORCE"),
         backend_api_key: env_or("IICP_BACKEND_API_KEY", Some("")).unwrap(),
@@ -823,6 +831,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             }
             "--with-proxy" => {
                 opts.with_proxy = true;
+                i += 1;
+            }
+            "--relay-capable" => {
+                opts.relay_capable = true;
                 i += 1;
             }
             "--auto-detect-nat" => {
@@ -860,6 +872,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     "--host" => opts.host = v,
                     "--external-ip-probe-url" => opts.external_ip_probe_url = v,
                     "--relay-worker-endpoint" => opts.relay_worker_endpoint = v,
+                    "--relay-accept-port" => {
+                        opts.relay_accept_port =
+                            v.parse().map_err(|e| format!("--relay-accept-port: {e}"))?
+                    }
                     "--log-dir" => opts.log_dir = Some(v),
                     _ => return Err(format!("unknown flag: {arg}")),
                 }
@@ -1526,6 +1542,10 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     cfg.max_concurrent = opts.max_concurrent;
     if !opts.relay_worker_endpoint.is_empty() {
         cfg.relay_worker_endpoint = Some(opts.relay_worker_endpoint.clone());
+    }
+    if opts.relay_capable {
+        cfg.relay_capable = true;
+        cfg.relay_accept_port = opts.relay_accept_port;
     }
     // #463/#464 — bind the operator identity: issue a delegation FROM the (key-backed) operator
     // identity for this node and advertise the public display_name. The directory verifies the
@@ -2597,5 +2617,33 @@ mod tests {
             failed2 >= 1,
             "a tampered amount must count as a failed signature"
         );
+    }
+
+    // WQ-066 — `--relay-capable` flag (0.7.45):
+    // Pre-fix: the flag was unregistered → "unknown flag" error.
+    // Post-fix: parse_args must accept it and set relay_capable=true.
+    #[test]
+    fn relay_capable_flag_parses() {
+        let opts = parse_args(&["--relay-capable".to_string()]).unwrap();
+        assert!(opts.relay_capable, "--relay-capable must set relay_capable=true");
+    }
+
+    #[test]
+    fn relay_capable_default_false() {
+        let opts = parse_args(&[]).unwrap();
+        assert!(!opts.relay_capable, "relay_capable must default to false");
+    }
+
+    #[test]
+    fn relay_accept_port_flag_parses() {
+        let opts =
+            parse_args(&["--relay-accept-port".to_string(), "9490".to_string()]).unwrap();
+        assert_eq!(opts.relay_accept_port, 9490, "--relay-accept-port must set the port");
+    }
+
+    #[test]
+    fn relay_accept_port_default() {
+        let opts = parse_args(&[]).unwrap();
+        assert_eq!(opts.relay_accept_port, 9485, "relay_accept_port must default to 9485");
     }
 }
