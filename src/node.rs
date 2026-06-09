@@ -548,7 +548,10 @@ fn canonical_json_node(v: &serde_json::Value) -> String {
         Value::Array(arr) => {
             format!(
                 "[{}]",
-                arr.iter().map(canonical_json_node).collect::<Vec<_>>().join(",")
+                arr.iter()
+                    .map(canonical_json_node)
+                    .collect::<Vec<_>>()
+                    .join(",")
             )
         }
         other => serde_json::to_string(other).unwrap_or_default(),
@@ -559,6 +562,7 @@ fn canonical_json_node(v: &serde_json::Value) -> String {
 /// Server-side credit award path: the node reports completion directly so the directory
 /// credits the provider wallet without requiring the consumer or proxy to forward a receipt.
 /// Fire-and-forget — called via `tokio::spawn`, never delays the task response.
+#[allow(clippy::too_many_arguments)]
 async fn post_cip_receipt(
     http: reqwest::Client,
     directory_url: String,
@@ -598,10 +602,7 @@ async fn post_cip_receipt(
     mac.update(canonical.as_bytes());
     let signature = hex::encode(mac.finalize().into_bytes());
 
-    let url = format!(
-        "{}/v1/credits/award",
-        directory_url.trim_end_matches('/')
-    );
+    let url = format!("{}/v1/credits/award", directory_url.trim_end_matches('/'));
     let _ = http
         .post(&url)
         .header("Authorization", format!("Bearer {token}"))
@@ -1884,10 +1885,12 @@ mod operator_wiring_tests {
         let node_id = "node-receipt-test";
         let tokens_used = 75u64;
 
-        let m = server.mock("POST", "/api/v1/credits/award")
+        let m = server
+            .mock("POST", "/api/v1/credits/award")
             .with_status(200)
             .with_body("{}")
-            .create_async().await;
+            .create_async()
+            .await;
 
         let result = serde_json::json!({"content": "hello world"});
         post_cip_receipt(
@@ -1899,7 +1902,8 @@ mod operator_wiring_tests {
             task_id.to_string(),
             tokens_used,
             result.clone(),
-        ).await;
+        )
+        .await;
 
         m.assert_async().await;
 
@@ -1918,7 +1922,11 @@ mod operator_wiring_tests {
         // Verify response_hash formula: SHA-256 of canonical JSON of result.
         let result_bytes = canonical_json_node(&result).into_bytes();
         let hash = hex::encode(Sha256::digest(&result_bytes));
-        assert_eq!(hash.len(), 64, "response_hash must be a 64-char hex SHA-256");
+        assert_eq!(
+            hash.len(),
+            64,
+            "response_hash must be a 64-char hex SHA-256"
+        );
         assert!(!hash.chars().any(|c| !c.is_ascii_hexdigit()), "must be hex");
     }
 }

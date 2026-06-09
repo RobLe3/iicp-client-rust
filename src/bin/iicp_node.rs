@@ -226,6 +226,7 @@ fn print_operator_help() {
     );
 }
 
+#[allow(dead_code)] // only called inside #[cfg(feature = "proxy")] blocks
 fn print_proxy_help() {
     print!(
         "usage: iicp-node proxy [options]\n\n\
@@ -573,7 +574,10 @@ async fn fetch_and_display_credits(
     }
 
     if as_json {
-        println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&body).unwrap_or_default()
+        );
         return Ok(());
     }
 
@@ -582,14 +586,24 @@ async fn fetch_and_display_credits(
     let spent = num("total_spent");
     let balance = num("balance");
     let tx = body.get("tx_count").and_then(|v| v.as_u64()).unwrap_or(0);
-    let reconciles = body.get("reconciles").and_then(|v| v.as_bool()).unwrap_or(false);
-    let tpc = body.get("tokens_per_credit").and_then(|v| v.as_u64()).unwrap_or(1000);
+    let reconciles = body
+        .get("reconciles")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tpc = body
+        .get("tokens_per_credit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000);
 
     println!("IICP credits — {label}");
     println!("  Earned (income)   {earned:>12.3}");
     println!("  Spent             {spent:>12.3}");
     println!("  ─────────────────────────────");
-    let check = if reconciles { "✓ reconciles" } else { "✗ DOES NOT RECONCILE" };
+    let check = if reconciles {
+        "✓ reconciles"
+    } else {
+        "✗ DOES NOT RECONCILE"
+    };
     println!(
         "  Balance           {balance:>12.3}   {check}   (≈ {} tokens)",
         (balance * tpc as f64) as i64
@@ -608,7 +622,9 @@ async fn fetch_and_display_credits(
                 "[iicp-node] ✗ {vfailed} award event(s) FAILED Ed25519 verification — tampered or \
                  inconsistent event log. Do NOT trust these figures."
             );
-            return Err(format!("{vfailed} CREDIT_AWARD signature(s) failed verification"));
+            return Err(format!(
+                "{vfailed} CREDIT_AWARD signature(s) failed verification"
+            ));
         }
         println!(
             "  ✓ {vcount} award(s) cryptographically verified · {vsum:.3} credits (Ed25519, signed by the directory)"
@@ -711,11 +727,13 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                             // Multiple nodes have cached tokens — show all of them.
                             let multi: Vec<(String, String, String)> = with_token
                                 .iter()
-                                .map(|n| (
-                                    n.name.clone(),
-                                    n.node_id.clone(),
-                                    n.node_token.clone().unwrap_or_default(),
-                                ))
+                                .map(|n| {
+                                    (
+                                        n.name.clone(),
+                                        n.node_id.clone(),
+                                        n.node_token.clone().unwrap_or_default(),
+                                    )
+                                })
                                 .collect();
                             let dir = directory_url.take().unwrap_or_else(|| {
                                 env::var("IICP_DIRECTORY_URL")
@@ -726,8 +744,11 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                                 multi.len()
                             );
                             for (i, (name, nid, tok)) in multi.iter().enumerate() {
-                                if i > 0 { println!(); }
-                                fetch_and_display_credits(&dir, nid, tok, name, as_json, verify).await?;
+                                if i > 0 {
+                                    println!();
+                                }
+                                fetch_and_display_credits(&dir, nid, tok, name, as_json, verify)
+                                    .await?;
                             }
                             return Ok(());
                         }
@@ -2560,9 +2581,12 @@ mod tests {
             }
         });
         let args: Vec<String> = vec![
-            "--node-id".into(), "test-node-abc".into(),
-            "--token".into(), "tok".into(),
-            "--directory-url".into(), format!("http://127.0.0.1:{port}"),
+            "--node-id".into(),
+            "test-node-abc".into(),
+            "--token".into(),
+            "tok".into(),
+            "--directory-url".into(),
+            format!("http://127.0.0.1:{port}"),
         ];
         let _ = run_credits(&args).await;
         let req = captured.lock().unwrap().clone();
@@ -2671,7 +2695,10 @@ mod tests {
     #[test]
     fn relay_capable_flag_parses() {
         let opts = parse_args(&["--relay-capable".to_string()]).unwrap();
-        assert!(opts.relay_capable, "--relay-capable must set relay_capable=true");
+        assert!(
+            opts.relay_capable,
+            "--relay-capable must set relay_capable=true"
+        );
     }
 
     #[test]
@@ -2682,14 +2709,19 @@ mod tests {
 
     #[test]
     fn relay_accept_port_flag_parses() {
-        let opts =
-            parse_args(&["--relay-accept-port".to_string(), "9490".to_string()]).unwrap();
-        assert_eq!(opts.relay_accept_port, 9490, "--relay-accept-port must set the port");
+        let opts = parse_args(&["--relay-accept-port".to_string(), "9490".to_string()]).unwrap();
+        assert_eq!(
+            opts.relay_accept_port, 9490,
+            "--relay-accept-port must set the port"
+        );
     }
 
     #[test]
     fn relay_accept_port_default() {
         let opts = parse_args(&[]).unwrap();
-        assert_eq!(opts.relay_accept_port, 9485, "relay_accept_port must default to 9485");
+        assert_eq!(
+            opts.relay_accept_port, 9485,
+            "relay_accept_port must default to 9485"
+        );
     }
 }
