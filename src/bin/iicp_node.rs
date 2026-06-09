@@ -1629,6 +1629,17 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 .cloned(),
         }));
     }
+    // TC-9c — pre-load saved HMAC key so CIPWorkerReceipts work immediately on restart
+    // without waiting for the first re-registration cycle.
+    if !opts.node.is_empty() {
+        if let Ok(Some(ni)) = load_node(&opts.node) {
+            if let Some(k) = ni.node_hmac_key {
+                if !k.is_empty() {
+                    cfg.node_hmac_key = k;
+                }
+            }
+        }
+    }
     // Capture before cfg is consumed by IicpNode::new.
     let resolved_log_dir = cfg.log_dir.clone();
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
@@ -1860,11 +1871,16 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                             &format!("endpoint={}", opts.public_endpoint),
                         );
                     }
-                    // #456 — cache the token in the saved config so `iicp-node credits`
-                    // can authenticate later without re-registering (best-effort).
+                    // #456 / TC-9c — cache token + HMAC key in the saved config so
+                    // `iicp-node credits` can authenticate and CIPWorkerReceipts work
+                    // immediately on restart (best-effort).
                     if !opts.node.is_empty() {
                         if let Ok(Some(mut ni)) = load_node(&opts.node) {
                             ni.node_token = Some(t.clone());
+                            let hmac_key = node.node_hmac_key();
+                            if !hmac_key.is_empty() {
+                                ni.node_hmac_key = Some(hmac_key);
+                            }
                             let _ = save_node(&ni);
                         }
                     }
