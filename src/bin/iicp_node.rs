@@ -545,11 +545,14 @@ async fn fetch_and_display_credits(
         .build()
         .map_err(|e| format!("client: {e}"))?;
 
-    let url = format!("{}/v1/credits/summary", directory_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/v1/credits/summary?node_id={}",
+        directory_url.trim_end_matches('/'),
+        node_id
+    );
     let resp = client
         .get(&url)
         .header("Authorization", format!("Bearer {token}"))
-        .header("X-Node-Id", node_id)
         .send()
         .await
         .map_err(|e| format!("request failed: {e}"))?;
@@ -2528,6 +2531,49 @@ mod tests {
         assert!(
             run_credits(&bad_args).await.is_err(),
             "a forged/wrong token must be rejected — local config cannot fabricate credits"
+        );
+    }
+
+    /// #credits-query-param — `iicp-node credits` must pass node_id as a query param
+    /// (not as X-Node-Id header) so the opaque-token path works through CDN proxies that
+    /// may strip custom headers. Fails if the URL reverts to header-only auth.
+    #[tokio::test]
+    async fn credits_node_id_sent_as_query_param() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let captured2 = Arc::clone(&captured);
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 4096];
+                if let Ok(n) = s.read(&mut buf) {
+                    *captured2.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).to_string();
+                }
+                let body = r#"{"total_earned":1.0,"total_spent":0.0,"balance":1.0,"tx_count":1,"reconciles":true,"tokens_per_credit":1000}"#;
+                let _ = s.write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()
+                );
+            }
+        });
+        let args: Vec<String> = vec![
+            "--node-id".into(), "test-node-abc".into(),
+            "--token".into(), "tok".into(),
+            "--directory-url".into(), format!("http://127.0.0.1:{port}"),
+        ];
+        let _ = run_credits(&args).await;
+        let req = captured.lock().unwrap().clone();
+        assert!(
+            req.contains("node_id=test-node-abc"),
+            "credits request must include node_id as query param (got: {})",
+            req.lines().next().unwrap_or("")
+        );
+        assert!(
+            !req.contains("X-Node-Id"),
+            "X-Node-Id header must not be sent (CDN strips it)"
         );
     }
 
