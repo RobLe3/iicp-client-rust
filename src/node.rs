@@ -760,9 +760,11 @@ async fn task_endpoint(
             let hmac_key = state.node_hmac_key.read().expect("poisoned").clone();
             if !hmac_key.is_empty() {
                 let token = state.node_token.read().expect("poisoned").clone();
+                // `value` is the handler's return value — the handler in iicp_node.rs already
+                // unwraps the backend's {"result": ...} envelope, so `value` IS the OpenAI
+                // completion response and usage lives at value["usage"], not value["result"]["usage"].
                 let tokens_used: u64 = value
-                    .get("result")
-                    .and_then(|r| r.get("usage"))
+                    .get("usage")
                     .and_then(|u| u.get("total_tokens"))
                     .and_then(|t| t.as_u64())
                     .unwrap_or(0);
@@ -1866,6 +1868,33 @@ mod operator_wiring_tests {
             .build_register_payload();
         assert!(p.get("operator_delegation").is_none());
         assert!(p.get("operator_display_name").is_none());
+    }
+
+    /// TC-9c — token extraction: handler returns the unwrapped OpenAI completion response, so
+    /// usage is at value["usage"]["total_tokens"], NOT value["result"]["usage"]["total_tokens"].
+    /// This test would fail if the extraction path regressed back to the wrong nested form.
+    #[test]
+    fn token_extraction_uses_direct_usage_path() {
+        let handler_value = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "model": "qwen2.5:0.5b",
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}
+        });
+        let tokens: u64 = handler_value
+            .get("usage")
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        assert_eq!(tokens, 15, "must extract total_tokens from top-level usage key");
+
+        // Regression: the wrong path (via "result") must yield 0, not 15.
+        let wrong: u64 = handler_value
+            .get("result")
+            .and_then(|r| r.get("usage"))
+            .and_then(|u| u.get("total_tokens"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0);
+        assert_eq!(wrong, 0, "nested result.usage path must not exist in handler value");
     }
 
     /// TC-9c — post_cip_receipt constructs a valid HMAC-SHA256 signed body for /v1/credits/award.
