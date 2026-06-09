@@ -103,6 +103,11 @@ pub struct TaskRequest {
     pub constraints: Option<TaskConstraints>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<TaskAuth>,
+    /// #488 — querying node identity for self-query neutrality at the directory.
+    /// Set to the requester's node_id so the serving node can include it in the
+    /// CIPWorkerReceipt, enabling the directory to detect same-operator loops.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_node_id: Option<String>,
 }
 
 /// Constraints block for a task request.

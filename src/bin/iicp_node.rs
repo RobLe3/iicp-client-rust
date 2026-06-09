@@ -265,6 +265,8 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     let mut model: Option<String> = None;
     let mut max_tokens: Option<u32> = None;
     let mut timeout_ms: u64 = 60_000;
+    // #488: optional node config path — used to populate source_node_id for self-query detection.
+    let mut node_cfg: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -284,6 +286,7 @@ async fn run_query(args: &[String]) -> Result<(), String> {
                 "--timeout-ms" => {
                     timeout_ms = v.parse().map_err(|e| format!("--timeout-ms: {e}"))?
                 }
+                "--node" => node_cfg = Some(v),
                 _ => return Err(format!("unknown flag: {a}")),
             }
             i += 2;
@@ -307,6 +310,20 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     };
     let client = IicpClient::new(config).map_err(|e| format!("client init: {e}"))?;
 
+    // #488: resolve source_node_id from the saved node config (--node flag or IICP_NODE env).
+    let effective_node_cfg = node_cfg
+        .or_else(|| env::var("IICP_NODE").ok())
+        .unwrap_or_default();
+    let source_node_id: Option<String> = if !effective_node_cfg.is_empty() {
+        if let Ok(Some(ni)) = iicp_client::identity::load_node(&effective_node_cfg) {
+            Some(ni.node_id)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let request = TaskRequest {
         task_id: uuid::Uuid::new_v4().to_string(),
         intent: intent.clone(),
@@ -323,6 +340,7 @@ async fn run_query(args: &[String]) -> Result<(), String> {
             None
         },
         auth: None,
+        source_node_id,
     };
 
     eprintln!("[iicp-node] Discovering nodes for {}...", intent);

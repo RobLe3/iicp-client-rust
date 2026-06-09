@@ -295,6 +295,7 @@ impl IicpClient {
                 model: opts.model,
             }),
             auth: None,
+            source_node_id: None,
         };
         let task_resp = self.submit(request).await?;
         let node_id = task_resp.metrics.as_ref().and_then(|m| m.node_id.clone());
