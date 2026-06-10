@@ -73,6 +73,9 @@ impl ProxyBackend for IicpClient {
                 payload,
                 constraints: None,
                 auth: None,
+                // Proxy gateway has no registered node identity — self-query
+                // neutrality (#488) does not apply to anonymous consumers.
+                source_node_id: None,
             })
             .await
             .map_err(ProxyDispatchError::Iicp)
