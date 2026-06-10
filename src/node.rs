@@ -1176,8 +1176,11 @@ impl IicpNode {
         if base.is_empty() {
             return None;
         }
-        let root = if base.ends_with("/v1") { &base[..base.len() - 3] } else { base };
-        let mut rb = self.http.get(format!("{root}/api/tags")).timeout(std::time::Duration::from_secs(2));
+        let root = base.strip_suffix("/v1").unwrap_or(base);
+        let mut rb = self
+            .http
+            .get(format!("{root}/api/tags"))
+            .timeout(std::time::Duration::from_secs(2));
         if let Some(key) = &self.cfg.backend_api_key {
             if !key.is_empty() {
                 rb = rb.bearer_auth(key);
@@ -1187,7 +1190,8 @@ impl IicpNode {
             if resp.status().is_success() {
                 if let Ok(data) = resp.json::<Value>().await {
                     if let Some(arr) = data["models"].as_array() {
-                        let mut names: Vec<String> = arr.iter()
+                        let mut names: Vec<String> = arr
+                            .iter()
                             .filter_map(|m| m["name"].as_str().map(str::to_string))
                             .collect::<std::collections::HashSet<_>>()
                             .into_iter()
@@ -1198,7 +1202,10 @@ impl IicpNode {
                 }
             }
         }
-        let mut rb2 = self.http.get(format!("{root}/v1/models")).timeout(std::time::Duration::from_secs(2));
+        let mut rb2 = self
+            .http
+            .get(format!("{root}/v1/models"))
+            .timeout(std::time::Duration::from_secs(2));
         if let Some(key) = &self.cfg.backend_api_key {
             if !key.is_empty() {
                 rb2 = rb2.bearer_auth(key);
@@ -1208,7 +1215,8 @@ impl IicpNode {
             if resp.status().is_success() {
                 if let Ok(data) = resp.json::<Value>().await {
                     if let Some(arr) = data["data"].as_array() {
-                        let names: Vec<String> = arr.iter()
+                        let names: Vec<String> = arr
+                            .iter()
                             .filter_map(|m| m["id"].as_str().map(str::to_string))
                             .collect();
                         return Some(names);

@@ -692,7 +692,9 @@ async fn test_heartbeat_includes_health_models_when_probe_succeeds() {
         .mock("GET", "/api/tags")
         .with_status(200)
         .with_header("content-type", "application/json")
-        .with_body(json!({"models": [{"name": "llama3:latest"}, {"name": "qwen2.5:0.5b"}]}).to_string())
+        .with_body(
+            json!({"models": [{"name": "llama3:latest"}, {"name": "qwen2.5:0.5b"}]}).to_string(),
+        )
         .create_async()
         .await;
 
@@ -708,11 +710,17 @@ async fn test_heartbeat_includes_health_models_when_probe_succeeds() {
         .create_async()
         .await;
 
-    let mut cfg = NodeConfig::new("hm-rs-1", "http://127.0.0.1:9999", "urn:iicp:intent:llm:chat:v1");
+    let mut cfg = NodeConfig::new(
+        "hm-rs-1",
+        "http://127.0.0.1:9999",
+        "urn:iicp:intent:llm:chat:v1",
+    );
     cfg.directory_url = server.url();
     cfg.backend_url = Some(backend.url());
     let node = IicpNode::new(cfg);
-    node.heartbeat("tok").await.expect("heartbeat should succeed");
+    node.heartbeat("tok")
+        .await
+        .expect("heartbeat should succeed");
     _m_hb.assert_async().await;
     // Verify the heartbeat body contained health_models (via the mock call count)
     // Full body inspection is done in Python/TS tests; here we confirm no panic + mock fires.
@@ -734,10 +742,16 @@ async fn test_heartbeat_omits_health_models_when_no_backend_url() {
         .create_async()
         .await;
 
-    let mut cfg = NodeConfig::new("hm-rs-2", "http://127.0.0.1:9999", "urn:iicp:intent:llm:chat:v1");
+    let mut cfg = NodeConfig::new(
+        "hm-rs-2",
+        "http://127.0.0.1:9999",
+        "urn:iicp:intent:llm:chat:v1",
+    );
     cfg.directory_url = server.url();
     // No backend_url set
     let node = IicpNode::new(cfg);
-    node.heartbeat("tok").await.expect("heartbeat without backend_url should succeed");
+    node.heartbeat("tok")
+        .await
+        .expect("heartbeat without backend_url should succeed");
     _m.assert_async().await;
 }
