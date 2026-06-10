@@ -1658,6 +1658,13 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             }
         }
     }
+    // #494 — wire backend URL for live health_models probing in heartbeats.
+    if !opts.backend_url.is_empty() {
+        cfg.backend_url = Some(opts.backend_url.clone());
+    }
+    if !opts.backend_api_key.is_empty() {
+        cfg.backend_api_key = Some(opts.backend_api_key.clone());
+    }
     // Capture before cfg is consumed by IicpNode::new.
     let resolved_log_dir = cfg.log_dir.clone();
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]

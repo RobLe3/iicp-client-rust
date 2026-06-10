@@ -214,6 +214,13 @@ pub struct NodeConfig {
     pub operator_display_name: Option<String>,
     pub operator_created_at: Option<String>,
     pub operator_integrity_hash: Option<String>,
+    /// #494 — backend base URL for live model health probing during heartbeat.
+    /// When set, heartbeat probes /api/tags (Ollama) or /v1/models (OpenAI-compat)
+    /// and includes `health_models` in the payload so the directory can filter
+    /// stale-model nodes from discover results. `None` = no probing.
+    pub backend_url: Option<String>,
+    /// Bearer API key for authenticated backends (LM Studio, hosted services).
+    pub backend_api_key: Option<String>,
 }
 
 impl NodeConfig {
@@ -254,6 +261,8 @@ impl NodeConfig {
             operator_display_name: None,
             operator_created_at: None,
             operator_integrity_hash: None,
+            backend_url: None,
+            backend_api_key: None,
         }
     }
 }
@@ -1159,6 +1168,57 @@ impl IicpNode {
         Ok(token.to_string())
     }
 
+    /// #494 — probe the backend's live model list for health_models heartbeat reporting.
+    /// Tries Ollama /api/tags first, then OpenAI-compat /v1/models.
+    /// Returns None on any error (probe failure is soft — heartbeat still sends without health_models).
+    async fn probe_health_models(&self) -> Option<Vec<String>> {
+        let base = self.cfg.backend_url.as_deref()?.trim_end_matches('/');
+        if base.is_empty() {
+            return None;
+        }
+        let root = if base.ends_with("/v1") { &base[..base.len() - 3] } else { base };
+        let mut rb = self.http.get(format!("{root}/api/tags")).timeout(std::time::Duration::from_secs(2));
+        if let Some(key) = &self.cfg.backend_api_key {
+            if !key.is_empty() {
+                rb = rb.bearer_auth(key);
+            }
+        }
+        if let Ok(resp) = rb.send().await {
+            if resp.status().is_success() {
+                if let Ok(data) = resp.json::<Value>().await {
+                    if let Some(arr) = data["models"].as_array() {
+                        let mut names: Vec<String> = arr.iter()
+                            .filter_map(|m| m["name"].as_str().map(str::to_string))
+                            .collect::<std::collections::HashSet<_>>()
+                            .into_iter()
+                            .collect();
+                        names.sort();
+                        return Some(names);
+                    }
+                }
+            }
+        }
+        let mut rb2 = self.http.get(format!("{root}/v1/models")).timeout(std::time::Duration::from_secs(2));
+        if let Some(key) = &self.cfg.backend_api_key {
+            if !key.is_empty() {
+                rb2 = rb2.bearer_auth(key);
+            }
+        }
+        if let Ok(resp) = rb2.send().await {
+            if resp.status().is_success() {
+                if let Ok(data) = resp.json::<Value>().await {
+                    if let Some(arr) = data["data"].as_array() {
+                        let names: Vec<String> = arr.iter()
+                            .filter_map(|m| m["id"].as_str().map(str::to_string))
+                            .collect();
+                        return Some(names);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Send a single heartbeat to the directory.
     pub async fn heartbeat(&self, node_token: &str) -> Result<()> {
         let mut body = json!({
@@ -1186,6 +1246,13 @@ impl IicpNode {
             if !hmac_key.is_empty() {
                 body["challenge_response"] =
                     json!(crate::pricing::sign_body(ch.as_bytes(), &hmac_key));
+            }
+        }
+
+        // #494 — report live model list so the directory can filter stale-model nodes.
+        if self.cfg.backend_url.is_some() {
+            if let Some(models) = self.probe_health_models().await {
+                body["health_models"] = json!(models);
             }
         }
 
