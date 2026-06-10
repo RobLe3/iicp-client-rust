@@ -727,6 +727,51 @@ async fn test_heartbeat_includes_health_models_when_probe_succeeds() {
     let _ = captured_clone;
 }
 
+/// #494 — /iicp/health must expose models[] containing the primary model.
+/// DIR-TRUST-01 REACH probe checks health_data.get("models"); fails if absent.
+#[tokio::test]
+async fn test_health_endpoint_exposes_models_array() {
+    let port = free_port();
+    let handle = start_node(port, 4).await;
+    wait_port(port).await;
+
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/iicp/health"))
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let models = body["models"].as_array().expect("/iicp/health must include models[]");
+    assert!(
+        models.iter().any(|m| m.as_str() == Some("test-model")),
+        "primary model must appear in models[]"
+    );
+    handle.abort();
+}
+
+/// #494 — /iicp/health models[] includes capabilities (not just the primary model).
+#[tokio::test]
+async fn test_health_endpoint_models_includes_capabilities() {
+    let port = free_port();
+    let mut cfg = NodeConfig::new("multi-node", "http://multi.local", "urn:iicp:intent:llm:chat:v1");
+    cfg.model = Some("primary-model".into());
+    cfg.capabilities = vec!["extra-model".into()];
+    let node = IicpNode::new(cfg);
+    let addr = format!("127.0.0.1:{port}");
+    let handle = tokio::spawn(async move {
+        let _ = node.serve(|_t| Box::pin(async move { Ok(json!({})) }), &addr, None).await;
+    });
+    wait_port(port).await;
+
+    let resp = reqwest::get(format!("http://127.0.0.1:{port}/iicp/health"))
+        .await
+        .unwrap();
+    let body: Value = resp.json().await.unwrap();
+    let models = body["models"].as_array().expect("models[] must be present");
+    let names: Vec<&str> = models.iter().filter_map(|m| m.as_str()).collect();
+    assert!(names.contains(&"primary-model"), "primary model in models[]");
+    assert!(names.contains(&"extra-model"), "capability must appear in models[]");
+    handle.abort();
+}
+
 /// When backend_url is not set, health_models must not appear in the heartbeat payload.
 /// This test confirms backward compat — old nodes without backend_url still work.
 #[tokio::test]

@@ -326,6 +326,8 @@ struct AppState {
     region: String,
     intent: String,
     model: String,
+    /// All models served by this node (primary model + capabilities), mirroring registration.
+    models: Vec<String>,
     active_jobs: Arc<AtomicUsize>,
     /// TC-9c: directory URL for background CIPWorkerReceipt posting after task completion.
     directory_url: String,
@@ -381,6 +383,7 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "effective_max_concurrent": eff_max,
         "available": active < eff_max,
         "model": state.model,
+        "models": state.models,
         "intent": state.intent,
         "pinhole_state": pinhole_state,
     }))
@@ -1335,12 +1338,22 @@ impl IicpNode {
 
         let tasks_success = Arc::new(AtomicUsize::new(0));
         let tasks_failed = Arc::new(AtomicUsize::new(0));
+        let mut all_models: Vec<String> = match &self.cfg.model {
+            Some(m) => vec![m.clone()],
+            None => Vec::new(),
+        };
+        for cap in &self.cfg.capabilities {
+            if !all_models.contains(cap) {
+                all_models.push(cap.clone());
+            }
+        }
         let state = Arc::new(AppState {
             handler,
             node_id: self.cfg.node_id.clone(),
             region: self.cfg.region.clone().unwrap_or_else(|| "unknown".into()),
             intent: self.cfg.intent.clone(),
             model: self.cfg.model.clone().unwrap_or_default(),
+            models: all_models,
             active_jobs,
             directory_url: self.cfg.directory_url.clone(),
             node_token: Arc::clone(&self.runtime_token),
