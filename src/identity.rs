@@ -411,7 +411,7 @@ pub fn generate_node(
         public_endpoint: public_endpoint.to_string(),
         auto_detect_nat,
         external_ip_probe_url: external_ip_probe_url.to_string(),
-        node_token: None,   // cached on first register (#456)
+        node_token: None,    // cached on first register (#456)
         node_hmac_key: None, // cached on first register (TC-9c)
         created_at: now_iso(),
     })

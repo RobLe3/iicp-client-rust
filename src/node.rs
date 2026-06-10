@@ -1912,7 +1912,10 @@ mod operator_wiring_tests {
             .and_then(|u| u.get("total_tokens"))
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        assert_eq!(tokens, 15, "must extract total_tokens from top-level usage key");
+        assert_eq!(
+            tokens, 15,
+            "must extract total_tokens from top-level usage key"
+        );
 
         // Regression: the wrong path (via "result") must yield 0, not 15.
         let wrong: u64 = handler_value
@@ -1921,7 +1924,10 @@ mod operator_wiring_tests {
             .and_then(|u| u.get("total_tokens"))
             .and_then(|t| t.as_u64())
             .unwrap_or(0);
-        assert_eq!(wrong, 0, "nested result.usage path must not exist in handler value");
+        assert_eq!(
+            wrong, 0,
+            "nested result.usage path must not exist in handler value"
+        );
     }
 
     /// TC-9c — post_cip_receipt constructs a valid HMAC-SHA256 signed body for /v1/credits/award.
@@ -2069,7 +2075,7 @@ mod operator_wiring_tests {
         let task_id = "task-490";
         let tokens: u64 = 50;
         let nonce = "abc123";
-        let response_hash = "deadbeef" .repeat(8); // 64-char hex
+        let response_hash = "deadbeef".repeat(8); // 64-char hex
         let querying_node_id = "querying-node-xyz";
 
         // Build the extended canonical — must include querying_node_id at end.
@@ -2085,8 +2091,10 @@ mod operator_wiring_tests {
         let short_sig = hex::encode(mac2.finalize().into_bytes());
 
         // Signatures must differ — proves the canonical is distinct.
-        assert_ne!(expected, short_sig,
-            "extended canonical must produce a different signature than short canonical");
+        assert_ne!(
+            expected, short_sig,
+            "extended canonical must produce a different signature than short canonical"
+        );
 
         // The extended canonical must match what post_cip_receipt would produce.
         // We verify the formula by checking that the extended message length is correct:
