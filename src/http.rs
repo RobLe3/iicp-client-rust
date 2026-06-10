@@ -62,11 +62,29 @@ impl HttpClient {
         Ok(serde_json::from_value(body)?)
     }
 
+    /// Expose the inner `Client` for consumer token acquisition.
+    pub(crate) fn inner(&self) -> &Client {
+        &self.inner
+    }
+
     pub(crate) async fn post_json<B: serde::Serialize, T: DeserializeOwned>(
         &self,
         url: &str,
         body: &B,
         auth_override: Option<&str>,
+        traceparent: Option<&str>,
+    ) -> Result<T> {
+        self.post_json_ct(url, body, auth_override, None, traceparent)
+            .await
+    }
+
+    /// Like `post_json` but also sends `X-IICP-Consumer-Token` when `consumer_token` is `Some`.
+    pub(crate) async fn post_json_ct<B: serde::Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        auth_override: Option<&str>,
+        consumer_token: Option<&str>,
         traceparent: Option<&str>,
     ) -> Result<T> {
         let tp = traceparent
@@ -76,6 +94,10 @@ impl HttpClient {
         let rb = match auth_override {
             Some(t) => rb.bearer_auth(t),
             None => self.auth(rb),
+        };
+        let rb = match consumer_token {
+            Some(ct) => rb.header("X-IICP-Consumer-Token", ct),
+            None => rb,
         };
         let resp = rb.send().await?;
         let status = resp.status().as_u16();

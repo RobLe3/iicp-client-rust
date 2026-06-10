@@ -18,6 +18,7 @@
 //! ```
 
 mod client;
+pub mod consumer_token;
 mod errors;
 mod http;
 pub mod node;

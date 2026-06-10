@@ -6,6 +6,7 @@ use rand::Rng;
 use regex::Regex;
 
 use crate::confidentiality::encrypt_payload;
+use crate::consumer_token::{acquire_consumer_token, ConsumerTokenCache};
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
 use crate::types::*;
@@ -110,6 +111,8 @@ fn is_safe_query_param(s: &str) -> bool {
 pub struct IicpClient {
     config: ClientConfig,
     http: HttpClient,
+    /// Phase 2 (#496): in-process consumer token cache.
+    ct_cache: ConsumerTokenCache,
 }
 
 impl IicpClient {
@@ -119,7 +122,11 @@ impl IicpClient {
             return Err(IicpError::TimeoutTooLarge(config.timeout_ms));
         }
         let http = HttpClient::new(config.timeout_ms, config.node_token.clone())?;
-        Ok(Self { config, http })
+        Ok(Self {
+            config,
+            http,
+            ct_cache: ConsumerTokenCache::new(),
+        })
     }
 
     /// Discover nodes for *intent* (SDK-01). Accepts an optional traceparent for propagation.
@@ -212,6 +219,22 @@ impl IicpClient {
         let mut last_err: Option<IicpError> = None;
 
         'nodes: for node in &candidates {
+            // Phase 2 (#496): acquire directory-issued consumer token when caller has identity.
+            let consumer_token: Option<String> = if let Some(ref tok) = self.config.node_token {
+                acquire_consumer_token(
+                    &self.ct_cache,
+                    self.http.inner(),
+                    &self.config.directory_url,
+                    tok,
+                    &node.node_id,
+                    &request.intent,
+                    5.0,
+                )
+                .await
+            } else {
+                None
+            };
+
             // IICP-CX S.16 §5: build body per node (cx_public_key may differ per node)
             let body: serde_json::Value = if self.config.use_confidentiality {
                 if let Some(ref cx_key) = node.cx_public_key {
@@ -237,10 +260,11 @@ impl IicpClient {
             for attempt in 0..MAX_RETRIES {
                 match self
                     .http
-                    .post_json(
+                    .post_json_ct(
                         &format!("{}/v1/task", node.endpoint),
                         &body,
                         None,
+                        consumer_token.as_deref(),
                         Some(&tp),
                     )
                     .await
