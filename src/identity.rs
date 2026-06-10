@@ -222,6 +222,22 @@ impl OperatorIdentity {
     }
 }
 
+/// #503 — printed to stderr when serve/register runs without a key-backed operator
+/// identity. An anonymous node accrues NO founder/recognition standing and nothing
+/// else in the flow would ever tell the operator (the first external operator was
+/// silently invisible to the founders program for 3 days).
+pub const NO_IDENTITY_NOTICE: &str = "NOTICE: no operator identity - this node is registering anonymously.\n        You will NOT accrue founder or recognition standing.\n        Run `iicp-node init` (takes 30 seconds), then restart, to start\n        your founder clock. Docs: https://iicp.network/docs/operator-identity";
+
+/// The #503 anonymous-registration notice, or None when the identity is fine.
+/// Fires for BOTH the no-identity case and the legacy keyless case (a UUID
+/// identity cannot sign a delegation, so the node is anonymous either way).
+pub fn no_identity_notice(op: Option<&OperatorIdentity>) -> Option<&'static str> {
+    match op {
+        Some(op) if op.is_key_backed() => None,
+        _ => Some(NO_IDENTITY_NOTICE),
+    }
+}
+
 pub fn operator_path() -> io::Result<PathBuf> {
     Ok(config_dir()?.join("operator.json"))
 }
@@ -517,5 +533,44 @@ mod node_identity_tests {
             identity.region, "unknown",
             "missing region field must default to 'unknown', not 'eu-central' (#484)"
         );
+    }
+}
+
+// ── #503 — anonymous-registration notice ─────────────────────────────────────
+// A node serving without a key-backed operator identity accrues NO founder or
+// recognition standing; the SDK must say so loudly instead of staying silent.
+// Each test fails if the notice helper is removed or stops covering its case.
+#[cfg(test)]
+mod no_identity_notice_tests {
+    use super::{no_identity_notice, OperatorIdentity, NO_IDENTITY_NOTICE};
+
+    #[test]
+    fn fires_when_no_operator() {
+        let n = no_identity_notice(None).expect("notice must fire without an identity");
+        assert_eq!(n, NO_IDENTITY_NOTICE);
+        assert!(n.contains("iicp-node init"));
+        assert!(n.to_lowercase().contains("founder"));
+    }
+
+    #[test]
+    fn fires_for_legacy_keyless_identity() {
+        let legacy = OperatorIdentity {
+            operator_id: "op-12345678-1234-1234-1234-123456789abc".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            display_name: "Legacy".into(),
+            contact: String::new(),
+            operator_secret: String::new(),
+            operator_integrity_hash: String::new(),
+            operator_secret_enc: None,
+        };
+        assert!(!legacy.is_key_backed());
+        assert!(no_identity_notice(Some(&legacy)).is_some());
+    }
+
+    #[test]
+    fn silent_for_key_backed_identity() {
+        let op = OperatorIdentity::generate("Keyed", "");
+        assert!(op.is_key_backed());
+        assert!(no_identity_notice(Some(&op)).is_none());
     }
 }
