@@ -152,7 +152,9 @@ fn print_help() {
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
          \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
-         \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485)\n\
+         \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485).\n\
+         \x20                            Note: relay bind authentication is pending (#510) — only run a relay\n\
+         \x20                            accept port on networks you trust until the signed-bind mechanism ships.\n\
          \x20 --with-proxy               IICP_WITH_PROXY — also run the compat proxy gateway (loopback 9483)\n\
          \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\n\
          query optional:\n\

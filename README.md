@@ -299,6 +299,8 @@ let node = IicpNode::new(NodeConfig {
 });
 ```
 
+> **Security note**: relay bind authentication is pending ([#510](https://github.com/RobLe3/iicp.network/issues/510)) — only run a relay accept port on networks you trust until the signed-bind mechanism ships.
+
 ### Opt-out / override
 
 ```bash
