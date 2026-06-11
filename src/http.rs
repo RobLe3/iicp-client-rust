@@ -67,17 +67,6 @@ impl HttpClient {
         &self.inner
     }
 
-    pub(crate) async fn post_json<B: serde::Serialize, T: DeserializeOwned>(
-        &self,
-        url: &str,
-        body: &B,
-        auth_override: Option<&str>,
-        traceparent: Option<&str>,
-    ) -> Result<T> {
-        self.post_json_ct(url, body, auth_override, None, traceparent)
-            .await
-    }
-
     /// Like `post_json` but also sends `X-IICP-Consumer-Token` when `consumer_token` is `Some`.
     pub(crate) async fn post_json_ct<B: serde::Serialize, T: DeserializeOwned>(
         &self,

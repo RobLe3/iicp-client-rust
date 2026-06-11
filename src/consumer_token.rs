@@ -11,10 +11,14 @@ use reqwest::Client;
 
 const EXPIRY_BUFFER_S: u64 = 30;
 
+/// Cache key: (caller_node_token, target_node_id, intent).
+type CacheKey = (String, String, String);
+/// Cached value: (token, exp_unix).
+type CachedToken = (String, u64);
+
 /// Thread-safe consumer token cache.
-/// Key: (caller_node_token, target_node_id, intent) → (token, exp_unix)
 pub struct ConsumerTokenCache {
-    inner: Mutex<HashMap<(String, String, String), (String, u64)>>,
+    inner: Mutex<HashMap<CacheKey, CachedToken>>,
 }
 
 impl ConsumerTokenCache {
