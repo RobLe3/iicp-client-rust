@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.54] — 2026-06-11
+
+### Fixed — `iicp-node credits` resilience
+
+- Transient failures (network error, 5xx, undecodable body) are retried once after
+  a 2s pause — deploy windows / shared-hosting blips no longer surface as one-shot
+  CLI errors (`HTTP 500` / `bad response: error decoding response body`).
+- All-nodes listing (bare `iicp-node credits` with multiple saved nodes): one
+  node's failure no longer aborts the whole listing — every node is shown and the
+  command exits non-zero with an `N/M node(s) failed` summary.
+- All-nodes listing now honors each node's saved `directory_url` instead of the
+  global default (parity with Python/TypeScript).
+
+## [0.7.53] — 2026-06-11
+
+### Added — model-drift re-registration (#494)
+
+- Each heartbeat tick compares the backend's live model list against the registered
+  set and automatically re-registers when they diverge — directory registration no
+  longer goes stale when Ollama loads/unloads models.
+- Background heartbeat loop (inside `serve()`) now sends `health_models` — it was
+  missing from the inlined heartbeat payload even in 0.7.52.
+
+## [0.7.52] — 2026-06-10
+
+### Added
+
+- #496 Phase-2 consumer token support.
+- `models[]` array on the `/iicp/health` endpoint (#494).
+- #503 loud CLI notice when serving without an operator identity.
+
 ## [0.7.51] — 2026-06-10
 
 ### Added — health_models heartbeat reporting (#494)

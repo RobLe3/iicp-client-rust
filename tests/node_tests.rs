@@ -739,7 +739,9 @@ async fn test_health_endpoint_exposes_models_array() {
         .await
         .unwrap();
     let body: Value = resp.json().await.unwrap();
-    let models = body["models"].as_array().expect("/iicp/health must include models[]");
+    let models = body["models"]
+        .as_array()
+        .expect("/iicp/health must include models[]");
     assert!(
         models.iter().any(|m| m.as_str() == Some("test-model")),
         "primary model must appear in models[]"
@@ -751,13 +753,19 @@ async fn test_health_endpoint_exposes_models_array() {
 #[tokio::test]
 async fn test_health_endpoint_models_includes_capabilities() {
     let port = free_port();
-    let mut cfg = NodeConfig::new("multi-node", "http://multi.local", "urn:iicp:intent:llm:chat:v1");
+    let mut cfg = NodeConfig::new(
+        "multi-node",
+        "http://multi.local",
+        "urn:iicp:intent:llm:chat:v1",
+    );
     cfg.model = Some("primary-model".into());
     cfg.capabilities = vec!["extra-model".into()];
     let node = IicpNode::new(cfg);
     let addr = format!("127.0.0.1:{port}");
     let handle = tokio::spawn(async move {
-        let _ = node.serve(|_t| Box::pin(async move { Ok(json!({})) }), &addr, None).await;
+        let _ = node
+            .serve(|_t| Box::pin(async move { Ok(json!({})) }), &addr, None)
+            .await;
     });
     wait_port(port).await;
 
@@ -767,8 +775,14 @@ async fn test_health_endpoint_models_includes_capabilities() {
     let body: Value = resp.json().await.unwrap();
     let models = body["models"].as_array().expect("models[] must be present");
     let names: Vec<&str> = models.iter().filter_map(|m| m.as_str()).collect();
-    assert!(names.contains(&"primary-model"), "primary model in models[]");
-    assert!(names.contains(&"extra-model"), "capability must appear in models[]");
+    assert!(
+        names.contains(&"primary-model"),
+        "primary model in models[]"
+    );
+    assert!(
+        names.contains(&"extra-model"),
+        "capability must appear in models[]"
+    );
     handle.abort();
 }
 
@@ -871,7 +885,7 @@ async fn test_no_reregister_on_empty_backend_models() {
     let _m_reg = dir
         .mock("POST", "/v1/register")
         .with_status(200)
-        .expect(0)  // must NOT be called
+        .expect(0) // must NOT be called
         .create_async()
         .await;
 

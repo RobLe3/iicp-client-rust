@@ -73,9 +73,7 @@ pub async fn acquire_consumer_token(
         return Some(tok);
     }
 
-    let base = directory_url
-        .trim_end_matches("/api")
-        .trim_end_matches('/');
+    let base = directory_url.trim_end_matches("/api").trim_end_matches('/');
     let url = format!("{base}/api/v1/consumer-token");
 
     let body = serde_json::json!({
@@ -85,10 +83,7 @@ pub async fn acquire_consumer_token(
 
     let result = tokio::time::timeout(
         Duration::from_secs_f64(timeout_s),
-        http.post(&url)
-            .bearer_auth(node_token)
-            .json(&body)
-            .send(),
+        http.post(&url).bearer_auth(node_token).json(&body).send(),
     )
     .await;
 

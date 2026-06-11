@@ -984,7 +984,10 @@ impl IicpNode {
         let mut new_payload = self.build_register_payload();
         let new_caps = build_capabilities(&live, &self.cfg.intent, self.cfg.max_tokens);
         new_payload["capabilities"] = serde_json::to_value(&new_caps).unwrap_or(json!([]));
-        let url = format!("{}/v1/register", self.cfg.directory_url.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/register",
+            self.cfg.directory_url.trim_end_matches('/')
+        );
         if let Some(t) = reregister(&self.http, &url, &new_payload).await {
             *self.registered_models.write().expect("poisoned") = live;
             *self.runtime_token.write().expect("poisoned") = t;
@@ -1645,22 +1648,21 @@ impl IicpNode {
                             // #494 — detect model drift; re-register when live set differs.
                             if let Some(live) = live_models {
                                 if !live.is_empty() {
-                                    let registered = hb_registered_models
-                                        .read().expect("poisoned").clone();
+                                    let registered =
+                                        hb_registered_models.read().expect("poisoned").clone();
                                     let live_set: std::collections::HashSet<_> =
                                         live.iter().cloned().collect();
                                     let reg_set: std::collections::HashSet<_> =
                                         registered.into_iter().collect();
                                     if live_set != reg_set {
                                         let mut new_payload = hb_register_payload.clone();
-                                        let new_caps = build_capabilities(
-                                            &live, &hb_intent, hb_max_tokens,
-                                        );
+                                        let new_caps =
+                                            build_capabilities(&live, &hb_intent, hb_max_tokens);
                                         new_payload["capabilities"] =
                                             serde_json::to_value(&new_caps).unwrap_or(json!([]));
-                                        if let Some(t) = reregister(
-                                            &http, &hb_register_url, &new_payload,
-                                        ).await {
+                                        if let Some(t) =
+                                            reregister(&http, &hb_register_url, &new_payload).await
+                                        {
                                             *hb_registered_models.write().expect("poisoned") =
                                                 live.clone();
                                             token = t;

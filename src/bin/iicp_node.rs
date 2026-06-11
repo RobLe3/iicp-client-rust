@@ -569,18 +569,45 @@ async fn fetch_and_display_credits(
         directory_url.trim_end_matches('/'),
         node_id
     );
-    let resp = client
-        .get(&url)
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .map_err(|e| format!("request failed: {e}"))?;
-
-    let status = resp.status();
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("bad response: {e}"))?;
+    // Transient failures (network error, 5xx, undecodable body) get ONE retry
+    // after a short pause — shared-hosting blips and deploy windows otherwise
+    // surface as one-shot CLI errors (observed 2026-06-11).
+    let mut outcome: Result<(reqwest::StatusCode, serde_json::Value), String> =
+        Err("unreachable".to_string());
+    for attempt in 1..=2u8 {
+        outcome = async {
+            let resp = client
+                .get(&url)
+                .header("Authorization", format!("Bearer {token}"))
+                .send()
+                .await
+                .map_err(|e| format!("request failed: {e}"))?;
+            let status = resp.status();
+            let body: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("bad response: {e}"))?;
+            Ok((status, body))
+        }
+        .await;
+        match &outcome {
+            Ok((status, _)) if !status.is_server_error() => break, // success or definitive 4xx
+            _ if attempt == 1 => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+            _ => {}
+        }
+    }
+    let (status, body) = match outcome {
+        Ok((status, body)) if status.is_server_error() => {
+            let msg = body
+                .get("error")
+                .and_then(|e| e.get("message"))
+                .and_then(|m| m.as_str())
+                .unwrap_or("request rejected");
+            return Err(format!("HTTP {status}: {msg}"));
+        }
+        Ok(ok) => ok,
+        Err(e) => return Err(e),
+    };
 
     if !status.is_success() {
         let msg = body
@@ -743,13 +770,16 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                         }
                         _ => {
                             // Multiple nodes have cached tokens — show all of them.
-                            let multi: Vec<(String, String, String)> = with_token
+                            // Each node's own saved directory_url wins over the global
+                            // flag/env default (parity with Python/TS, 2026-06-11).
+                            let multi: Vec<(String, String, String, String)> = with_token
                                 .iter()
                                 .map(|n| {
                                     (
                                         n.name.clone(),
                                         n.node_id.clone(),
                                         n.node_token.clone().unwrap_or_default(),
+                                        n.directory_url.clone(),
                                     )
                                 })
                                 .collect();
@@ -761,12 +791,33 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                                 "[iicp-node] no --node given — showing credits for all {} nodes:",
                                 multi.len()
                             );
-                            for (i, (name, nid, tok)) in multi.iter().enumerate() {
+                            // One node failing must not hide the others — show every
+                            // node, then exit non-zero if any failed (2026-06-11).
+                            let mut failed = 0usize;
+                            for (i, (name, nid, tok, node_dir)) in multi.iter().enumerate() {
                                 if i > 0 {
                                     println!();
                                 }
-                                fetch_and_display_credits(&dir, nid, tok, name, as_json, verify)
-                                    .await?;
+                                let effective_dir =
+                                    if node_dir.is_empty() { &dir } else { node_dir };
+                                if let Err(e) = fetch_and_display_credits(
+                                    effective_dir,
+                                    nid,
+                                    tok,
+                                    name,
+                                    as_json,
+                                    verify,
+                                )
+                                .await
+                                {
+                                    eprintln!(
+                                        "ERROR: credits fetch failed for node '{name}': {e} — continuing with remaining nodes"
+                                    );
+                                    failed += 1;
+                                }
+                            }
+                            if failed > 0 {
+                                return Err(format!("{failed}/{} node(s) failed", multi.len()));
                             }
                             return Ok(());
                         }

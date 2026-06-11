@@ -20,7 +20,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.52"
+iicp-client = "0.7.54"
 ```
 
 To run a provider node from the command line, install the `iicp-node` binary:

@@ -91,11 +91,23 @@ async fn caches_token_and_avoids_second_directory_call() {
     let http = reqwest::Client::new();
 
     let first = acquire_consumer_token(
-        &cache, &http, &server.url(), "jwt", "node-x", "intent:a", 5.0,
+        &cache,
+        &http,
+        &server.url(),
+        "jwt",
+        "node-x",
+        "intent:a",
+        5.0,
     )
     .await;
     let second = acquire_consumer_token(
-        &cache, &http, &server.url(), "jwt", "node-x", "intent:a", 5.0,
+        &cache,
+        &http,
+        &server.url(),
+        "jwt",
+        "node-x",
+        "intent:a",
+        5.0,
     )
     .await;
 
@@ -128,7 +140,13 @@ async fn refreshes_expired_cached_entry() {
 
     let http = reqwest::Client::new();
     let result = acquire_consumer_token(
-        &cache, &http, &server.url(), "jwt", "node-y", "intent:b", 5.0,
+        &cache,
+        &http,
+        &server.url(),
+        "jwt",
+        "node-y",
+        "intent:b",
+        5.0,
     )
     .await;
 
