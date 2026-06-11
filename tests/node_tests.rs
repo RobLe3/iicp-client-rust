@@ -800,3 +800,96 @@ async fn test_heartbeat_omits_health_models_when_no_backend_url() {
         .expect("heartbeat without backend_url should succeed");
     _m.assert_async().await;
 }
+
+// ── #494 — model drift re-registration ────────────────────────────────────────
+
+/// When the backend's model list changes after registration, the heartbeat loop
+/// should detect the drift and re-register with the updated list.
+/// This test verifies the register call fires when live ≠ registered.
+#[tokio::test]
+async fn test_model_drift_triggers_reregister() {
+    use mockito::Server;
+    let mut dir = Server::new_async().await;
+    let mut backend = mockito::Server::new_async().await;
+
+    // Backend now only has phi3:mini (llama3.2:1b drifted away)
+    let _m_tags = backend
+        .mock("GET", "/api/tags")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"models": [{"name": "phi3:mini"}]}).to_string())
+        .create_async()
+        .await;
+
+    // Directory register — must be called once for drift re-registration
+    let _m_reg = dir
+        .mock("POST", "/v1/register")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"node_token": "tok-drift-rs"}).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "drift-rs-1",
+        "http://node.local:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = dir.url();
+    cfg.backend_url = Some(backend.url());
+    cfg.model = Some("phi3:mini".into());
+    cfg.capabilities = vec!["llama3.2:1b".into()];
+    let node = IicpNode::new(cfg);
+    // Simulate a prior registration: registered phi3:mini + llama3.2:1b
+    {
+        let mut g = node.registered_models().write().expect("poisoned");
+        *g = vec!["phi3:mini".into(), "llama3.2:1b".into()];
+    }
+
+    node.check_model_drift_and_reregister().await;
+
+    _m_reg.assert_async().await;
+}
+
+/// When backend returns empty model list, no re-registration should occur
+/// (avoids spurious re-register during transient backend downtime).
+#[tokio::test]
+async fn test_no_reregister_on_empty_backend_models() {
+    use mockito::Server;
+    let mut dir = Server::new_async().await;
+    let mut backend = mockito::Server::new_async().await;
+
+    let _m_tags = backend
+        .mock("GET", "/api/tags")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"models": []}).to_string())
+        .create_async()
+        .await;
+
+    let _m_reg = dir
+        .mock("POST", "/v1/register")
+        .with_status(200)
+        .expect(0)  // must NOT be called
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "drift-rs-2",
+        "http://node.local:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = dir.url();
+    cfg.backend_url = Some(backend.url());
+    cfg.model = Some("phi3:mini".into());
+    let node = IicpNode::new(cfg);
+    {
+        let mut g = node.registered_models().write().expect("poisoned");
+        *g = vec!["phi3:mini".into()];
+    }
+
+    node.check_model_drift_and_reregister().await;
+
+    _m_reg.assert_async().await; // expect 0 calls
+}

@@ -33,6 +33,66 @@ const DEFAULT_DIRECTORY: &str = "https://iicp.network/api";
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const NONCE_TTL_SECS: u64 = 300;
 
+/// #494 — standalone health-model probe for use in background tasks that don't have `&self`.
+/// Tries Ollama /api/tags then OpenAI /v1/models. Returns None on any error (soft).
+async fn probe_health_models_bg(
+    http: &Client,
+    backend_url: &str,
+    api_key: &Option<String>,
+) -> Option<Vec<String>> {
+    let base = backend_url.trim_end_matches('/');
+    if base.is_empty() {
+        return None;
+    }
+    let root = base.strip_suffix("/v1").unwrap_or(base);
+    let mut rb = http
+        .get(format!("{root}/api/tags"))
+        .timeout(std::time::Duration::from_secs(2));
+    if let Some(key) = api_key {
+        if !key.is_empty() {
+            rb = rb.bearer_auth(key);
+        }
+    }
+    if let Ok(resp) = rb.send().await {
+        if resp.status().is_success() {
+            if let Ok(data) = resp.json::<Value>().await {
+                if let Some(arr) = data["models"].as_array() {
+                    let mut names: Vec<String> = arr
+                        .iter()
+                        .filter_map(|m| m["name"].as_str().map(str::to_string))
+                        .collect::<std::collections::HashSet<_>>()
+                        .into_iter()
+                        .collect();
+                    names.sort();
+                    return Some(names);
+                }
+            }
+        }
+    }
+    let mut rb2 = http
+        .get(format!("{root}/v1/models"))
+        .timeout(std::time::Duration::from_secs(2));
+    if let Some(key) = api_key {
+        if !key.is_empty() {
+            rb2 = rb2.bearer_auth(key);
+        }
+    }
+    if let Ok(resp) = rb2.send().await {
+        if resp.status().is_success() {
+            if let Ok(data) = resp.json::<Value>().await {
+                if let Some(arr) = data["data"].as_array() {
+                    return Some(
+                        arr.iter()
+                            .filter_map(|m| m["id"].as_str().map(str::to_string))
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+    None
+}
+
 /// #404 — re-register: POST the register payload and return the fresh `node_token`.
 /// Extracted from the heartbeat loop's re-register arm so the self-heal behaviour
 /// is unit-testable (the 30s interval loop itself is not).
@@ -865,6 +925,9 @@ pub struct IicpNode {
     /// ADR-047 Part A (#411) — latest liveness nonce from the heartbeat response,
     /// answered (HMAC) on the next beat. None until the first response.
     liveness_challenge: std::sync::RwLock<Option<String>>,
+    /// #494 — model set registered at last register(); compared each heartbeat tick for drift.
+    /// Arc so the background heartbeat task can read and update it.
+    registered_models: Arc<std::sync::RwLock<Vec<String>>>,
 }
 
 impl IicpNode {
@@ -883,6 +946,7 @@ impl IicpNode {
             pinhole_uid: std::sync::RwLock::new(None),
             pinhole_lease_seconds: std::sync::RwLock::new(3600),
             liveness_challenge: std::sync::RwLock::new(None),
+            registered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
         }
     }
 
@@ -897,6 +961,34 @@ impl IicpNode {
     /// `directory_url`, `endpoint`, or `node_id` without owning the config.
     pub fn cfg(&self) -> &NodeConfig {
         &self.cfg
+    }
+
+    /// #494 — expose registered_models for test inspection and background-task wiring.
+    pub fn registered_models(&self) -> &Arc<std::sync::RwLock<Vec<String>>> {
+        &self.registered_models
+    }
+
+    /// #494 — check for model drift and re-register if the live set differs from registered.
+    /// Used by tests; production uses the same logic inlined in the heartbeat background task.
+    pub async fn check_model_drift_and_reregister(&self) {
+        let live = match self.probe_health_models().await {
+            Some(v) if !v.is_empty() => v,
+            _ => return,
+        };
+        let registered = self.registered_models.read().expect("poisoned").clone();
+        let live_set: std::collections::HashSet<_> = live.iter().cloned().collect();
+        let reg_set: std::collections::HashSet<_> = registered.into_iter().collect();
+        if live_set == reg_set {
+            return;
+        }
+        let mut new_payload = self.build_register_payload();
+        let new_caps = build_capabilities(&live, &self.cfg.intent, self.cfg.max_tokens);
+        new_payload["capabilities"] = serde_json::to_value(&new_caps).unwrap_or(json!([]));
+        let url = format!("{}/v1/register", self.cfg.directory_url.trim_end_matches('/'));
+        if let Some(t) = reregister(&self.http, &url, &new_payload).await {
+            *self.registered_models.write().expect("poisoned") = live;
+            *self.runtime_token.write().expect("poisoned") = t;
+        }
     }
 
     /// Set the relay-worker endpoint after construction. Used by the CLI when a
@@ -1167,6 +1259,19 @@ impl IicpNode {
                     *guard = dir_key.to_string();
                 }
             }
+        }
+        // #494 — track the registered model set for drift detection.
+        {
+            let mut models: Vec<String> = match &self.cfg.model {
+                Some(m) => vec![m.clone()],
+                None => Vec::new(),
+            };
+            for cap in &self.cfg.capabilities {
+                if !models.contains(cap) {
+                    models.push(cap.clone());
+                }
+            }
+            *self.registered_models.write().expect("poisoned") = models;
         }
         Ok(token.to_string())
     }
@@ -1479,6 +1584,12 @@ impl IicpNode {
             let hb_register_payload = self.build_register_payload();
             let hb_token_arc = Arc::clone(&self.runtime_token);
             let hb_register_url = format!("{}/v1/register", dir.trim_end_matches('/'));
+            // #494 — model drift detection: capture backend probe config + registered models.
+            let hb_backend_url = self.cfg.backend_url.clone();
+            let hb_backend_api_key = self.cfg.backend_api_key.clone();
+            let hb_intent = self.cfg.intent.clone();
+            let hb_max_tokens = self.cfg.max_tokens;
+            let hb_registered_models = Arc::clone(&self.registered_models);
             tokio::spawn(async move {
                 let mut token = token;
                 let mut seq: u64 = 0;
@@ -1490,35 +1601,79 @@ impl IicpNode {
                     // expects incremental, not cumulative counts).
                     let ok = hb_tasks_success.swap(0, Ordering::Relaxed);
                     let fail = hb_tasks_failed.swap(0, Ordering::Relaxed);
+                    // #494 — probe the backend for the current model list before heartbeat.
+                    let live_models = if let Some(ref bu) = hb_backend_url {
+                        probe_health_models_bg(&http, bu, &hb_backend_api_key).await
+                    } else {
+                        None
+                    };
+                    // Build the heartbeat payload with optional health_models.
+                    let mut hb_body = json!({
+                        "node_id": &node_id,
+                        "node_token": &token,
+                        "status": "available",
+                        // Explicit availability boolean — see heartbeat() above.
+                        // Lets the directory restore a briefly-dormant node on the
+                        // next beat, even on directory builds older than v1.10.17.
+                        "available": true,
+                        // Live capacity after availability shaping (ADR-006).
+                        "max_concurrent": avail.effective_max_concurrent(max_c),
+                        // Task outcome metrics — only sent when non-zero to
+                        // avoid moving reputation on idle periods.
+                        "metrics": if ok > 0 || fail > 0 {
+                            json!({"tasks_success": ok, "tasks_failed": fail})
+                        } else {
+                            json!({})
+                        },
+                    });
+                    if let Some(ref hm) = live_models {
+                        hb_body["health_models"] = json!(hm);
+                    }
                     match http
                         // /v1/heartbeat — see heartbeat() above for the doubled-prefix
                         // history. Same fix applied here in the background loop.
                         .post(format!("{}/v1/heartbeat", dir.trim_end_matches('/')))
                         .bearer_auth(&token)
-                        .json(&json!({
-                            "node_id": &node_id,
-                            "node_token": &token,
-                            "status": "available",
-                            // Explicit availability boolean — see heartbeat() above.
-                            // Lets the directory restore a briefly-dormant node on the
-                            // next beat, even on directory builds older than v1.10.17.
-                            "available": true,
-                            // Live capacity after availability shaping (ADR-006).
-                            "max_concurrent": avail.effective_max_concurrent(max_c),
-                            // Task outcome metrics — only sent when non-zero to
-                            // avoid moving reputation on idle periods.
-                            "metrics": if ok > 0 || fail > 0 {
-                                json!({"tasks_success": ok, "tasks_failed": fail})
-                            } else {
-                                json!({})
-                            },
-                        }))
+                        .json(&hb_body)
                         .send()
                         .await
                     {
                         Ok(resp) if resp.status().is_success() => {
                             if let Some(ref log) = hb_log {
                                 log.write("heartbeat_ok", &hb_node_id, &format!("seq={seq}"));
+                            }
+                            // #494 — detect model drift; re-register when live set differs.
+                            if let Some(live) = live_models {
+                                if !live.is_empty() {
+                                    let registered = hb_registered_models
+                                        .read().expect("poisoned").clone();
+                                    let live_set: std::collections::HashSet<_> =
+                                        live.iter().cloned().collect();
+                                    let reg_set: std::collections::HashSet<_> =
+                                        registered.into_iter().collect();
+                                    if live_set != reg_set {
+                                        let mut new_payload = hb_register_payload.clone();
+                                        let new_caps = build_capabilities(
+                                            &live, &hb_intent, hb_max_tokens,
+                                        );
+                                        new_payload["capabilities"] =
+                                            serde_json::to_value(&new_caps).unwrap_or(json!([]));
+                                        if let Some(t) = reregister(
+                                            &http, &hb_register_url, &new_payload,
+                                        ).await {
+                                            *hb_registered_models.write().expect("poisoned") =
+                                                live.clone();
+                                            token = t;
+                                            if let Ok(mut g) = hb_token_arc.write() {
+                                                *g = token.clone();
+                                            }
+                                            tracing::info!(
+                                                "seq={seq} model drift: re-registered with {} models",
+                                                live.len()
+                                            );
+                                        }
+                                    }
+                                }
                             }
                         }
                         // #399 — directory no longer knows this node (it was
