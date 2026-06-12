@@ -59,6 +59,7 @@ pub mod scheduler;
 pub mod token_validator;
 pub mod trust_auditor;
 pub mod tunnel;
+pub mod updater;
 
 #[cfg(feature = "nat")]
 pub use qualify::{

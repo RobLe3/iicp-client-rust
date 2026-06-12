@@ -2890,6 +2890,28 @@ async fn main() {
         }
         return;
     }
+    if cmd == "update" {
+        // #521 P1 — read-only version check. Exit 10 when a newer release
+        // exists (cron/scripts can act), 0 when current/unreachable. No install.
+        use iicp_client::updater::{is_outdated, latest_crates_version, UPGRADE_COMMAND};
+        let current = env!("CARGO_PKG_VERSION");
+        match latest_crates_version(5).await {
+            None => {
+                println!("iicp-client {current} — could not reach crates.io to check for updates.");
+                process::exit(0);
+            }
+            Some(latest) if is_outdated(current, &latest) => {
+                println!(
+                    "iicp-client {current} — a newer release is available: {latest}\n  upgrade:  {UPGRADE_COMMAND}"
+                );
+                process::exit(10);
+            }
+            Some(latest) => {
+                println!("iicp-client {current} — up to date (latest: {latest}).");
+                process::exit(0);
+            }
+        }
+    }
     if cmd != "serve" {
         eprintln!("unknown command: {cmd}");
         print_help();
