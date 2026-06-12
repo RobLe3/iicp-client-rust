@@ -2336,7 +2336,9 @@ mod task_rate_tests {
         assert!(task_rate_step(&mut b, 1, "k", now));
         assert!(!task_rate_step(&mut b, 1, "k", now));
         // backdate the window so the next call opens a fresh one
-        let past = now.checked_sub(super::TASK_RATE_WINDOW + std::time::Duration::from_secs(1)).unwrap();
+        let past = now
+            .checked_sub(super::TASK_RATE_WINDOW + std::time::Duration::from_secs(1))
+            .unwrap();
         b.insert("k".to_string(), (past, 1));
         assert!(task_rate_step(&mut b, 1, "k", now));
     }
