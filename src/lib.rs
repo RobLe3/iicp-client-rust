@@ -58,6 +58,7 @@ pub mod relay_worker_client;
 pub mod scheduler;
 pub mod token_validator;
 pub mod trust_auditor;
+pub mod tunnel;
 
 #[cfg(feature = "nat")]
 pub use qualify::{

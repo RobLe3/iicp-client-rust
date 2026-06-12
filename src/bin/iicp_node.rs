@@ -98,6 +98,8 @@ struct ServeOpts {
     host: String,
     skip_registration: bool,
     auto_detect_nat: bool,
+    /// #520 rung 5 tri-state: Some(true)=forced, Some(false)=disabled, None=auto.
+    tunnel: Option<bool>,
     /// True when `--no-auto-detect-nat` was passed — suppresses the saved-config re-enable.
     no_auto_detect_nat: bool,
     external_ip_probe_url: String,
@@ -153,6 +155,7 @@ fn print_help() {
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
          \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
+         \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel; default auto (only when all NAT paths fail)\n\
          \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485).\n\
          \x20                            Note: relay bind authentication is pending (#510) — only run a relay\n\
          \x20                            accept port on networks you trust until the signed-bind mechanism ships.\n\
@@ -894,6 +897,11 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         host: env_or("IICP_HOST", Some("::")).unwrap(),
         skip_registration: env_bool("IICP_SKIP_REGISTRATION"),
         // Default ON — opt out with IICP_AUTO_DETECT_NAT=false.
+        tunnel: match std::env::var("IICP_TUNNEL").ok().as_deref() {
+            Some("1") | Some("true") | Some("yes") => Some(true),
+            Some("0") | Some("false") | Some("no") => Some(false),
+            _ => None,
+        },
         auto_detect_nat: std::env::var("IICP_AUTO_DETECT_NAT")
             .map(|v| v.to_lowercase() != "false" && v.to_lowercase() != "0")
             .unwrap_or(true),
@@ -931,6 +939,14 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             }
             "--relay-capable" => {
                 opts.relay_capable = true;
+                i += 1;
+            }
+            "--tunnel" => {
+                opts.tunnel = Some(true);
+                i += 1;
+            }
+            "--no-tunnel" => {
+                opts.tunnel = Some(false);
                 i += 1;
             }
             "--auto-detect-nat" => {
@@ -1598,6 +1614,10 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // when the operator's public_endpoint is bracketed-IPv6 (even without
     // --auto-detect-nat). Mirrors Python + TS cli paths.
     #[cfg(feature = "nat")]
+    // #520 rung 5 — Quick Tunnel escalation state (see src/tunnel.rs).
+    // Held for the serve lifetime; Drop/close() tears the child down.
+    let mut tunnel: Option<iicp_client::tunnel::QuickTunnel> = None;
+
     let tier0_pinhole = if !opts.auto_detect_nat && opts.public_endpoint.contains('[') {
         let r = iicp_client::nat_detection::try_open_v6_pinhole_for_endpoint(
             &opts.public_endpoint,
@@ -1841,14 +1861,55 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                     "[iicp-node] auto-elected relay: {}:{}",
                     relay_host, relay_port
                 );
+            } else if opts.tunnel != Some(false) {
+                // #520 rung 5: no relay anywhere → Quick Tunnel (zero-account),
+                // unless disabled via --no-tunnel / IICP_TUNNEL=0.
+                tunnel = try_tunnel_rung(opts.port, false);
+                if let Some(t) = &tunnel {
+                    apply_tunnel_profile(&mut node, &t.url);
+                    opts.public_endpoint = t.url.clone();
+                } else {
+                    eprintln!(
+                        "[iicp-node] NAT tier={}: no relay-capable peers and no tunnel \
+                         available. Set IICP_RELAY_WORKER_ENDPOINT=<host>:<port> to specify a relay.",
+                        profile.tier
+                    );
+                }
             } else {
                 eprintln!(
-                    "[iicp-node] NAT tier={}: no relay-capable peers in directory. \
-                     Set IICP_RELAY_WORKER_ENDPOINT=<host>:<port> to specify a relay manually.",
+                    "[iicp-node] NAT tier={}: no relay-capable peers in directory \
+                     (tunnel escalation disabled). Set IICP_RELAY_WORKER_ENDPOINT to specify a relay.",
                     profile.tier
                 );
             }
         }
+    }
+
+    // #520 — `--tunnel` forces rung 5 regardless of NAT tier.
+    if opts.tunnel == Some(true) && tunnel.is_none() {
+        tunnel = try_tunnel_rung(opts.port, true);
+        if let Some(t) = &tunnel {
+            apply_tunnel_profile(&mut node, &t.url);
+            opts.public_endpoint = t.url.clone();
+        }
+    }
+    if let Some(t) = &tunnel {
+        // Quick Tunnel URLs rotate per process. Live re-registration needs a
+        // &self endpoint setter (pending); until then, advise a restart.
+        t.watch(
+            |url| {
+                eprintln!(
+                    "[iicp-node] Quick Tunnel URL rotated to {url} — restart \
+                     `iicp-node serve` to re-register the new endpoint."
+                );
+            },
+            || {
+                eprintln!(
+                    "[iicp-node] Quick Tunnel permanently down — this node is no \
+                     longer publicly reachable. Restart `iicp-node serve` to recover."
+                );
+            },
+        );
     }
 
     let backend_url = opts.backend_url.clone();
@@ -2043,6 +2104,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
     };
 
+    if let Some(t) = &tunnel {
+        t.close(); // #520 — tear the Quick Tunnel down with the node
+    }
     // #343 — revoke pinhole + deregister on the way out, best-effort.
     #[cfg(feature = "nat")]
     {
@@ -2847,6 +2911,54 @@ async fn main() {
         process::exit(1);
     }
 }
+
+// ── #520 rung 5 helpers ───────────────────────────────────────────────────────
+
+/// Open a Quick Tunnel for rung 5, or None (missing binary / startup failure).
+fn try_tunnel_rung(port: u16, forced: bool) -> Option<iicp_client::tunnel::QuickTunnel> {
+    use iicp_client::tunnel::{
+        cloudflared_path, open_quick_tunnel, INSTALL_HINT, TUNNEL_START_TIMEOUT,
+    };
+    if cloudflared_path().is_none() {
+        eprintln!("[iicp-node] {INSTALL_HINT}");
+        return None;
+    }
+    match open_quick_tunnel(port, TUNNEL_START_TIMEOUT) {
+        Ok(t) => {
+            eprintln!(
+                "[iicp-node] NAT rung 5{}: public https endpoint via Quick Tunnel — {} \
+                 (zero-account; URL rotates on restart)",
+                if forced { " (forced)" } else { "" },
+                t.url
+            );
+            Some(t)
+        }
+        Err(e) => {
+            eprintln!("[iicp-node] Quick Tunnel failed to start: {e} — continuing without it");
+            None
+        }
+    }
+}
+
+/// Register the tunnel URL as the node endpoint via a synthesized NAT profile
+/// (tier 3 + ExternalTunnel ⇒ is_reachable, so apply_nat_profile adopts it).
+#[cfg(feature = "nat")]
+fn apply_tunnel_profile(node: &mut iicp_client::node::IicpNode, url: &str) {
+    let profile = iicp_client::nat_detection::NatProfile {
+        tier: 3,
+        transport_method: iicp_client::nat_detection::TransportMethod::ExternalTunnel,
+        public_endpoint: Some(url.to_string()),
+        transport_endpoint: None,
+        internal_endpoint: None,
+        operator_guidance: None,
+        detection_log: vec!["rung 5: quick tunnel".to_string()],
+        ipv6: None,
+    };
+    node.apply_nat_profile(&profile);
+}
+
+#[cfg(not(feature = "nat"))]
+fn apply_tunnel_profile(_node: &mut iicp_client::node::IicpNode, _url: &str) {}
 
 #[cfg(test)]
 mod tests {
