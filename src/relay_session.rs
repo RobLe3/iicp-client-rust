@@ -333,6 +333,10 @@ impl RelaySession {
 
 // ── RelaySessionRegistry ─────────────────────────────────────────────────────
 
+/// Red-team F5 (2026-06-12): cap concurrent relay sessions so a bind-flood
+/// can't exhaust relay memory / starve legitimate workers.
+pub const MAX_RELAY_SESSIONS: usize = 256;
+
 #[derive(Clone, Default)]
 pub struct RelaySessionRegistry {
     sessions: Arc<Mutex<HashMap<String, RelaySession>>>,
@@ -341,6 +345,17 @@ pub struct RelaySessionRegistry {
 impl RelaySessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// True if a NEW worker_id can't be admitted (cap reached). A rebind of an
+    /// already-bound worker_id is always allowed (F5).
+    pub fn at_capacity(&self, worker_id: &str) -> bool {
+        let sessions = self.sessions.lock().unwrap();
+        !sessions.contains_key(worker_id) && sessions.len() >= MAX_RELAY_SESSIONS
+    }
+
+    pub fn count(&self) -> usize {
+        self.sessions.lock().unwrap().len()
     }
 
     pub fn bind(&self, worker_id: String, session: RelaySession) {
@@ -532,6 +547,24 @@ async fn handle_relay_connection(
                 .map_err(|e| e.to_string())?;
             return Ok(());
         }
+    }
+
+    // Red-team F5: cap concurrent sessions (bind-flood DoS). Rebind exempt.
+    if registry.at_capacity(&worker_id) {
+        tracing::warn!(
+            "Relay: at session capacity — rejecting bind for {}",
+            worker_id
+        );
+        let nack = cbor_encode_int_map(&[
+            (1, CborVal::Text("error".into())),
+            (2, CborVal::Text(worker_id.clone())),
+            (3, CborVal::Text("relay at session capacity".into())),
+        ]);
+        writer
+            .write_all(&make_frame(MT_RELAY_ACK, &nack))
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
     }
 
     // Spawn writer task — receives frames from an unbounded channel and writes to socket.

@@ -374,3 +374,25 @@ async fn health_and_task_carry_cors() {
         .unwrap();
     assert_eq!(t.headers().get("access-control-allow-origin").unwrap(), "*");
 }
+
+// ── Red-team F5: session-cap DoS protection (2026-06-12) ─────────────────────
+
+#[test]
+fn session_cap_excludes_rebind() {
+    use iicp_client::relay_session::{HttpPollWorkerSession, RelaySession, RelaySessionRegistry};
+    let reg = RelaySessionRegistry::new();
+    // Default cap is 256; fill it, then assert new is capped but rebind isn't.
+    for i in 0..256 {
+        reg.bind(
+            format!("w-{i}"),
+            RelaySession::HttpPoll(HttpPollWorkerSession::new(
+                format!("w-{i}"),
+                String::new(),
+                vec![],
+            )),
+        );
+    }
+    assert_eq!(reg.count(), 256);
+    assert!(reg.at_capacity("w-new")); // new worker → capped
+    assert!(!reg.at_capacity("w-0")); // rebind → exempt
+}

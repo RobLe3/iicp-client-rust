@@ -664,6 +664,13 @@ async fn relay_bind_endpoint(
             ).into_response());
         }
     }
+    // Red-team F5: reject new binds past the session cap (bind-flood DoS).
+    if state.relay_sessions.at_capacity(worker_id) {
+        return relay_cors((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":{"code":"IICP-E039","message":"relay at session capacity — try another relay"}})),
+        ).into_response());
+    }
     let intent = payload
         .get("intent")
         .and_then(Value::as_str)
