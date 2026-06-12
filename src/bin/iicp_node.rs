@@ -2489,9 +2489,16 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
     }
 
     let dangerous: std::collections::HashSet<&str> =
-        ["bash", "shell", "exec", "run_command", "eval"]
-            .iter()
-            .copied()
+        // Backstop denylist on top of the operator's explicit --tools allowlist
+        // (red-team pass 3): shells/interpreters/exec primitives. The required
+        // --tools allowlist + allow_tool_execution opt-in are the primary controls.
+        [
+            "bash", "sh", "zsh", "fish", "shell", "powershell", "pwsh", "cmd",
+            "exec", "execute", "run_command", "run", "system", "eval",
+            "python", "python3", "node", "ruby", "perl", "subprocess", "popen", "spawn",
+        ]
+        .iter()
+        .copied()
             .collect();
 
     fn tool_to_intent(name: &str) -> String {
