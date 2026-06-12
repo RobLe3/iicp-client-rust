@@ -413,6 +413,38 @@ struct AppState {
     /// R1 relay-as-last-resort (#341): sessions from workers binding outbound.
     #[cfg(feature = "iicp-tcp")]
     relay_sessions: Arc<crate::relay_session::RelaySessionRegistry>,
+    /// F4 (#524) — per-Origin /v1/task fixed-window rate limit. Keyed by the
+    /// Origin header (browser/CORS confused-deputy vector); non-browser callers
+    /// send no Origin and are not throttled. (window_start, count) per origin.
+    task_rate_limit: u32,
+    task_rate_buckets: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
+}
+
+const TASK_RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// Pure fixed-window step (testable without an AppState): returns true if the
+/// origin is under `limit` for the current window.
+fn task_rate_step(
+    buckets: &mut HashMap<String, (Instant, u32)>,
+    limit: u32,
+    origin: &str,
+    now: Instant,
+) -> bool {
+    let entry = buckets.entry(origin.to_string()).or_insert((now, 0));
+    if now.duration_since(entry.0) >= TASK_RATE_WINDOW {
+        *entry = (now, 0);
+    }
+    entry.1 += 1;
+    let allowed = entry.1 <= limit;
+    if buckets.len() > 4096 {
+        buckets.retain(|_, (start, _)| now.duration_since(*start) < TASK_RATE_WINDOW);
+    }
+    allowed
+}
+
+fn task_rate_allow(state: &AppState, origin: &str) -> bool {
+    let mut buckets = state.task_rate_buckets.lock().unwrap();
+    task_rate_step(&mut buckets, state.task_rate_limit, origin, Instant::now())
 }
 
 // ── GET /iicp/health ─────────────────────────────────────────────────────────
@@ -982,6 +1014,23 @@ async fn task_endpoint(
     headers: HeaderMap,
     Json(mut req): Json<TaskRequest>,
 ) -> Response {
+    // F4 (#524) — rate-limit browser-origin task dispatch (CORS confused-deputy
+    // vector) only; non-browser callers send no Origin and are not throttled.
+    if state.task_rate_limit > 0 {
+        if let Some(origin) = headers.get("origin").and_then(|v| v.to_str().ok()) {
+            if !task_rate_allow(&state, origin) {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    [("Retry-After", "60"), ("Content-Type", "application/json")],
+                    Json(json!({
+                        "error": { "code": "IICP-E023", "message": "per-origin task rate limit exceeded" }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // #403 — CIP per-task admission gate (parity with the adapter cip_gate):
     // reject tool-execution-domain intents unless the operator opted in via
     // cip_policy.allow_tool_execution. Checked before the QoS slot so a denied
@@ -1726,6 +1775,13 @@ impl IicpNode {
             pinhole_lease_seconds: Arc::clone(&shared_pinhole_lease),
             #[cfg(feature = "iicp-tcp")]
             relay_sessions: Arc::new(crate::relay_session::RelaySessionRegistry::new()),
+            // F4 (#524) — per-Origin /v1/task rate limit; default 120/60s,
+            // IICP_TASK_RATE_LIMIT overrides (0 disables).
+            task_rate_limit: std::env::var("IICP_TASK_RATE_LIMIT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            task_rate_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
         });
 
         // Capture the availability handle before `state` is moved into the router,
@@ -2224,6 +2280,44 @@ impl IicpNode {
                 .await
                 .map_err(|e| IicpError::Node(e.to_string()))
         }
+    }
+}
+
+#[cfg(test)]
+mod task_rate_tests {
+    use super::task_rate_step;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    #[test]
+    fn allows_under_limit_then_blocks() {
+        let mut b = HashMap::new();
+        let now = Instant::now();
+        assert!(task_rate_step(&mut b, 3, "o-a", now));
+        assert!(task_rate_step(&mut b, 3, "o-a", now));
+        assert!(task_rate_step(&mut b, 3, "o-a", now));
+        assert!(!task_rate_step(&mut b, 3, "o-a", now)); // 4th over limit
+    }
+
+    #[test]
+    fn origins_are_independent() {
+        let mut b = HashMap::new();
+        let now = Instant::now();
+        assert!(task_rate_step(&mut b, 1, "o-a", now));
+        assert!(task_rate_step(&mut b, 1, "o-b", now)); // own bucket
+        assert!(!task_rate_step(&mut b, 1, "o-a", now)); // a over
+    }
+
+    #[test]
+    fn window_resets() {
+        let mut b = HashMap::new();
+        let now = Instant::now();
+        assert!(task_rate_step(&mut b, 1, "k", now));
+        assert!(!task_rate_step(&mut b, 1, "k", now));
+        // backdate the window so the next call opens a fresh one
+        let past = now.checked_sub(super::TASK_RATE_WINDOW + std::time::Duration::from_secs(1)).unwrap();
+        b.insert("k".to_string(), (past, 1));
+        assert!(task_rate_step(&mut b, 1, "k", now));
     }
 }
 
