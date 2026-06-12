@@ -8,19 +8,30 @@
 //! 3. Full round-trip: mock directory register → GET /iicp/health → POST /v1/task
 //!    → MCP tools/call → response. Uses real axum servers on loopback.
 
-use axum::{Router, routing::{get, post}, response::Json};
+use axum::{
+    response::Json,
+    routing::{get, post},
+    Router,
+};
 use serde_json::{json, Value};
 use std::net::TcpListener as StdListener;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 
 fn free_port() -> u16 {
-    StdListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    StdListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 async fn wait_port(port: u16) {
     for _ in 0..40 {
-        if reqwest::get(format!("http://127.0.0.1:{port}/iicp/health")).await.is_ok() {
+        if reqwest::get(format!("http://127.0.0.1:{port}/iicp/health"))
+            .await
+            .is_ok()
+        {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -33,13 +44,27 @@ async fn wait_port(port: u16) {
 #[test]
 fn test_tool_to_intent_produces_correct_urn() {
     fn tool_to_intent(name: &str) -> String {
-        let safe: String = name.to_lowercase().chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+        let safe: String = name
+            .to_lowercase()
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         format!("urn:iicp:intent:mcp:{safe}:v1")
     }
-    assert_eq!(tool_to_intent("read_file"), "urn:iicp:intent:mcp:read_file:v1");
-    assert_eq!(tool_to_intent("web-search"), "urn:iicp:intent:mcp:web_search:v1");
+    assert_eq!(
+        tool_to_intent("read_file"),
+        "urn:iicp:intent:mcp:read_file:v1"
+    );
+    assert_eq!(
+        tool_to_intent("web-search"),
+        "urn:iicp:intent:mcp:web_search:v1"
+    );
 }
 
 // ── test 2: dangerous tool filtering ─────────────────────────────────────────
@@ -47,9 +72,15 @@ fn test_tool_to_intent_produces_correct_urn() {
 #[test]
 fn test_dangerous_tools_are_filtered() {
     let dangerous: std::collections::HashSet<&str> =
-        ["bash", "shell", "exec", "run_command", "eval"].iter().copied().collect();
+        ["bash", "shell", "exec", "run_command", "eval"]
+            .iter()
+            .copied()
+            .collect();
     let tools = vec!["read_file", "bash", "list_dir", "exec"];
-    let active: Vec<&str> = tools.into_iter().filter(|t| !dangerous.contains(*t)).collect();
+    let active: Vec<&str> = tools
+        .into_iter()
+        .filter(|t| !dangerous.contains(*t))
+        .collect();
     assert_eq!(active, vec!["read_file", "list_dir"]);
 }
 
@@ -67,38 +98,53 @@ async fn test_mcp_gateway_registers_serves_and_dispatches() {
 
     // Mock directory server
     let dir_app = Router::new()
-        .route("/register", post({
-            let reg = reg_clone;
-            move |body: axum::body::Bytes| {
-                let reg = reg.clone();
-                async move {
-                    let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
-                    reg.lock().unwrap().push(v);
-                    Json(json!({"node_token": issued_token}))
+        .route(
+            "/register",
+            post({
+                let reg = reg_clone;
+                move |body: axum::body::Bytes| {
+                    let reg = reg.clone();
+                    async move {
+                        let v: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
+                        reg.lock().unwrap().push(v);
+                        Json(json!({"node_token": issued_token}))
+                    }
                 }
-            }
-        }))
+            }),
+        )
         .route("/heartbeat", post(|| async { Json(json!({})) }));
-    let dir_listener = TcpListener::bind(format!("127.0.0.1:{dir_port}")).await.unwrap();
+    let dir_listener = TcpListener::bind(format!("127.0.0.1:{dir_port}"))
+        .await
+        .unwrap();
     let dir_handle = tokio::spawn(async move { axum::serve(dir_listener, dir_app).await.unwrap() });
 
     // Mock MCP server
     let mcp_app = Router::new().route("/mcp", post(|| async {
         Json(json!({"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"file-contents"}]}}))
     }));
-    let mcp_listener = TcpListener::bind(format!("127.0.0.1:{mcp_port}")).await.unwrap();
+    let mcp_listener = TcpListener::bind(format!("127.0.0.1:{mcp_port}"))
+        .await
+        .unwrap();
     let mcp_handle = tokio::spawn(async move { axum::serve(mcp_listener, mcp_app).await.unwrap() });
 
     // Start gateway in background
     let _gw_args: Vec<String> = vec![
-        "--tools".into(), "read_file,list_dir".into(),
-        "--node-id".into(), "gw-rust-test-001".into(),
-        "--mcp-url".into(), format!("http://127.0.0.1:{mcp_port}"),
-        "--directory-url".into(), format!("http://127.0.0.1:{dir_port}"),
-        "--port".into(), gw_port.to_string(),
-        "--host".into(), "127.0.0.1".into(),
-        "--public-endpoint".into(), format!("http://127.0.0.1:{gw_port}"),
-        "--region".into(), "test".into(),
+        "--tools".into(),
+        "read_file,list_dir".into(),
+        "--node-id".into(),
+        "gw-rust-test-001".into(),
+        "--mcp-url".into(),
+        format!("http://127.0.0.1:{mcp_port}"),
+        "--directory-url".into(),
+        format!("http://127.0.0.1:{dir_port}"),
+        "--port".into(),
+        gw_port.to_string(),
+        "--host".into(),
+        "127.0.0.1".into(),
+        "--public-endpoint".into(),
+        format!("http://127.0.0.1:{gw_port}"),
+        "--region".into(),
+        "test".into(),
     ];
 
     let gw_handle = tokio::spawn(async move {
@@ -116,8 +162,18 @@ async fn test_mcp_gateway_registers_serves_and_dispatches() {
         let tok_clone = token.clone();
 
         #[derive(Clone)]
-        struct S { nid: String, tools: Vec<String>, mcp: String, tok: Arc<Mutex<String>> }
-        let s = S { nid: node_id.into(), tools: active_tools, mcp: mcp_url, tok: tok_clone };
+        struct S {
+            nid: String,
+            tools: Vec<String>,
+            mcp: String,
+            tok: Arc<Mutex<String>>,
+        }
+        let s = S {
+            nid: node_id.into(),
+            tools: active_tools,
+            mcp: mcp_url,
+            tok: tok_clone,
+        };
 
         let app = Router::new()
             .route("/iicp/health", get({
@@ -156,7 +212,9 @@ async fn test_mcp_gateway_registers_serves_and_dispatches() {
                 }
             }));
 
-        let listener = TcpListener::bind(format!("127.0.0.1:{gw_port}")).await.unwrap();
+        let listener = TcpListener::bind(format!("127.0.0.1:{gw_port}"))
+            .await
+            .unwrap();
         axum::serve(listener, app).await.unwrap();
     });
 
@@ -165,11 +223,21 @@ async fn test_mcp_gateway_registers_serves_and_dispatches() {
     let client = reqwest::Client::new();
 
     // Test /iicp/health
-    let health: Value = client.get(format!("http://127.0.0.1:{gw_port}/iicp/health"))
-        .send().await.unwrap().json().await.unwrap();
+    let health: Value = client
+        .get(format!("http://127.0.0.1:{gw_port}/iicp/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert_eq!(health["status"], "ok", "health status must be ok");
     assert_eq!(health["node_id"], "gw-rust-test-001");
-    assert!(health["active_tools"].as_array().unwrap().iter().any(|v| v == "read_file"));
+    assert!(health["active_tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "read_file"));
 
     // Test /v1/task
     let task_resp: Value = client.post(format!("http://127.0.0.1:{gw_port}/v1/task"))

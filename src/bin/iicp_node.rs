@@ -2385,11 +2385,11 @@ async fn run_proxy_cmd(args: &[String]) -> Result<(), String> {
 // ── mcp-gateway (#512) — bridge a local MCP server as an IICP provider node ─
 async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
     use axum::{
-        Router,
         extract::State,
         http::{HeaderMap, StatusCode},
         response::Json,
         routing::{get, post},
+        Router,
     };
     use serde_json::{json, Value};
     use std::sync::{Arc, Mutex};
@@ -2414,44 +2414,99 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
     }
 
     let dangerous: std::collections::HashSet<&str> =
-        ["bash", "shell", "exec", "run_command", "eval"].iter().copied().collect();
+        ["bash", "shell", "exec", "run_command", "eval"]
+            .iter()
+            .copied()
+            .collect();
 
     fn tool_to_intent(name: &str) -> String {
-        let safe: String = name.to_lowercase()
+        let safe: String = name
+            .to_lowercase()
             .chars()
-            .map(|c| if c.is_ascii_alphanumeric() || c == '_' { c } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         format!("urn:iicp:intent:mcp:{safe}:v1")
     }
 
-    let mut mcp_url = env::var("IICP_MCP_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
+    let mut mcp_url =
+        env::var("IICP_MCP_URL").unwrap_or_else(|_| "http://localhost:8001".to_string());
     let mut raw_tools = env::var("IICP_MCP_TOOLS").unwrap_or_default();
     let mut node_id = env::var("IICP_NODE_ID").unwrap_or_default();
     let mut public_endpoint = env::var("IICP_PUBLIC_ENDPOINT").unwrap_or_default();
-    let mut directory_url = env::var("IICP_DIRECTORY_URL").unwrap_or_else(|_| "https://iicp.network/api/v1".to_string());
+    let mut directory_url = env::var("IICP_DIRECTORY_URL")
+        .unwrap_or_else(|_| "https://iicp.network/api/v1".to_string());
     let mut region = env::var("IICP_REGION").unwrap_or_else(|_| "local".to_string());
-    let mut port: u16 = env::var("IICP_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(9484);
+    let mut port: u16 = env::var("IICP_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9484);
     let mut host = env::var("IICP_HOST").unwrap_or_else(|_| "::".to_string());
     let node_token_env = env::var("IICP_NODE_TOKEN").unwrap_or_default();
 
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--mcp-url" => { i += 1; mcp_url = args.get(i).cloned().ok_or("--mcp-url needs a value")?; }
-            "--tools" => { i += 1; raw_tools = args.get(i).cloned().ok_or("--tools needs a value")?; }
-            "--node-id" => { i += 1; node_id = args.get(i).cloned().ok_or("--node-id needs a value")?; }
-            "--public-endpoint" => { i += 1; public_endpoint = args.get(i).cloned().ok_or("--public-endpoint needs a value")?; }
-            "--directory-url" => { i += 1; directory_url = args.get(i).cloned().ok_or("--directory-url needs a value")?; }
-            "--region" => { i += 1; region = args.get(i).cloned().ok_or("--region needs a value")?; }
-            "--port" => { i += 1; port = args.get(i).and_then(|s| s.parse().ok()).ok_or("--port needs a number")?; }
-            "--host" => { i += 1; host = args.get(i).cloned().ok_or("--host needs a value")?; }
+            "--mcp-url" => {
+                i += 1;
+                mcp_url = args.get(i).cloned().ok_or("--mcp-url needs a value")?;
+            }
+            "--tools" => {
+                i += 1;
+                raw_tools = args.get(i).cloned().ok_or("--tools needs a value")?;
+            }
+            "--node-id" => {
+                i += 1;
+                node_id = args.get(i).cloned().ok_or("--node-id needs a value")?;
+            }
+            "--public-endpoint" => {
+                i += 1;
+                public_endpoint = args
+                    .get(i)
+                    .cloned()
+                    .ok_or("--public-endpoint needs a value")?;
+            }
+            "--directory-url" => {
+                i += 1;
+                directory_url = args
+                    .get(i)
+                    .cloned()
+                    .ok_or("--directory-url needs a value")?;
+            }
+            "--region" => {
+                i += 1;
+                region = args.get(i).cloned().ok_or("--region needs a value")?;
+            }
+            "--port" => {
+                i += 1;
+                port = args
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--port needs a number")?;
+            }
+            "--host" => {
+                i += 1;
+                host = args.get(i).cloned().ok_or("--host needs a value")?;
+            }
             other => return Err(format!("unknown mcp-gateway flag: {other}")),
         }
         i += 1;
     }
 
-    let parsed_tools: Vec<String> = raw_tools.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
-    let active_tools: Vec<String> = parsed_tools.into_iter().filter(|t| !dangerous.contains(t.to_lowercase().as_str())).collect();
+    let parsed_tools: Vec<String> = raw_tools
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let active_tools: Vec<String> = parsed_tools
+        .into_iter()
+        .filter(|t| !dangerous.contains(t.to_lowercase().as_str()))
+        .collect();
 
     if active_tools.is_empty() {
         eprintln!("ERROR: --tools is required. Provide a comma-separated list of MCP tool names.\n  Example: iicp-node mcp-gateway --tools read_file,list_dir --mcp-url http://localhost:8001");
@@ -2469,7 +2524,10 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
     let intents: Vec<String> = active_tools.iter().map(|t| tool_to_intent(t)).collect();
 
     // Register
-    let http_client = reqwest::Client::builder().timeout(std::time::Duration::from_secs(10)).build().map_err(|e| e.to_string())?;
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
     let mut node_token = node_token_env.clone();
     {
         let payload = json!({
@@ -2480,17 +2538,32 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             "mcp_tools": active_tools,
             "protocol_version": "1.0",
         });
-        let mut req = http_client.post(format!("{directory_url}/register")).json(&payload);
-        if !node_token.is_empty() { req = req.bearer_auth(&node_token); }
+        let mut req = http_client
+            .post(format!("{directory_url}/register"))
+            .json(&payload);
+        if !node_token.is_empty() {
+            req = req.bearer_auth(&node_token);
+        }
         match req.send().await {
             Ok(r) if r.status().is_success() => {
                 let data: Value = r.json().await.unwrap_or_default();
-                if let Some(t) = data["node_token"].as_str() { node_token = t.to_string(); }
-                println!("iicp-node mcp-gateway registered as {node_id:?} with {} tool(s): {}", active_tools.len(), active_tools.join(", "));
+                if let Some(t) = data["node_token"].as_str() {
+                    node_token = t.to_string();
+                }
+                println!(
+                    "iicp-node mcp-gateway registered as {node_id:?} with {} tool(s): {}",
+                    active_tools.len(),
+                    active_tools.join(", ")
+                );
                 println!("  IICP endpoint: {public_endpoint}\n  MCP server:    {mcp_url}");
             }
-            Err(e) => eprintln!("WARNING: directory registration failed ({e}) — running without listing"),
-            Ok(r) => eprintln!("WARNING: directory registration returned {} — running without listing", r.status()),
+            Err(e) => {
+                eprintln!("WARNING: directory registration failed ({e}) — running without listing")
+            }
+            Ok(r) => eprintln!(
+                "WARNING: directory registration returned {} — running without listing",
+                r.status()
+            ),
         }
     }
 
@@ -2507,7 +2580,12 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             interval.tick().await;
             let tok = hb_token_clone.lock().map(|g| g.clone()).unwrap_or_default();
             let payload = json!({"node_id": hb_node_id, "intents": hb_intents, "load": 0.0, "status": "active"});
-            let _ = hb_client.post(format!("{hb_dir}/heartbeat")).bearer_auth(&tok).json(&payload).send().await;
+            let _ = hb_client
+                .post(format!("{hb_dir}/heartbeat"))
+                .bearer_auth(&tok)
+                .json(&payload)
+                .send()
+                .await;
         }
     });
 
@@ -2532,51 +2610,130 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
     };
 
     async fn health_handler(State(s): State<GwState>) -> Json<Value> {
-        let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        Json(json!({"status": "ok", "node_id": s.node_id, "active_tools": s.active_tools, "mcp_server": s.mcp_url, "timestamp": ts}))
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Json(
+            json!({"status": "ok", "node_id": s.node_id, "active_tools": s.active_tools, "mcp_server": s.mcp_url, "timestamp": ts}),
+        )
     }
 
-    async fn task_handler(State(s): State<GwState>, headers: HeaderMap, body: axum::body::Bytes) -> (StatusCode, Json<Value>) {
-        let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("");
+    async fn task_handler(
+        State(s): State<GwState>,
+        headers: HeaderMap,
+        body: axum::body::Bytes,
+    ) -> (StatusCode, Json<Value>) {
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         let tok = s.node_token.lock().map(|g| g.clone()).unwrap_or_default();
         if !tok.is_empty() && auth != format!("Bearer {tok}") {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"error": "Unauthorized"})));
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Unauthorized"})),
+            );
         }
         let req_body: Value = match serde_json::from_slice(&body) {
-            Ok(v) => v, Err(_) => return (StatusCode::BAD_REQUEST, Json(json!({"error": "invalid JSON"}))),
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "invalid JSON"})),
+                )
+            }
         };
-        let payload = req_body.get("payload").and_then(|v| v.as_object()).cloned().unwrap_or_default();
-        let mut tool_name = payload.get("tool_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let payload = req_body
+            .get("payload")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        let mut tool_name = payload
+            .get("tool_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if tool_name.is_empty() {
             if let Some(intent) = req_body.get("intent").and_then(|v| v.as_str()) {
-                if let Some(cap) = regex::Regex::new(r"urn:iicp:intent:mcp:([^:]+):v1").ok().and_then(|re| re.captures(intent)) {
+                if let Some(cap) = regex::Regex::new(r"urn:iicp:intent:mcp:([^:]+):v1")
+                    .ok()
+                    .and_then(|re| re.captures(intent))
+                {
                     tool_name = cap[1].to_string();
                 }
             }
         }
-        if tool_name.is_empty() { return (StatusCode::BAD_REQUEST, Json(json!({"error": "Cannot determine tool name"}))); }
-        let dangerous: std::collections::HashSet<&str> = ["bash","shell","exec","run_command","eval"].iter().copied().collect();
-        if dangerous.contains(tool_name.to_lowercase().as_str()) { return (StatusCode::FORBIDDEN, Json(json!({"error": "Tool not permitted"}))); }
-        if !s.active_tools.is_empty() && !s.active_tools.contains(&tool_name) { return (StatusCode::NOT_FOUND, Json(json!({"error": "Tool not available"}))); }
-        let task_id = req_body.get("task_id").and_then(|v| v.as_str()).unwrap_or(&uuid::Uuid::new_v4().to_string()).to_string();
+        if tool_name.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Cannot determine tool name"})),
+            );
+        }
+        let dangerous: std::collections::HashSet<&str> =
+            ["bash", "shell", "exec", "run_command", "eval"]
+                .iter()
+                .copied()
+                .collect();
+        if dangerous.contains(tool_name.to_lowercase().as_str()) {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "Tool not permitted"})),
+            );
+        }
+        if !s.active_tools.is_empty() && !s.active_tools.contains(&tool_name) {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({"error": "Tool not available"})),
+            );
+        }
+        let task_id = req_body
+            .get("task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&uuid::Uuid::new_v4().to_string())
+            .to_string();
         let arguments = payload.get("arguments").cloned().unwrap_or(json!({}));
-        let rpc_id = { let mut g = s.mcp_rpc_id.lock().unwrap(); *g += 1; *g };
+        let rpc_id = {
+            let mut g = s.mcp_rpc_id.lock().unwrap();
+            *g += 1;
+            *g
+        };
         let rpc = json!({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call","params":{"name":tool_name,"arguments":arguments}});
-        match s.mcp_client.post(format!("{}/mcp", s.mcp_url)).json(&rpc).timeout(std::time::Duration::from_secs(30)).send().await {
-            Err(_) => (StatusCode::BAD_GATEWAY, Json(json!({"error":"MCP server unreachable"}))),
-            Ok(resp) => {
-                match resp.json::<Value>().await {
-                    Err(_) => (StatusCode::BAD_GATEWAY, Json(json!({"error":"invalid MCP response"}))),
-                    Ok(data) => {
-                        if let Some(err) = data.get("error") {
-                            let msg = err.get("message").and_then(|v| v.as_str()).unwrap_or("MCP error");
-                            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": msg})));
-                        }
-                        let result = data.get("result").cloned().unwrap_or(Value::Null);
-                        (StatusCode::OK, Json(json!({"task_id": task_id, "status": "completed", "result": result})))
+        match s
+            .mcp_client
+            .post(format!("{}/mcp", s.mcp_url))
+            .json(&rpc)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Err(_) => (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error":"MCP server unreachable"})),
+            ),
+            Ok(resp) => match resp.json::<Value>().await {
+                Err(_) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error":"invalid MCP response"})),
+                ),
+                Ok(data) => {
+                    if let Some(err) = data.get("error") {
+                        let msg = err
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("MCP error");
+                        return (
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            Json(json!({"error": msg})),
+                        );
                     }
+                    let result = data.get("result").cloned().unwrap_or(Value::Null);
+                    (
+                        StatusCode::OK,
+                        Json(json!({"task_id": task_id, "status": "completed", "result": result})),
+                    )
                 }
-            }
+            },
         }
     }
 
@@ -2586,9 +2743,13 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         .with_state(state);
 
     let bind_addr = format!("{host}:{port}");
-    let listener = TcpListener::bind(&bind_addr).await.map_err(|e| format!("bind {bind_addr}: {e}"))?;
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(|e| format!("bind {bind_addr}: {e}"))?;
     println!("  Listening on {bind_addr}");
-    axum::serve(listener, app).await.map_err(|e| e.to_string())?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
