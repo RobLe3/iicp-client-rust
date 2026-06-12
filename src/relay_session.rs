@@ -179,11 +179,163 @@ impl RelayWorkerSession {
     }
 }
 
+// ── HttpPollWorkerSession (#450 browser workers) ─────────────────────────────
+
+/// One bound HTTP long-poll relay-worker session.
+///
+/// Same forward/respond semantics as [`RelayWorkerSession`] — the registry
+/// stores both behind [`RelaySession`] so relay handlers treat the transports
+/// identically. Instead of pushing CALL frames down a TCP socket,
+/// `forward_task()` queues the call for the worker's `GET /v1/relay/pull`
+/// long-poll; the worker posts the result via `POST /v1/relay/result`.
+///
+/// Auth: `session_token` is issued at bind and presented as a Bearer token on
+/// pull/result/unbind — stronger than the unauthenticated TCP RELAY_BIND
+/// (#510), applied to the new transport from day one.
+///
+/// Liveness = the worker pulled within `liveness_window`. A dead session is
+/// displaceable by a fresh bind (#510 interim-C: an ALIVE session never is).
+#[derive(Clone)]
+pub struct HttpPollWorkerSession {
+    pub worker_id: String,
+    pub intent: String,
+    pub models: Vec<String>,
+    pub session_token: String,
+    call_tx: mpsc::UnboundedSender<Value>,
+    call_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>>,
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    last_pull: Arc<Mutex<std::time::Instant>>,
+    liveness_window: std::time::Duration,
+    closed: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl HttpPollWorkerSession {
+    pub fn new(worker_id: String, intent: String, models: Vec<String>) -> Self {
+        Self::with_liveness_window(
+            worker_id,
+            intent,
+            models,
+            std::time::Duration::from_secs(90),
+        )
+    }
+
+    pub fn with_liveness_window(
+        worker_id: String,
+        intent: String,
+        models: Vec<String>,
+        liveness_window: std::time::Duration,
+    ) -> Self {
+        let (call_tx, call_rx) = mpsc::unbounded_channel();
+        Self {
+            worker_id,
+            intent,
+            models,
+            session_token: Uuid::new_v4().simple().to_string(),
+            call_tx,
+            call_rx: Arc::new(tokio::sync::Mutex::new(call_rx)),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            last_pull: Arc::new(Mutex::new(std::time::Instant::now())),
+            liveness_window,
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// Queue a CALL for the polling worker and await its RESPONSE.
+    pub async fn forward_task(&self, task: &Value, timeout_secs: u64) -> Result<Value, String> {
+        let call_id = Uuid::new_v4().to_string();
+        let (tx, rx) = oneshot::channel::<Value>();
+        self.pending.lock().unwrap().insert(call_id.clone(), tx);
+        let call = serde_json::json!({ "call_id": call_id, "task": task });
+        if self.call_tx.send(call).is_err() {
+            self.pending.lock().unwrap().remove(&call_id);
+            return Err("relay poll session closed".into());
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => Err("relay session closed".into()),
+            Err(_) => {
+                self.pending.lock().unwrap().remove(&call_id);
+                Err(format!(
+                    "relay forward timeout ({timeout_secs}s) for call {call_id}"
+                ))
+            }
+        }
+    }
+
+    /// Long-poll: next queued CALL, or `None` when the window elapses.
+    pub async fn next_call(&self, timeout: std::time::Duration) -> Option<Value> {
+        *self.last_pull.lock().unwrap() = std::time::Instant::now();
+        let mut rx = self.call_rx.lock().await;
+        let out = tokio::time::timeout(timeout, rx.recv())
+            .await
+            .ok()
+            .flatten();
+        *self.last_pull.lock().unwrap() = std::time::Instant::now();
+        out
+    }
+
+    pub fn is_alive(&self) -> bool {
+        !self.closed.load(std::sync::atomic::Ordering::Relaxed)
+            && self.last_pull.lock().unwrap().elapsed() < self.liveness_window
+    }
+
+    pub fn on_response(&self, call_id: &str, result: Value) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(call_id) {
+            let _ = tx.send(result);
+        }
+    }
+
+    pub fn close(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+// ── RelaySession (transport-agnostic handle) ─────────────────────────────────
+
+/// A bound relay-worker session over either transport (TCP frames or HTTP
+/// long-poll). Relay handlers forward through this without caring which.
+#[derive(Clone)]
+pub enum RelaySession {
+    Tcp(RelayWorkerSession),
+    HttpPoll(HttpPollWorkerSession),
+}
+
+impl RelaySession {
+    pub async fn forward_task(&self, task: &Value, timeout_secs: u64) -> Result<Value, String> {
+        match self {
+            RelaySession::Tcp(s) => s.forward_task(task, timeout_secs).await,
+            RelaySession::HttpPoll(s) => s.forward_task(task, timeout_secs).await,
+        }
+    }
+
+    pub fn is_alive(&self) -> bool {
+        match self {
+            RelaySession::Tcp(s) => s.is_alive(),
+            RelaySession::HttpPoll(s) => s.is_alive(),
+        }
+    }
+
+    pub fn on_response(&self, call_id: &str, result: Value) {
+        match self {
+            RelaySession::Tcp(s) => s.on_response(call_id, result),
+            RelaySession::HttpPoll(s) => s.on_response(call_id, result),
+        }
+    }
+
+    pub fn models(&self) -> Vec<String> {
+        match self {
+            RelaySession::Tcp(_) => vec![],
+            RelaySession::HttpPoll(s) => s.models.clone(),
+        }
+    }
+}
+
 // ── RelaySessionRegistry ─────────────────────────────────────────────────────
 
 #[derive(Clone, Default)]
 pub struct RelaySessionRegistry {
-    sessions: Arc<Mutex<HashMap<String, RelayWorkerSession>>>,
+    sessions: Arc<Mutex<HashMap<String, RelaySession>>>,
 }
 
 impl RelaySessionRegistry {
@@ -191,7 +343,7 @@ impl RelaySessionRegistry {
         Self::default()
     }
 
-    pub fn bind(&self, worker_id: String, session: RelayWorkerSession) {
+    pub fn bind(&self, worker_id: String, session: RelaySession) {
         self.sessions.lock().unwrap().insert(worker_id, session);
     }
 
@@ -205,15 +357,30 @@ impl RelaySessionRegistry {
     /// this worker_id — the ending session must not displace it on teardown.
     pub fn unbind_session(&self, worker_id: &str, session: &RelayWorkerSession) {
         let mut sessions = self.sessions.lock().unwrap();
-        if let Some(existing) = sessions.get(worker_id) {
+        if let Some(RelaySession::Tcp(existing)) = sessions.get(worker_id) {
             if Arc::ptr_eq(&existing.pending, &session.pending) {
                 sessions.remove(worker_id);
             }
         }
     }
 
-    pub fn get(&self, worker_id: &str) -> Option<RelayWorkerSession> {
+    pub fn get(&self, worker_id: &str) -> Option<RelaySession> {
         self.sessions.lock().unwrap().get(worker_id).cloned()
+    }
+
+    /// Find an HTTP-poll session by its bearer token (pull/result auth, #450).
+    pub fn get_by_token(&self, token: &str) -> Option<HttpPollWorkerSession> {
+        if token.is_empty() {
+            return None;
+        }
+        self.sessions
+            .lock()
+            .unwrap()
+            .values()
+            .find_map(|s| match s {
+                RelaySession::HttpPoll(p) if p.session_token == token => Some(p.clone()),
+                _ => None,
+            })
     }
 
     pub fn is_bound(&self, worker_id: &str) -> bool {
@@ -231,14 +398,27 @@ pub struct RelayAcceptServer {
     pub registry: RelaySessionRegistry,
     pub host: String,
     pub port: u16,
+    /// The relay's public HTTP task port — advertised in RELAY_ACK (field 4)
+    /// so workers can register {relay}:{http_port}/v1/relay-for/<wid> (#450).
+    pub http_port: u16,
 }
 
 impl RelayAcceptServer {
     pub fn new(registry: RelaySessionRegistry, host: impl Into<String>, port: u16) -> Self {
+        Self::with_http_port(registry, host, port, 9484)
+    }
+
+    pub fn with_http_port(
+        registry: RelaySessionRegistry,
+        host: impl Into<String>,
+        port: u16,
+        http_port: u16,
+    ) -> Self {
         Self {
             registry,
             host: host.into(),
             port,
+            http_port,
         }
     }
 
@@ -253,8 +433,9 @@ impl RelayAcceptServer {
                 Ok((stream, peer)) => {
                     tracing::debug!("Relay accept: connection from {peer}");
                     let reg = self.registry.clone();
+                    let http_port = self.http_port;
                     tokio::spawn(async move {
-                        if let Err(e) = handle_relay_connection(stream, reg).await {
+                        if let Err(e) = handle_relay_connection(stream, reg, http_port).await {
                             tracing::warn!("Relay session error from {peer}: {e}");
                         }
                     });
@@ -294,6 +475,7 @@ async fn read_frame(reader: &mut (impl AsyncReadExt + Unpin)) -> Result<(u8, Vec
 async fn handle_relay_connection(
     stream: TcpStream,
     registry: RelaySessionRegistry,
+    http_port: u16,
 ) -> Result<(), String> {
     let peer = stream
         .peer_addr()
@@ -363,12 +545,16 @@ async fn handle_relay_connection(
     });
 
     let session = RelayWorkerSession::new(worker_id.clone(), write_tx);
-    registry.bind(worker_id.clone(), session.clone());
+    registry.bind(worker_id.clone(), RelaySession::Tcp(session.clone()));
     tracing::info!("Relay: worker={} bound (intent={})", worker_id, intent);
 
+    // Field 4 (additive, #450): the relay's HTTP task port, so the worker can
+    // register {relay_host}:{http_port}/v1/relay-for/{worker_id} with the
+    // directory. Old workers ignore unknown CBOR keys.
     let relay_ack = cbor_encode_int_map(&[
         (1, CborVal::Text("ok".into())),
         (2, CborVal::Text(worker_id.clone())),
+        (4, CborVal::Integer(i64::from(http_port).into())),
     ]);
     session.send_raw(make_frame(MT_RELAY_ACK, &relay_ack))?;
 
@@ -435,7 +621,7 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let session = RelayWorkerSession::new("w-001".into(), tx);
         assert!(!reg.is_bound("w-001"));
-        reg.bind("w-001".into(), session);
+        reg.bind("w-001".into(), RelaySession::Tcp(session));
         assert!(reg.is_bound("w-001"));
         assert!(reg.get("w-001").is_some());
         reg.unbind("w-001");
@@ -472,8 +658,8 @@ mod tests {
             let (tx, _rx) = mpsc::unbounded_channel();
             RelayWorkerSession::new(id.into(), tx)
         };
-        reg.bind("a".into(), mk("a"));
-        reg.bind("b".into(), mk("b"));
+        reg.bind("a".into(), RelaySession::Tcp(mk("a")));
+        reg.bind("b".into(), RelaySession::Tcp(mk("b")));
         let mut ids = reg.bound_worker_ids();
         ids.sort();
         assert_eq!(ids, vec!["a", "b"]);
@@ -492,7 +678,7 @@ mod tests {
                 if let Ok((stream, _peer)) = listener.accept().await {
                     let reg = registry.clone();
                     tokio::spawn(async move {
-                        let _ = handle_relay_connection(stream, reg).await;
+                        let _ = handle_relay_connection(stream, reg, 9484).await;
                     });
                 }
             }
@@ -545,8 +731,12 @@ mod tests {
 
         // A's session remains installed and still receives dispatches.
         let still = reg.get("w-hijack").expect("registry entry must remain");
+        let tcp_pending = |s: &RelaySession| match s {
+            RelaySession::Tcp(t) => Arc::clone(&t.pending),
+            RelaySession::HttpPoll(_) => panic!("expected TCP session"),
+        };
         assert!(
-            Arc::ptr_eq(&still.pending, &session_a.pending),
+            Arc::ptr_eq(&tcp_pending(&still), &tcp_pending(&session_a)),
             "registry entry must not be replaced"
         );
         assert!(still.is_alive());

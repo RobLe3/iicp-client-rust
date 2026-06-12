@@ -597,6 +597,233 @@ async fn relay_endpoint(
     }
 }
 
+// ── HTTP long-poll relay worker transport (#450) ──────────────────────────────
+// Browser-compatible worker side: bind → pull (long-poll) → result. Same
+// RelaySessionRegistry as TCP RELAY_BIND workers; consumers reach both via
+// the path-scoped /v1/relay-for/:wid endpoints. All responses carry CORS
+// headers (web pages are first-class callers of this transport).
+
+#[cfg(feature = "iicp-tcp")]
+fn relay_cors(mut resp: Response) -> Response {
+    let h = resp.headers_mut();
+    h.insert("Access-Control-Allow-Origin", "*".parse().expect("static"));
+    h.insert(
+        "Access-Control-Allow-Methods",
+        "GET, POST, OPTIONS".parse().expect("static"),
+    );
+    h.insert(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization".parse().expect("static"),
+    );
+    resp
+}
+
+#[cfg(feature = "iicp-tcp")]
+async fn relay_cors_preflight() -> Response {
+    let mut resp = StatusCode::NO_CONTENT.into_response();
+    resp.headers_mut()
+        .insert("Access-Control-Max-Age", "86400".parse().expect("static"));
+    relay_cors(resp)
+}
+
+#[cfg(feature = "iicp-tcp")]
+fn relay_authed_session(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Option<crate::relay_session::HttpPollWorkerSession> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token = auth.strip_prefix("Bearer ").unwrap_or("");
+    state.relay_sessions.get_by_token(token)
+}
+
+#[cfg(feature = "iicp-tcp")]
+async fn relay_bind_endpoint(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Value>,
+) -> Response {
+    let worker_id = payload
+        .get("worker_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if worker_id.is_empty() {
+        return relay_cors(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":{"code":"IICP-E001","message":"worker_id is required"}})),
+            )
+                .into_response(),
+        );
+    }
+    // #510 interim-C parity: never displace an ALIVE bound session.
+    if let Some(existing) = state.relay_sessions.get(worker_id) {
+        if existing.is_alive() {
+            return relay_cors((
+                StatusCode::CONFLICT,
+                Json(json!({"error":{"code":"IICP-E038","message":"worker_id has an alive relay session — rebind rejected"}})),
+            ).into_response());
+        }
+    }
+    let intent = payload
+        .get("intent")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let models: Vec<String> = payload
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let session = crate::relay_session::HttpPollWorkerSession::new(
+        worker_id.to_string(),
+        intent,
+        models.clone(),
+    );
+    let token = session.session_token.clone();
+    state.relay_sessions.bind(
+        worker_id.to_string(),
+        crate::relay_session::RelaySession::HttpPoll(session),
+    );
+    tracing::info!(
+        "HTTP-poll relay worker bound: {} (models={})",
+        worker_id,
+        models.join(",")
+    );
+    relay_cors(
+        Json(json!({
+            "session_token": token,
+            "poll_timeout_s": 25,
+            "worker_endpoint_path": format!("/v1/relay-for/{worker_id}"),
+        }))
+        .into_response(),
+    )
+}
+
+#[cfg(feature = "iicp-tcp")]
+async fn relay_pull_endpoint(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(session) = relay_authed_session(&state, &headers) else {
+        return relay_cors((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":{"code":"IICP-E021","message":"invalid or missing relay session token"}})),
+        ).into_response());
+    };
+    match session.next_call(Duration::from_secs(25)).await {
+        Some(call) => relay_cors(Json(call).into_response()),
+        None => relay_cors(StatusCode::NO_CONTENT.into_response()),
+    }
+}
+
+#[cfg(feature = "iicp-tcp")]
+async fn relay_result_endpoint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<Value>,
+) -> Response {
+    let Some(session) = relay_authed_session(&state, &headers) else {
+        return relay_cors((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":{"code":"IICP-E021","message":"invalid or missing relay session token"}})),
+        ).into_response());
+    };
+    let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
+    let result = payload.get("result");
+    if call_id.is_empty() || !result.map(Value::is_object).unwrap_or(false) {
+        return relay_cors(
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error":{"code":"IICP-E001","message":"call_id and result are required"}})),
+            )
+                .into_response(),
+        );
+    }
+    session.on_response(call_id, result.expect("checked above").clone());
+    relay_cors(StatusCode::NO_CONTENT.into_response())
+}
+
+#[cfg(feature = "iicp-tcp")]
+async fn relay_unbind_endpoint(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(session) = relay_authed_session(&state, &headers) else {
+        return relay_cors((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error":{"code":"IICP-E021","message":"invalid or missing relay session token"}})),
+        ).into_response());
+    };
+    session.close();
+    state.relay_sessions.unbind(&session.worker_id);
+    tracing::info!("HTTP-poll relay worker unbound: {}", session.worker_id);
+    relay_cors(StatusCode::NO_CONTENT.into_response())
+}
+
+// ── Path-scoped worker endpoints: /v1/relay-for/:wid/… (#450) ─────────────────
+// Relay-bound workers register endpoint={relay}/v1/relay-for/<wid> with the
+// directory, so PUBLISHED consumers — which compose "{endpoint}/v1/task" —
+// route through the relay with no client changes.
+
+#[cfg(feature = "iicp-tcp")]
+async fn relay_for_task_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(wid): axum::extract::Path<String>,
+    Json(task): Json<Value>,
+) -> Response {
+    let session = match state.relay_sessions.get(&wid) {
+        Some(s) if s.is_alive() => s,
+        _ => {
+            return relay_cors((
+                StatusCode::NOT_FOUND,
+                Json(json!({"error":{"code":"IICP-E030","message":"no alive relay session for this worker"}})),
+            ).into_response());
+        }
+    };
+    match session.forward_task(&task, 120).await {
+        Ok(result) => {
+            let task_id = task.get("task_id").and_then(Value::as_str).unwrap_or("");
+            // Merge the worker's result object into the response envelope
+            // ({task_id, status, ...result}) — parity with Python/TS so
+            // consumers' chat() parses choices unchanged.
+            let mut body = json!({"task_id": task_id, "status": "completed"});
+            if let (Some(obj), Some(res_obj)) = (body.as_object_mut(), result.as_object()) {
+                for (k, v) in res_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+            relay_cors(Json(body).into_response())
+        }
+        Err(e) => relay_cors((
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error":{"code":"IICP-E031","message":format!("relay session forward failed: {e}")}})),
+        ).into_response()),
+    }
+}
+
+#[cfg(feature = "iicp-tcp")]
+async fn relay_for_health_endpoint(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(wid): axum::extract::Path<String>,
+) -> Response {
+    match state.relay_sessions.get(&wid) {
+        Some(s) if s.is_alive() => relay_cors(
+            Json(json!({
+                "status": "ok",
+                "node_id": wid,
+                "via_relay": true,
+                "models": s.models(),
+            }))
+            .into_response(),
+        ),
+        _ => relay_cors((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error":{"code":"IICP-E030","message":"no alive relay session for this worker"}})),
+        ).into_response()),
+    }
+}
+
 // ── POST /v1/task ─────────────────────────────────────────────────────────────
 
 /// Recursive canonical JSON — byte-identical to the directory's signing form.
@@ -1523,6 +1750,37 @@ impl IicpNode {
         }
         if self.cfg.relay_capable {
             app = app.route("/v1/relay", post(relay_endpoint));
+            // #450 — HTTP long-poll relay worker transport (browser workers)
+            // + path-scoped consumer endpoints. CORS preflight via OPTIONS
+            // handlers (web pages are first-class callers).
+            #[cfg(feature = "iicp-tcp")]
+            {
+                app = app
+                    .route(
+                        "/v1/relay/bind",
+                        post(relay_bind_endpoint).options(relay_cors_preflight),
+                    )
+                    .route(
+                        "/v1/relay/pull",
+                        get(relay_pull_endpoint).options(relay_cors_preflight),
+                    )
+                    .route(
+                        "/v1/relay/result",
+                        post(relay_result_endpoint).options(relay_cors_preflight),
+                    )
+                    .route(
+                        "/v1/relay/unbind",
+                        post(relay_unbind_endpoint).options(relay_cors_preflight),
+                    )
+                    .route(
+                        "/v1/relay-for/:wid/v1/task",
+                        post(relay_for_task_endpoint).options(relay_cors_preflight),
+                    )
+                    .route(
+                        "/v1/relay-for/:wid/iicp/health",
+                        get(relay_for_health_endpoint).options(relay_cors_preflight),
+                    );
+            }
         }
         // R1: capture relay_sessions Arc before state is moved into the router.
         #[cfg(feature = "iicp-tcp")]
@@ -1772,11 +2030,13 @@ impl IicpNode {
             let relay_reg = relay_sessions_arc;
             let relay_host_str = bind_host.clone();
             let relay_port = self.cfg.relay_accept_port;
+            let relay_http_port = addr.port();
             tokio::spawn(async move {
-                let srv = Arc::new(crate::relay_session::RelayAcceptServer::new(
+                let srv = Arc::new(crate::relay_session::RelayAcceptServer::with_http_port(
                     (*relay_reg).clone(),
                     relay_host_str,
                     relay_port,
+                    relay_http_port,
                 ));
                 if let Err(e) = srv.serve().await {
                     tracing::warn!("Relay accept server error: {e}");
@@ -1843,8 +2103,8 @@ impl IicpNode {
                         // The node operator should use the cli bin which has the full
                         // context to re-register. Full wiring tracked in #341 R2.
                         tracing::info!(
-                            "Relay worker bound to relay {}:{} — update directory registration to use relay endpoint",
-                            rh, rp,
+                            "Relay worker bound — register endpoint http://{}:{}/v1/relay-for/{} with the directory (#450 path-scoped routing; rp is the relay's HTTP port from RELAY_ACK field 4)",
+                            rh, rp, _wid,
                         );
                         let _ = (http, dir); // suppress unused warnings
                     })

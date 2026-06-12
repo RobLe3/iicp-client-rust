@@ -230,6 +230,19 @@ impl RelayWorkerClient {
         if cbor_text(ack_body.get(&1)) != "ok" {
             return Err(format!("RELAY_ACK not ok: {:?}", ack_body.get(&1)));
         }
+        // Field 4 (#450): the relay's HTTP task port — used for directory
+        // registration ({relay}:{http_port}/v1/relay-for/{worker_id}). Relays
+        // predating the field default to the standard task port.
+        let relay_http_port: u16 = ack_body
+            .get(&4)
+            .and_then(|v| {
+                if let CborVal::Integer(n) = v {
+                    u16::try_from(i64::try_from(*n).ok()?).ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(9484);
 
         tracing::info!(
             "Relay worker {}: bound to relay {}:{}",
@@ -240,7 +253,7 @@ impl RelayWorkerClient {
         if let Some(cb) = &self.on_bind {
             cb(
                 self.relay_host.clone(),
-                self.relay_port,
+                relay_http_port,
                 self.worker_id.clone(),
             )
             .await;
