@@ -335,3 +335,42 @@ async fn options_preflight() {
         .unwrap()
         .contains("Authorization"));
 }
+
+// ── Node-wide CORS (browser consumers, 2026-06-12) ────────────────────────────
+// Web pages dispatch /v1/task to https nodes directly — every endpoint must
+// answer preflights and carry CORS (fails if node-wide CORS is reverted).
+
+#[tokio::test]
+async fn options_preflight_on_task() {
+    let port = spawn_relay().await;
+    let client = reqwest::Client::new();
+    let r = client
+        .request(
+            reqwest::Method::OPTIONS,
+            format!("http://127.0.0.1:{port}/v1/task"),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 204);
+    assert_eq!(r.headers().get("access-control-allow-origin").unwrap(), "*");
+}
+
+#[tokio::test]
+async fn health_and_task_carry_cors() {
+    let port = spawn_relay().await;
+    let client = reqwest::Client::new();
+    let h = client
+        .get(format!("http://127.0.0.1:{port}/iicp/health"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(h.headers().get("access-control-allow-origin").unwrap(), "*");
+    let t = client
+        .post(format!("http://127.0.0.1:{port}/v1/task"))
+        .json(&serde_json::json!({"task_id":"t-cors","intent":"urn:iicp:intent:llm:chat:v1","payload":{"messages":[]}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(t.headers().get("access-control-allow-origin").unwrap(), "*");
+}

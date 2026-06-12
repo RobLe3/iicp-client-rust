@@ -603,7 +603,6 @@ async fn relay_endpoint(
 // the path-scoped /v1/relay-for/:wid endpoints. All responses carry CORS
 // headers (web pages are first-class callers of this transport).
 
-#[cfg(feature = "iicp-tcp")]
 fn relay_cors(mut resp: Response) -> Response {
     let h = resp.headers_mut();
     h.insert("Access-Control-Allow-Origin", "*".parse().expect("static"));
@@ -618,7 +617,6 @@ fn relay_cors(mut resp: Response) -> Response {
     resp
 }
 
-#[cfg(feature = "iicp-tcp")]
 async fn relay_cors_preflight() -> Response {
     let mut resp = StatusCode::NO_CONTENT.into_response();
     resp.headers_mut()
@@ -1741,9 +1739,19 @@ impl IicpNode {
             });
         }
 
+        // CORS on every endpoint (2026-06-12): web pages are first-class
+        // consumers (iicp.network/browser-node dispatches /v1/task to https
+        // nodes directly). CORS only ever gated browsers — curl was never
+        // restricted — so this adds no capability.
         let mut app = Router::new()
-            .route("/v1/task", post(task_endpoint))
-            .route("/iicp/health", get(health_endpoint))
+            .route(
+                "/v1/task",
+                post(task_endpoint).options(relay_cors_preflight),
+            )
+            .route(
+                "/iicp/health",
+                get(health_endpoint).options(relay_cors_preflight),
+            )
             .route("/metrics", get(metrics_endpoint));
         if self.cfg.enable_mesh {
             app = app.route("/v1/peers", post(peers_endpoint));
@@ -1785,7 +1793,11 @@ impl IicpNode {
         // R1: capture relay_sessions Arc before state is moved into the router.
         #[cfg(feature = "iicp-tcp")]
         let relay_sessions_arc = Arc::clone(&state.relay_sessions);
-        let app = app.with_state(state);
+        let app = app
+            .layer(axum::middleware::map_response(
+                |resp: Response| async move { relay_cors(resp) },
+            ))
+            .with_state(state);
 
         let addr: SocketAddr = addr
             .parse()
