@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.59] — 2026-06-12
+
+### Security
+
+- **Per-Origin `/v1/task` rate limit (F4, #524)** — caps browser-origin task
+  dispatch (the CORS confused-deputy vector); non-browser callers (the
+  operator's own authed traffic) are never throttled. 429 IICP-E023; default
+  120/60s, `IICP_TASK_RATE_LIMIT` overrides (0 disables).
+
+### Added — re-registration ownership proof (#529)
+
+- The node now sends `current_node_token` on re-registration when it holds a
+  cached token, so an endpoint change after a tunnel/CGNAT rotation is accepted
+  via the directory's IICP-E050 ownership path. Additive + backwards-compatible
+  (directory accepts-but-does-not-require it).
+
 ## [0.7.58] — 2026-06-12
 
 ### Security — relay session cap (red-team F5)
