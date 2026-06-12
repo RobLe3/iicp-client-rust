@@ -1375,6 +1375,14 @@ impl IicpNode {
     /// Mirrors `iicp_client.IicpNode.deregister` (Python iter-1471) and
     /// `IicpNode.deregister` (TS iter-1474). Best-effort: shutdown paths
     /// swallow failures so a flaky directory connection doesn't block exit.
+    /// Phase 2 (#529/#55) — seed a previously-cached node_token so the next
+    /// `register()` proves ownership via `current_node_token` (IICP-E050 path).
+    pub fn seed_token(&self, token: &str) {
+        if !token.is_empty() {
+            *self.runtime_token.write().expect("poisoned") = token.to_string();
+        }
+    }
+
     /// Deregister from the directory. `node_token` defaults to the token stashed by
     /// `register()` (BUG-5) when `None` — pass `Some(token)` to override.
     pub async fn deregister(&self, node_token: Option<&str>) -> Result<()> {
@@ -1414,6 +1422,12 @@ impl IicpNode {
     /// Build the spec-compliant REGISTER payload (iicp-dir §3.1 + v0.7.0
     /// dual-endpoint). Extracted so the background heartbeat task can re-POST
     /// the same payload to recover after the directory drops the node (#399).
+    /// Test-only accessor for the register payload (#55 ownership-proof check).
+    #[doc(hidden)]
+    pub fn register_payload_for_test(&self) -> Value {
+        self.build_register_payload()
+    }
+
     fn build_register_payload(&self) -> Value {
         // Build the spec-compliant capability object. Legacy
         // `capabilities: Vec<String>` is folded into the models array.
@@ -1446,6 +1460,13 @@ impl IicpNode {
         });
         if !self.cfg.node_id.is_empty() {
             payload["node_id"] = json!(self.cfg.node_id);
+        }
+        // Phase 2 (#529/#55) — prove ownership on re-registration so an endpoint
+        // change (rotating tunnel/CGNAT) is accepted via the IICP-E050 token path.
+        // Sent only when a prior token is stashed; additive + backwards-compatible.
+        let stashed_token = self.runtime_token.read().expect("poisoned").clone();
+        if !stashed_token.is_empty() {
+            payload["current_node_token"] = json!(stashed_token);
         }
         if let Some(t) = &self.cfg.transport_endpoint {
             payload["transport_endpoint"] = json!(t);

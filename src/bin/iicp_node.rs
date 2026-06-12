@@ -1517,9 +1517,15 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let node_supplied = !opts.node.is_empty();
 
     // Load persisted node config if --node was provided.
+    // Phase 2 (#529/#55) — capture any cached node_token to prove ownership on
+    // re-registration (IICP-E050 token path).
+    let mut saved_node_token: Option<String> = None;
     if node_supplied {
         match load_node(&opts.node).map_err(|e| e.to_string())? {
-            Some(saved) => apply_saved_node(&mut opts, &saved),
+            Some(saved) => {
+                saved_node_token = saved.node_token.clone();
+                apply_saved_node(&mut opts, &saved);
+            }
             None => {
                 return Err(format!(
                     "no saved config at ~/.iicp/nodes/{}.json. Run `iicp-node init` first.",
@@ -1746,6 +1752,11 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let resolved_log_dir = cfg.log_dir.clone();
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
     let mut node = IicpNode::new(cfg);
+    // Phase 2 (#529/#55) — seed the cached node_token so a re-registration (e.g.
+    // after a tunnel-URL rotation) proves ownership via current_node_token.
+    if let Some(tok) = &saved_node_token {
+        node.seed_token(tok);
+    }
 
     // Open node log (best-effort — log failure never blocks serve).
     let node_log: Option<std::sync::Arc<iicp_client::node_log::NodeLog>> =
