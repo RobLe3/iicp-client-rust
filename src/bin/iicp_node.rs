@@ -1857,41 +1857,45 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
 
         // Tier ≥ 3 (CGNAT + no usable IPv6 path) and no relay configured:
-        // auto-elect relay from the directory.
+        // Tunnel-FIRST, relay = last resort (maintainer 2026-06-13 choreography:
+        // tunnel → relay → gossip). A Quick Tunnel gives the node its OWN public endpoint
+        // — more autonomous than a third-party relay (no relay metadata/#510, one less hop);
+        // rotation mitigated by #538. --no-tunnel / IICP_TUNNEL=0 opts out → relay-first.
         if profile.tier >= 3 && opts.relay_worker_endpoint.is_empty() {
-            eprintln!(
-                "[iicp-node] NAT tier={}: auto-electing relay from directory…",
-                profile.tier
-            );
-            if let Some((relay_host, relay_port)) =
-                auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
-            {
-                opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
-                node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+            // (1) Quick Tunnel (rung 5) — the autonomous public endpoint.
+            if opts.tunnel != Some(false) {
                 eprintln!(
-                    "[iicp-node] auto-elected relay: {}:{}",
-                    relay_host, relay_port
+                    "[iicp-node] NAT tier={}: opening Quick Tunnel (rung 5) for an autonomous public endpoint…",
+                    profile.tier
                 );
-            } else if opts.tunnel != Some(false) {
-                // #520 rung 5: no relay anywhere → Quick Tunnel (zero-account),
-                // unless disabled via --no-tunnel / IICP_TUNNEL=0.
                 tunnel = try_tunnel_rung(opts.port, false);
                 if let Some(t) = &tunnel {
                     apply_tunnel_profile(&mut node, &t.url);
                     opts.public_endpoint = t.url.clone();
+                }
+            }
+            // (2) Relay = last resort — only if no tunnel (disabled or unavailable).
+            if tunnel.is_none() {
+                eprintln!(
+                    "[iicp-node] NAT tier={}: no tunnel — auto-electing a relay from directory (last resort)…",
+                    profile.tier
+                );
+                if let Some((relay_host, relay_port)) =
+                    auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
+                {
+                    opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
+                    node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                    eprintln!(
+                        "[iicp-node] auto-elected relay (last resort): {}:{}",
+                        relay_host, relay_port
+                    );
                 } else {
                     eprintln!(
-                        "[iicp-node] NAT tier={}: no relay-capable peers and no tunnel \
-                         available. Set IICP_RELAY_WORKER_ENDPOINT=<host>:<port> to specify a relay.",
+                        "[iicp-node] NAT tier={}: no tunnel and no relay-capable peers. \
+                         Set IICP_RELAY_WORKER_ENDPOINT=<host>:<port> to specify a relay.",
                         profile.tier
                     );
                 }
-            } else {
-                eprintln!(
-                    "[iicp-node] NAT tier={}: no relay-capable peers in directory \
-                     (tunnel escalation disabled). Set IICP_RELAY_WORKER_ENDPOINT to specify a relay.",
-                    profile.tier
-                );
             }
         }
     }
