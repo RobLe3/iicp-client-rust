@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.62] — 2026-06-13
+
+### Changed — privacy-first (mandatory E2E, no opt-out)
+- IICP-CX payload encryption is now **on by default with no opt-out**: the client always encrypts to
+  a node advertising a `cx_public_key` (`use_confidentiality` is a deprecated no-op). Directory,
+  relays, and network see only ciphertext; a node without a key yet gets a transitional plaintext
+  warning. The executing node still decrypts to run the model (run locally for full privacy).
+- Added Tier-2 response-encryption primitives (`encrypt_response`/`decrypt_response`) — not yet wired.
+
 ## [0.7.61] — 2026-06-13
 
 ### Fixed — self-healing tunnel (resilience, #538)
