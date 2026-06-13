@@ -191,6 +191,95 @@ pub fn decrypt_payload(
         .map_err(|e| IicpError::Node(format!("plaintext JSON parse: {e}")))
 }
 
+// ── Tier-2 §5a.3: bidirectional (response) encryption ────────────────────────
+// Byte-compatible with the Python/TS/adapter response primitives: response sealed
+// under the request's session shared secret with a distinct HKDF label so the
+// request and response keys differ. Pure primitives; wiring is a later step.
+
+/// Seal a node's RESPONSE under the request's session shared secret (IICP-CX §5a.3).
+pub fn encrypt_response(
+    response: &Value,
+    shared_secret: &[u8],
+    task_id: &str,
+) -> Result<HashMap<String, Value>> {
+    let mut nonce_bytes = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce_bytes);
+    let hk = Hkdf::<Sha256>::new(Some(&nonce_bytes), shared_secret);
+    let mut key_material = [0u8; 32];
+    hk.expand(
+        format!("IICP-CX-RESP-v1{task_id}").as_bytes(),
+        &mut key_material,
+    )
+    .map_err(|_| IicpError::Node("HKDF expand failed".to_string()))?;
+    let aad = format!("{task_id}|resp");
+    let cipher = Aes256Gcm::new_from_slice(&key_material)
+        .map_err(|_| IicpError::Node("AES key error".to_string()))?;
+    let body = serde_json::to_vec(response)
+        .map_err(|e| IicpError::Node(format!("response serialization: {e}")))?;
+    let ciphertext = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &body,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|_| IicpError::Node("AES-GCM encrypt failed".to_string()))?;
+    let mut env = HashMap::new();
+    env.insert("version".to_string(), Value::Number(1.into()));
+    env.insert(
+        "nonce".to_string(),
+        Value::String(b64url_encode(&nonce_bytes)),
+    );
+    env.insert(
+        "encrypted_body".to_string(),
+        Value::String(b64url_encode(&ciphertext)),
+    );
+    Ok(env)
+}
+
+/// Open a node's encrypted RESPONSE (CX-Consumer side, IICP-CX §5a.3).
+pub fn decrypt_response(
+    env: &HashMap<String, Value>,
+    shared_secret: &[u8],
+    task_id: &str,
+) -> Result<Value> {
+    let nonce_b64 = env
+        .get("nonce")
+        .and_then(Value::as_str)
+        .ok_or_else(|| IicpError::Node("missing nonce".to_string()))?;
+    let body_b64 = env
+        .get("encrypted_body")
+        .and_then(Value::as_str)
+        .ok_or_else(|| IicpError::Node("missing encrypted_body".to_string()))?;
+    let nonce_bytes =
+        b64url_decode(nonce_b64).map_err(|e| IicpError::Node(format!("nonce decode: {e}")))?;
+    let hk = Hkdf::<Sha256>::new(Some(&nonce_bytes), shared_secret);
+    let mut key_material = [0u8; 32];
+    hk.expand(
+        format!("IICP-CX-RESP-v1{task_id}").as_bytes(),
+        &mut key_material,
+    )
+    .map_err(|_| IicpError::Node("HKDF expand failed".to_string()))?;
+    let aad = format!("{task_id}|resp");
+    let cipher = Aes256Gcm::new_from_slice(&key_material)
+        .map_err(|_| IicpError::Node("AES key error".to_string()))?;
+    let ct = b64url_decode(body_b64).map_err(|e| IicpError::Node(format!("body decode: {e}")))?;
+    let plaintext = cipher
+        .decrypt(
+            Nonce::from_slice(&nonce_bytes),
+            Payload {
+                msg: &ct,
+                aad: aad.as_bytes(),
+            },
+        )
+        .map_err(|_| {
+            IicpError::Node("AES-GCM decrypt failed (wrong key or tampered)".to_string())
+        })?;
+    serde_json::from_slice(&plaintext)
+        .map_err(|e| IicpError::Node(format!("response JSON parse: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +371,28 @@ mod tests {
             key_id: "00000000".to_string(),
         };
         assert!(encrypt_payload(&serde_json::json!({}), &bad_key, "t1", "intent").is_err());
+    }
+
+    #[test]
+    fn test_response_roundtrip() {
+        let mut shared = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut shared);
+        let resp = serde_json::json!({"choices": [{"message": {"role": "assistant", "content": "answer"}}]});
+        let env = encrypt_response(&resp, &shared, "task-resp-1").unwrap();
+        assert!(env.contains_key("nonce") && env.contains_key("encrypted_body"));
+        assert_eq!(
+            decrypt_response(&env, &shared, "task-resp-1").unwrap(),
+            resp
+        );
+    }
+
+    #[test]
+    fn test_response_wrong_secret_fails() {
+        let mut s1 = [0u8; 32];
+        let mut s2 = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut s1);
+        rand::thread_rng().fill_bytes(&mut s2);
+        let env = encrypt_response(&serde_json::json!({"x": 1}), &s1, "t1").unwrap();
+        assert!(decrypt_response(&env, &s2, "t1").is_err());
     }
 }
