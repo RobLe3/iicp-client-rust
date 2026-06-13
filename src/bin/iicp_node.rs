@@ -2084,6 +2084,42 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         );
     }
 
+    // #521 P2 — background self-updater. Default-on; IICP_AUTO_UPDATE=0 opts out. Once a
+    // node reaches the first release carrying this updater, every future release
+    // self-propagates (cargo install --force + re-exec). Loop-safe + failure-isolated.
+    // The Rust upgrade recompiles, so it can take a few minutes; the node keeps serving
+    // until the re-exec. Features default to the recommended `nat,iicp-tcp`.
+    if iicp_client::updater::auto_update_enabled() {
+        let current = env!("CARGO_PKG_VERSION").to_string();
+        tokio::spawn(async move {
+            let interval = iicp_client::updater::auto_update_interval_secs();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                let latest = iicp_client::updater::latest_crates_version(5).await;
+                if iicp_client::updater::auto_update_decision(&current, latest.as_deref(), true)
+                    == iicp_client::updater::UpdateAction::ShouldUpgrade
+                {
+                    eprintln!(
+                        "[iicp-node] auto-update: newer release {} available (running {current}) — upgrading via cargo install (may take a few minutes)…",
+                        latest.as_deref().unwrap_or("?")
+                    );
+                    let ok = tokio::task::spawn_blocking(|| {
+                        iicp_client::updater::perform_self_update("nat,iicp-tcp")
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if ok {
+                        eprintln!("[iicp-node] auto-update: upgraded; restarting to apply…");
+                        let e = iicp_client::updater::reexec();
+                        eprintln!("[iicp-node] auto-update: re-exec failed ({e}); staying up on the new binary at next manual restart");
+                    } else {
+                        eprintln!("[iicp-node] auto-update: upgrade failed; will retry next check");
+                    }
+                }
+            }
+        });
+    }
+
     let opts_handler = openai_opts.clone();
     let backend_type = opts.backend_type.clone();
     let bind = fmt_bind_addr(&opts.host, opts.port);

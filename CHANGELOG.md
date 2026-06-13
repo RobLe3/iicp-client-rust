@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.60] — 2026-06-13
+
+### Added — background self-updater (#521 P2)
+- A node running `serve` keeps itself current automatically: it periodically checks crates.io
+  and, on a newer release, `cargo install --force`s and re-execs onto the new version — no
+  operator intervention. **Once a node reaches 0.7.60, every future release self-propagates.**
+  Default-on; opt out with `IICP_AUTO_UPDATE=0` (`IICP_AUTO_UPDATE_INTERVAL_S` sets cadence,
+  default 6h, min 5m). Loop-safe and failure-isolated. NB: the Rust upgrade recompiles from
+  source, so it can take a few minutes; the node keeps serving until the re-exec.
+
+### Added
+- Live re-register on Quick-Tunnel URL rotation (#527) — when a `--tunnel` node's public URL
+  rotates, the node now updates its endpoint and re-registers automatically (proving ownership
+  with `current_node_token`, IICP-E050) instead of logging restart-advice. Parity with the
+  Python/TypeScript clients, which already self-heal on rotation.
+
+### Security
+- Expand the `mcp-gateway` dangerous-tool denylist backstop (red-team pass 3, Rust parity).
+
 ## [0.7.59] — 2026-06-12
 
 ### Security
