@@ -23,8 +23,35 @@ use std::time::{Duration, Instant};
 
 /// cloudflared usually prints the URL within ~5 s; 20 s covers slow first runs.
 pub const TUNNEL_START_TIMEOUT: Duration = Duration::from_secs(20);
-/// Bounded self-healing: after this many unexpected deaths, stop respawning.
+/// Bounded self-healing: this many CONSECUTIVE failed respawns (without the tunnel
+/// recovering to a healthy state in between) → give up. The counter resets to 0 once
+/// a respawned tunnel passes a health check, so a long-running relay that sees many
+/// edge-drops over its lifetime keeps healing indefinitely — the cap only catches a
+/// truly broken cloudflared that never comes back. (#538)
 pub const MAX_RESPAWNS: u32 = 3;
+/// Active liveness check of the tunnel's OWN public URL — catches the failure mode the
+/// process-exit watcher misses: cloudflared still running but the edge connection
+/// dropped, so the URL is unreachable while the node looks healthy (the recurring
+/// dead-endpoint bug, #538). Probe every interval; after this many consecutive
+/// failures, force a tunnel restart (kill → respawn → new URL → re-register).
+pub const TUNNEL_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+pub const TUNNEL_HEALTH_MAX_FAILS: u32 = 3;
+
+/// GET `<url>/iicp/health` round-trips through the Cloudflare edge back to the local
+/// node — the same path a browser consumer takes — so it detects an edge-drop, not
+/// just a local-process death. Build error → treat as healthy (never self-restart on
+/// our own client error). Used by the watchdog from its own (non-tokio) thread.
+async fn tunnel_url_reachable(url: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return true,
+    };
+    let probe = format!("{}/iicp/health", url.trim_end_matches('/'));
+    matches!(client.get(&probe).send().await, Ok(r) if r.status().is_success())
+}
 
 pub const INSTALL_HINT: &str = "cloudflared not found — install it to become reachable \
 without router changes (zero-account Quick Tunnel): macOS `brew install cloudflared` · \
@@ -92,6 +119,7 @@ impl QuickTunnel {
     /// Callbacks run on the watchdog thread; marshal to your runtime if needed.
     pub fn watch(
         &self,
+        initial_url: String,
         on_new_url: impl Fn(String) + Send + 'static,
         on_dead: impl FnOnce() + Send + 'static,
     ) {
@@ -103,13 +131,54 @@ impl QuickTunnel {
         std::thread::Builder::new()
             .name("quick-tunnel-watchdog".into())
             .spawn(move || {
+                // Current-thread runtime for the periodic health probe. Safe to block_on
+                // here — this is a plain std thread, not a tokio worker.
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .ok();
+                let mut current_url = initial_url;
+                let mut health_fails: u32 = 0;
+                let mut last_health = Instant::now();
                 loop {
-                    // Poll instead of blocking wait(): close() needs the lock too.
+                    // Wait until the process exits OR the tunnel URL goes unreachable
+                    // (edge-drop) for too long. Poll, not blocking wait(): close() and
+                    // the health-kill both need the child lock too.
                     loop {
                         {
                             let mut guard = child.lock().unwrap();
                             if let Ok(Some(_)) = guard.try_wait() {
-                                break;
+                                break; // process exited — crash or our health-triggered kill
+                            }
+                        }
+                        if closed.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        // #538 — edge-drop detection: cloudflared can stay alive while its
+                        // tunnel becomes unreachable. Probe the public URL; restart on a
+                        // sustained failure so the dead endpoint can't persist.
+                        if last_health.elapsed() >= TUNNEL_HEALTH_INTERVAL {
+                            last_health = Instant::now();
+                            let healthy = rt
+                                .as_ref()
+                                .map(|r| r.block_on(tunnel_url_reachable(&current_url)))
+                                .unwrap_or(true);
+                            if healthy {
+                                health_fails = 0;
+                                // Recovered/steady → forget prior respawns so a relay's
+                                // lifetime edge-drops never exhaust MAX_RESPAWNS.
+                                respawns.store(0, Ordering::Relaxed);
+                            } else {
+                                health_fails += 1;
+                                if health_fails >= TUNNEL_HEALTH_MAX_FAILS {
+                                    eprintln!(
+                                        "[quick-tunnel] {current_url} unreachable {health_fails}× \
+                                         while cloudflared is up (edge dropped) — restarting tunnel."
+                                    );
+                                    let _ = child.lock().unwrap().kill();
+                                    health_fails = 0;
+                                    // try_wait() sees the exit on the next poll → respawn arm.
+                                }
                             }
                         }
                         std::thread::sleep(Duration::from_millis(200));
@@ -120,19 +189,21 @@ impl QuickTunnel {
                     let n = respawns.fetch_add(1, Ordering::Relaxed) + 1;
                     if n > MAX_RESPAWNS {
                         eprintln!(
-                            "[quick-tunnel] died {} times — giving up. Node is no longer \
-                             publicly reachable; restart `iicp-node serve` to recover.",
+                            "[quick-tunnel] {} consecutive respawns failed to recover a healthy \
+                             tunnel — giving up. Node is no longer publicly reachable; restart \
+                             `iicp-node serve`.",
                             n - 1
                         );
                         on_dead();
                         return;
                     }
-                    eprintln!(
-                        "[quick-tunnel] exited unexpectedly — respawning ({n}/{MAX_RESPAWNS})…"
-                    );
+                    eprintln!("[quick-tunnel] tunnel down — respawning ({n}/{MAX_RESPAWNS})…");
                     match spawn_and_parse(local_port, TUNNEL_START_TIMEOUT, &binary) {
                         Ok((fresh_child, url)) => {
                             *child.lock().unwrap() = fresh_child;
+                            current_url = url.clone();
+                            health_fails = 0;
+                            last_health = Instant::now();
                             eprintln!("[quick-tunnel] back up at {url} — re-registering.");
                             on_new_url(url);
                         }

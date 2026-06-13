@@ -79,6 +79,7 @@ fn supervision_respawns_with_new_url() {
     let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
     let (tx, rx) = std::sync::mpsc::channel::<String>();
     t.watch(
+        t.url.clone(),
         move |url| {
             let _ = tx.send(url);
         },
@@ -100,6 +101,7 @@ fn supervision_gives_up_after_max_respawns() {
     let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     t.watch(
+        t.url.clone(),
         |_url| {},
         move || {
             let _ = tx.send(());

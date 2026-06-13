@@ -1911,6 +1911,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         // No restart needed (parity with Python/TypeScript).
         let ep_override = node.endpoint_override_handle();
         t.watch(
+            t.url.clone(),
             move |url| {
                 if let Ok(mut g) = ep_override.write() {
                     *g = Some(url.to_string());
