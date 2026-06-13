@@ -235,25 +235,25 @@ impl IicpClient {
                 None
             };
 
-            // IICP-CX S.16 §5: build body per node (cx_public_key may differ per node)
-            let body: serde_json::Value = if self.config.use_confidentiality {
-                if let Some(ref cx_key) = node.cx_public_key {
-                    let iicp_conf = encrypt_payload(
-                        &request.payload,
-                        cx_key,
-                        &request.task_id,
-                        &request.intent,
-                    )?;
-                    let mut body = serde_json::to_value(&request)?;
-                    if let Some(obj) = body.as_object_mut() {
-                        obj.remove("payload");
-                        obj.insert("iicp_conf".to_string(), serde_json::to_value(iicp_conf)?);
-                    }
-                    body
-                } else {
-                    serde_json::to_value(&request)?
+            // IICP-CX S.16: encryption is MANDATORY (privacy-first #360) — no opt-out.
+            // Always encrypt when the node advertises a cx_public_key. During the migration
+            // window (#532) a node with no key yet gets a loud warning + plaintext; fail-closed
+            // at P0b once the mesh is key-ready. use_confidentiality no longer gates this.
+            let body: serde_json::Value = if let Some(ref cx_key) = node.cx_public_key {
+                let iicp_conf =
+                    encrypt_payload(&request.payload, cx_key, &request.task_id, &request.intent)?;
+                let mut body = serde_json::to_value(&request)?;
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("payload");
+                    obj.insert("iicp_conf".to_string(), serde_json::to_value(iicp_conf)?);
                 }
+                body
             } else {
+                eprintln!(
+                    "[iicp-cx] node {} advertises no encryption key — sending UNENCRYPTED \
+                     (transitional; will be refused once the mesh is key-ready).",
+                    node.node_id
+                );
                 serde_json::to_value(&request)?
             };
 
