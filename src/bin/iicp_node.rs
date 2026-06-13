@@ -2107,8 +2107,12 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         let current = env!("CARGO_PKG_VERSION").to_string();
         tokio::spawn(async move {
             let interval = iicp_client::updater::auto_update_interval_secs();
+            // First check soon after startup (≤5 min) so a freshly-published release propagates
+            // fast + observably, instead of waiting a full interval (default 6h); then the cadence.
+            let mut delay = interval.min(300);
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                delay = interval;
                 let latest = iicp_client::updater::latest_crates_version(5).await;
                 if iicp_client::updater::auto_update_decision(&current, latest.as_deref(), true)
                     == iicp_client::updater::UpdateAction::ShouldUpgrade
