@@ -1861,41 +1861,50 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         // tunnel → relay → gossip). A Quick Tunnel gives the node its OWN public endpoint
         // — more autonomous than a third-party relay (no relay metadata/#510, one less hop);
         // rotation mitigated by #538. --no-tunnel / IICP_TUNNEL=0 opts out → relay-first.
-        if profile.tier >= 3 && opts.relay_worker_endpoint.is_empty() {
-            // (1) Quick Tunnel (rung 5) — the autonomous public endpoint.
-            if opts.tunnel != Some(false) {
-                eprintln!(
-                    "[iicp-node] NAT tier={}: opening Quick Tunnel (rung 5) for an autonomous public endpoint…",
-                    profile.tier
-                );
-                tunnel = try_tunnel_rung(opts.port, false);
-                if let Some(t) = &tunnel {
-                    apply_tunnel_profile(&mut node, &t.url);
-                    opts.public_endpoint = t.url.clone();
-                }
-            }
-            // (2) Relay = last resort — only if no tunnel (disabled or unavailable).
-            if tunnel.is_none() {
-                eprintln!(
-                    "[iicp-node] NAT tier={}: no tunnel — auto-electing a relay from directory (last resort)…",
-                    profile.tier
-                );
-                if let Some((relay_host, relay_port)) =
-                    auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
-                {
-                    opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
-                    node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+        // Escalation order from the pure, unit-tested planner (tested order == used order).
+        for step in plan_reachability(
+            profile.tier,
+            !opts.relay_worker_endpoint.is_empty(),
+            opts.tunnel != Some(false),
+        ) {
+            match step {
+                "tunnel" => {
                     eprintln!(
-                        "[iicp-node] auto-elected relay (last resort): {}:{}",
-                        relay_host, relay_port
+                        "[iicp-node] NAT tier={}: opening Quick Tunnel (rung 5) for an autonomous public endpoint…",
+                        profile.tier
                     );
-                } else {
+                    tunnel = try_tunnel_rung(opts.port, false);
+                    if let Some(t) = &tunnel {
+                        apply_tunnel_profile(&mut node, &t.url);
+                        opts.public_endpoint = t.url.clone();
+                        break;
+                    }
+                }
+                "relay" => {
+                    eprintln!(
+                        "[iicp-node] NAT tier={}: no tunnel — auto-electing a relay from directory (last resort)…",
+                        profile.tier
+                    );
+                    if let Some((relay_host, relay_port)) =
+                        auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
+                    {
+                        opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
+                        node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                        eprintln!(
+                            "[iicp-node] auto-elected relay (last resort): {}:{}",
+                            relay_host, relay_port
+                        );
+                        break;
+                    }
+                }
+                "gossip" => {
                     eprintln!(
                         "[iicp-node] NAT tier={}: no tunnel and no relay-capable peers. \
                          Set IICP_RELAY_WORKER_ENDPOINT=<host>:<port> to specify a relay.",
                         profile.tier
                     );
                 }
+                _ => {}
             }
         }
     }
@@ -2184,6 +2193,24 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
 
     serve_result
+}
+
+/// Pure reachability escalation planner (tunnel-FIRST, relay = last resort; maintainer
+/// 2026-06-13). Empty for tier<3 or a configured relay; else tunnel→relay→gossip
+/// (relay→gossip under --no-tunnel). Parity with the Python/TS planners; unit-tested so the
+/// reorder can't silently break.
+#[cfg(feature = "nat")]
+fn plan_reachability(tier: u8, relay_configured: bool, tunnel_enabled: bool) -> Vec<&'static str> {
+    if tier < 3 || relay_configured {
+        return Vec::new();
+    }
+    let mut steps = Vec::new();
+    if tunnel_enabled {
+        steps.push("tunnel");
+    }
+    steps.push("relay");
+    steps.push("gossip");
+    steps
 }
 
 /// Query the directory for relay-capable peers and elect one deterministically.
@@ -3047,6 +3074,24 @@ fn apply_tunnel_profile(_node: &mut iicp_client::node::IicpNode, _url: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Reachability escalation order (tunnel-FIRST, relay = last resort; maintainer 2026-06-13).
+    // serve consumes plan_reachability, so the tested order is the used order. Parity w/ Py/TS.
+    #[cfg(feature = "nat")]
+    #[test]
+    fn test_plan_reachability() {
+        assert_eq!(
+            plan_reachability(3, false, true),
+            vec!["tunnel", "relay", "gossip"]
+        );
+        assert_eq!(
+            plan_reachability(4, false, true),
+            vec!["tunnel", "relay", "gossip"]
+        );
+        assert_eq!(plan_reachability(3, false, false), vec!["relay", "gossip"]); // --no-tunnel
+        assert!(plan_reachability(2, false, true).is_empty()); // tier<3
+        assert!(plan_reachability(3, true, true).is_empty()); // configured relay
+    }
 
     // #410 — saved-node backend_url must be applied when no flag/env supplied it.
     // Regression: ServeOpts.backend_url used to default to the non-empty Ollama
