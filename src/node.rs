@@ -1281,9 +1281,14 @@ impl IicpNode {
     pub async fn check_model_drift_and_reregister(&self) {
         // #527 — endpoint drift (tunnel-URL rotation) is checked FIRST and
         // independently of the backend model probe, so a rotation re-registers
-        // even when the health probe is unavailable.
+        // even when the health probe is unavailable. Guard on a non-empty
+        // registered_endpoint: it's empty until the first register(), and an
+        // empty baseline must NOT read as "changed" (that would spuriously
+        // re-register a not-yet-registered node — regression caught by
+        // test_no_reregister_on_empty_backend_models).
+        let registered_ep = self.registered_endpoint.read().expect("poisoned").clone();
         let endpoint_changed =
-            self.effective_endpoint() != *self.registered_endpoint.read().expect("poisoned");
+            !registered_ep.is_empty() && self.effective_endpoint() != registered_ep;
 
         // Model drift — None/empty probe means "can't tell", not "no models".
         let live = self.probe_health_models().await.unwrap_or_default();
