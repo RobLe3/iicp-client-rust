@@ -17,3 +17,27 @@ fn seed_token_then_payload_carries_current_node_token() {
     let p = node.register_payload_for_test();
     assert_eq!(p["current_node_token"], "tok-prior");
 }
+
+// #527 — endpoint override (tunnel rotation) flows into the register payload
+#[test]
+fn endpoint_override_changes_register_payload() {
+    use iicp_client::{IicpNode, NodeConfig};
+    let cfg = NodeConfig::new(
+        "n-rot",
+        "https://old-tunnel.example.com".to_string(),
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    let node = IicpNode::new(cfg);
+    // fresh: payload carries the configured endpoint
+    assert_eq!(
+        node.register_payload_for_test()["endpoint"],
+        "https://old-tunnel.example.com"
+    );
+    // watchdog publishes a rotated URL via the override handle
+    *node.endpoint_override_handle().write().unwrap() =
+        Some("https://new-tunnel.example.com".to_string());
+    assert_eq!(
+        node.register_payload_for_test()["endpoint"],
+        "https://new-tunnel.example.com"
+    );
+}

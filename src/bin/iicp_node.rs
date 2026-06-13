@@ -1905,14 +1905,17 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
     }
     if let Some(t) = &tunnel {
-        // Quick Tunnel URLs rotate per process. Live re-registration needs a
-        // &self endpoint setter (pending); until then, advise a restart.
+        // #527 — Quick Tunnel URLs rotate per process. The watchdog (sync thread)
+        // publishes the new URL into the node's endpoint_override; the heartbeat
+        // loop re-registers it live (current_node_token → IICP-E050 token path).
+        // No restart needed (parity with Python/TypeScript).
+        let ep_override = node.endpoint_override_handle();
         t.watch(
-            |url| {
-                eprintln!(
-                    "[iicp-node] Quick Tunnel URL rotated to {url} — restart \
-                     `iicp-node serve` to re-register the new endpoint."
-                );
+            move |url| {
+                if let Ok(mut g) = ep_override.write() {
+                    *g = Some(url.to_string());
+                }
+                eprintln!("[iicp-node] Quick Tunnel URL rotated to {url} — re-registering live.");
             },
             || {
                 eprintln!(

@@ -1209,6 +1209,15 @@ pub struct IicpNode {
     /// #494 — model set registered at last register(); compared each heartbeat tick for drift.
     /// Arc so the background heartbeat task can read and update it.
     registered_models: Arc<std::sync::RwLock<Vec<String>>>,
+    /// #527 — endpoint override set by the tunnel watchdog when a Quick Tunnel
+    /// URL rotates (the watchdog runs on a sync thread with only an Arc handle;
+    /// this is the "&self endpoint setter" WQ-088 deferred). `None` = use
+    /// `cfg.endpoint`. `build_register_payload` reads the effective endpoint.
+    endpoint_override: Arc<std::sync::RwLock<Option<String>>>,
+    /// #527 — endpoint registered at last register(); compared each heartbeat
+    /// tick so a rotated endpoint triggers a live re-registration (the new URL
+    /// is accepted via the IICP-E050 token path, current_node_token #529).
+    registered_endpoint: Arc<std::sync::RwLock<String>>,
 }
 
 impl IicpNode {
@@ -1228,7 +1237,25 @@ impl IicpNode {
             pinhole_lease_seconds: std::sync::RwLock::new(3600),
             liveness_challenge: std::sync::RwLock::new(None),
             registered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            endpoint_override: Arc::new(std::sync::RwLock::new(None)),
+            registered_endpoint: Arc::new(std::sync::RwLock::new(String::new())),
         }
+    }
+
+    /// #527 — the effective register endpoint: the watchdog override (set on a
+    /// Quick Tunnel URL rotation) if present, else the configured endpoint.
+    fn effective_endpoint(&self) -> String {
+        self.endpoint_override
+            .read()
+            .expect("poisoned")
+            .clone()
+            .unwrap_or_else(|| self.cfg.endpoint.clone())
+    }
+
+    /// #527 — handle for the tunnel watchdog to publish a rotated Quick Tunnel
+    /// URL from its sync thread; the heartbeat loop re-registers on the change.
+    pub fn endpoint_override_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
+        Arc::clone(&self.endpoint_override)
     }
 
     /// Current HMAC key in use for ADR-019 pricing signatures (empty if
@@ -1252,26 +1279,48 @@ impl IicpNode {
     /// #494 — check for model drift and re-register if the live set differs from registered.
     /// Used by tests; production uses the same logic inlined in the heartbeat background task.
     pub async fn check_model_drift_and_reregister(&self) {
-        let live = match self.probe_health_models().await {
-            Some(v) if !v.is_empty() => v,
-            _ => return,
+        // #527 — endpoint drift (tunnel-URL rotation) is checked FIRST and
+        // independently of the backend model probe, so a rotation re-registers
+        // even when the health probe is unavailable.
+        let endpoint_changed =
+            self.effective_endpoint() != *self.registered_endpoint.read().expect("poisoned");
+
+        // Model drift — None/empty probe means "can't tell", not "no models".
+        let live = self.probe_health_models().await.unwrap_or_default();
+        let models_changed = if live.is_empty() {
+            false
+        } else {
+            let registered = self.registered_models.read().expect("poisoned").clone();
+            let live_set: std::collections::HashSet<_> = live.iter().cloned().collect();
+            let reg_set: std::collections::HashSet<_> = registered.into_iter().collect();
+            live_set != reg_set
         };
-        let registered = self.registered_models.read().expect("poisoned").clone();
-        let live_set: std::collections::HashSet<_> = live.iter().cloned().collect();
-        let reg_set: std::collections::HashSet<_> = registered.into_iter().collect();
-        if live_set == reg_set {
+
+        if !endpoint_changed && !models_changed {
             return;
         }
-        let mut new_payload = self.build_register_payload();
-        let new_caps = build_capabilities(&live, &self.cfg.intent, self.cfg.max_tokens);
-        new_payload["capabilities"] = serde_json::to_value(&new_caps).unwrap_or(json!([]));
+
+        let mut new_payload = self.build_register_payload(); // reads effective endpoint
+        if models_changed {
+            let new_caps = build_capabilities(&live, &self.cfg.intent, self.cfg.max_tokens);
+            new_payload["capabilities"] = serde_json::to_value(&new_caps).unwrap_or(json!([]));
+        }
         let url = format!(
             "{}/v1/register",
             self.cfg.directory_url.trim_end_matches('/')
         );
         if let Some(t) = reregister(&self.http, &url, &new_payload).await {
-            *self.registered_models.write().expect("poisoned") = live;
+            if models_changed {
+                *self.registered_models.write().expect("poisoned") = live;
+            }
+            *self.registered_endpoint.write().expect("poisoned") = self.effective_endpoint();
             *self.runtime_token.write().expect("poisoned") = t;
+            if endpoint_changed {
+                tracing::info!(
+                    "[iicp-node] re-registered after endpoint rotation → {}",
+                    self.effective_endpoint()
+                );
+            }
         }
     }
 
@@ -1447,7 +1496,8 @@ impl IicpNode {
             .unwrap_or_else(|| "unknown".to_string());
 
         let mut payload = json!({
-            "endpoint": self.cfg.endpoint,
+            // #527 — effective endpoint (watchdog override on tunnel rotation, else cfg).
+            "endpoint": self.effective_endpoint(),
             "region": region,
             // #409 — advertise one capability object per intent the backend can
             // serve (e.g. chat + embedding from one Ollama/LM Studio backend),
@@ -1578,6 +1628,9 @@ impl IicpNode {
             }
             *self.registered_models.write().expect("poisoned") = models;
         }
+        // #527 — record the endpoint we just registered, so the heartbeat-loop
+        // drift check re-registers when a tunnel rotation changes it.
+        *self.registered_endpoint.write().expect("poisoned") = self.effective_endpoint();
         Ok(token.to_string())
     }
 
@@ -1947,6 +2000,10 @@ impl IicpNode {
             let hb_intent = self.cfg.intent.clone();
             let hb_max_tokens = self.cfg.max_tokens;
             let hb_registered_models = Arc::clone(&self.registered_models);
+            // #527 — endpoint rotation (Quick Tunnel URL): the watchdog publishes
+            // the new URL into endpoint_override; the loop re-registers on drift.
+            let hb_endpoint_override = self.endpoint_override_handle();
+            let hb_registered_endpoint = Arc::clone(&self.registered_endpoint);
             tokio::spawn(async move {
                 let mut token = token;
                 let mut seq: u64 = 0;
@@ -2028,6 +2085,36 @@ impl IicpNode {
                                                 live.len()
                                             );
                                         }
+                                    }
+                                }
+                            }
+                            // #527 — endpoint rotation (Quick Tunnel URL): the
+                            // watchdog publishes the new URL into endpoint_override;
+                            // re-register so discover routes to the live endpoint.
+                            // current_node_token proves ownership (E050 token path).
+                            // Bind clones to locals so the RwLock guards drop
+                            // BEFORE the await below (guards aren't Send).
+                            let override_ep =
+                                hb_endpoint_override.read().expect("poisoned").clone();
+                            if let Some(ep) = override_ep {
+                                let registered_ep =
+                                    hb_registered_endpoint.read().expect("poisoned").clone();
+                                if ep != registered_ep {
+                                    let mut new_payload = hb_register_payload.clone();
+                                    new_payload["endpoint"] = json!(ep);
+                                    new_payload["current_node_token"] = json!(token);
+                                    if let Some(t) =
+                                        reregister(&http, &hb_register_url, &new_payload).await
+                                    {
+                                        *hb_registered_endpoint.write().expect("poisoned") =
+                                            ep.clone();
+                                        token = t;
+                                        if let Ok(mut g) = hb_token_arc.write() {
+                                            *g = token.clone();
+                                        }
+                                        tracing::info!(
+                                            "seq={seq} endpoint rotation: re-registered → {ep}"
+                                        );
                                     }
                                 }
                             }
