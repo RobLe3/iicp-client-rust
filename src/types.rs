@@ -44,12 +44,15 @@ pub struct DiscoverOptions {
 }
 
 /// X25519 public key advertised by a CX-Provider node (IICP-CX S.16 §3.1).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CxPublicKey {
     pub algorithm: String,
+    /// Encoding for `key`; directory validation expects base64url on REGISTER.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<String>,
     /// Base64url-encoded 32-byte X25519 public key.
     pub key: String,
-    /// 8-hex-byte key identifier.
+    /// Stable provider-key identifier, currently `cx-` plus 16 hex chars.
     pub key_id: String,
 }
 

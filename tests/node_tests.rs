@@ -3,7 +3,9 @@
 
 use std::net::TcpListener as StdListener;
 
+use iicp_client::confidentiality::encrypt_payload;
 use iicp_client::node::{IicpNode, NodeConfig};
+use iicp_client::CxPublicKey;
 use serde_json::{json, Value};
 
 fn free_port() -> u16 {
@@ -88,6 +90,62 @@ async fn test_task_endpoint_returns_200() {
     // loose end from that fix, surfaced by #453).
     assert_eq!(body["status"], "success");
     assert_eq!(body["task_id"], "t-001");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn test_task_endpoint_decrypts_iicp_conf() {
+    let port = free_port();
+    let mut cfg = NodeConfig::new(
+        "cx-rust-node",
+        "http://cx-rust.local",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.model = Some("test-model".into());
+    let node = IicpNode::new(cfg);
+    let cx_public_key: CxPublicKey =
+        serde_json::from_value(node.register_payload_for_test()["cx_public_key"].clone()).unwrap();
+    let addr = format!("127.0.0.1:{port}");
+    let handle = tokio::spawn(async move {
+        let _ = node
+            .serve(
+                |task| Box::pin(async move { Ok(json!({"echo": task.payload})) }),
+                &addr,
+                None,
+            )
+            .await;
+    });
+    wait_port(port).await;
+
+    let payload = json!({"messages": [{"role": "user", "content": "secret"}]});
+    let env = encrypt_payload(
+        &payload,
+        &cx_public_key,
+        "cx-rust-1",
+        "urn:iicp:intent:llm:chat:v1",
+    )
+    .unwrap();
+    let request_body = json!({
+        "task_id": "cx-rust-1",
+        "intent": "urn:iicp:intent:llm:chat:v1",
+        "iicp_conf": env,
+    });
+    let parsed: iicp_client::node::TaskRequest =
+        serde_json::from_value(request_body.clone()).unwrap();
+    assert!(parsed.payload.is_null());
+    assert!(parsed.iicp_conf.is_some());
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://127.0.0.1:{port}/v1/task"))
+        .json(&request_body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "success");
+    assert_eq!(body["result"]["echo"], payload);
 
     handle.abort();
 }
@@ -438,6 +496,15 @@ async fn test_register_payload_spec_compliant() {
     cfg.tokens_per_min = 2000;
     cfg.max_tokens = 8192;
     let node = IicpNode::new(cfg);
+    let register_payload = node.register_payload_for_test();
+    assert_eq!(register_payload["cx_public_key"]["algorithm"], "X25519");
+    assert_eq!(register_payload["cx_public_key"]["encoding"], "base64url");
+    assert!(
+        register_payload["cx_public_key"]["key_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("cx-")
+    );
     let token = node.register().await.unwrap();
     assert_eq!(token, "tok-1");
 }

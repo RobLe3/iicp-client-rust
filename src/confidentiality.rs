@@ -11,9 +11,10 @@ use aes_gcm::{
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use hkdf::Hkdf;
 use rand::RngCore;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
 use crate::errors::{IicpError, Result};
@@ -25,6 +26,86 @@ fn b64url_encode(data: &[u8]) -> String {
 
 fn b64url_decode(s: &str) -> std::result::Result<Vec<u8>, base64::DecodeError> {
     URL_SAFE_NO_PAD.decode(s)
+}
+
+fn cx_key_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("IICP_CX_KEY_DIR") {
+        return PathBuf::from(dir);
+    }
+    let base = std::env::var("IICP_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".iicp")))
+        .unwrap_or_else(|_| PathBuf::from(".iicp"));
+    base.join("cx")
+}
+
+fn cx_key_path(node_id: &str, endpoint: &str) -> PathBuf {
+    use sha2::Digest;
+    let stable = if !node_id.is_empty() { node_id } else { endpoint };
+    let digest = sha2::Sha256::digest(stable.as_bytes());
+    let digest_hex = hex::encode(digest);
+    cx_key_dir().join(format!("{}.json", &digest_hex[..24]))
+}
+
+fn public_key_from_raw(pub_bytes: &[u8; 32]) -> CxPublicKey {
+    use sha2::Digest;
+    let digest = sha2::Sha256::digest(pub_bytes);
+    CxPublicKey {
+        algorithm: "X25519".to_string(),
+        encoding: Some("base64url".to_string()),
+        key: b64url_encode(pub_bytes),
+        key_id: format!("cx-{}", &hex::encode(digest)[..16]),
+    }
+}
+
+/// Load or create the provider node's persistent CX key.
+///
+/// The private key remains local under `$IICP_CX_KEY_DIR` or `$IICP_HOME/cx`; the
+/// public half is safe to advertise in REGISTER as `cx_public_key`.
+pub fn load_or_create_node_cx_key(node_id: &str, endpoint: &str) -> Result<(CxPublicKey, [u8; 32])> {
+    let path = cx_key_path(node_id, endpoint);
+    if path.exists() {
+        let raw = std::fs::read(&path)
+            .map_err(|e| IicpError::Node(format!("CX key read {}: {e}", path.display())))?;
+        let data: Value = serde_json::from_slice(&raw)
+            .map_err(|e| IicpError::Node(format!("CX key JSON parse: {e}")))?;
+        let private_str = data
+            .get("private_key")
+            .and_then(Value::as_str)
+            .ok_or_else(|| IicpError::Node("CX key missing private_key".to_string()))?;
+        let private_bytes = b64url_decode(private_str)
+            .map_err(|e| IicpError::Node(format!("CX private_key decode: {e}")))?;
+        if private_bytes.len() != 32 {
+            return Err(IicpError::Node("CX private_key must be 32 bytes".to_string()));
+        }
+        let mut private_arr = [0u8; 32];
+        private_arr.copy_from_slice(&private_bytes);
+        let public = PublicKey::from(&StaticSecret::from(private_arr));
+        return Ok((public_key_from_raw(public.as_bytes()), private_arr));
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| IicpError::Node(format!("CX key dir {}: {e}", parent.display())))?;
+    }
+    let private = StaticSecret::random_from_rng(rand::thread_rng());
+    let private_arr = private.to_bytes();
+    let public = PublicKey::from(&private);
+    let cx_public_key = public_key_from_raw(public.as_bytes());
+    let data = json!({
+        "version": 1,
+        "algorithm": "X25519",
+        "private_key": b64url_encode(&private_arr),
+        "public_key": cx_public_key,
+    });
+    std::fs::write(&path, serde_json::to_vec_pretty(&data)?)
+        .map_err(|e| IicpError::Node(format!("CX key write {}: {e}", path.display())))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok((cx_public_key, private_arr))
 }
 
 /// Encrypt a task payload using the node's X25519 public key (CX-Consumer, IICP-CX §5).
@@ -295,6 +376,7 @@ mod tests {
         );
         let cx_public_key = CxPublicKey {
             algorithm: "X25519".to_string(),
+            encoding: Some("base64url".to_string()),
             key: b64url_encode(pub_bytes),
             key_id,
         };
@@ -367,6 +449,7 @@ mod tests {
     fn test_unsupported_algorithm_fails() {
         let bad_key = CxPublicKey {
             algorithm: "RSA".to_string(),
+            encoding: Some("base64url".to_string()),
             key: "abc".to_string(),
             key_id: "00000000".to_string(),
         };

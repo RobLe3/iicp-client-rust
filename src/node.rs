@@ -331,7 +331,10 @@ impl NodeConfig {
 pub struct TaskRequest {
     pub task_id: String,
     pub intent: String,
+    #[serde(default)]
     pub payload: Value,
+    #[serde(default)]
+    pub iicp_conf: Option<HashMap<String, Value>>,
     pub constraints: Option<Value>,
     pub auth: Option<Value>,
     pub nonce: Option<String>,
@@ -418,6 +421,8 @@ struct AppState {
     /// send no Origin and are not throttled. (window_start, count) per origin.
     task_rate_limit: u32,
     task_rate_buckets: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
+    /// IICP-CX provider private key for decrypting incoming iicp_conf task payloads.
+    cx_private_key: Option<[u8; 32]>,
 }
 
 const TASK_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -1102,6 +1107,34 @@ async fn task_endpoint(
             .into_response();
     }
 
+    if req.payload.is_null() {
+        if let Some(conf) = req.iicp_conf.as_ref() {
+            match state
+                .cx_private_key
+                .as_ref()
+                .ok_or_else(|| IicpError::Node("node has no CX private key".to_string()))
+                .and_then(|private_key| crate::confidentiality::decrypt_payload(conf, private_key))
+            {
+                Ok(payload) => {
+                    req.payload = payload;
+                }
+                Err(err) => {
+                    state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "error": {
+                                "code": "IICP-CX-02",
+                                "message": format!("iicp_conf decrypt failed: {err}")
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     // W3C traceparent propagation
     if let Some(tp) = headers.get("traceparent").and_then(|v| v.to_str().ok()) {
         req._trace = Some(json!({ "traceparent": tp }));
@@ -1218,6 +1251,9 @@ pub struct IicpNode {
     /// tick so a rotated endpoint triggers a live re-registration (the new URL
     /// is accepted via the IICP-E050 token path, current_node_token #529).
     registered_endpoint: Arc<std::sync::RwLock<String>>,
+    /// IICP-CX provider key advertised in REGISTER and used to decrypt iicp_conf.
+    cx_public_key: Option<crate::types::CxPublicKey>,
+    cx_private_key: Option<[u8; 32]>,
 }
 
 impl IicpNode {
@@ -1228,6 +1264,16 @@ impl IicpNode {
             .build()
             .expect("failed to build HTTP client");
         let runtime_hmac_key = Arc::new(std::sync::RwLock::new(cfg.node_hmac_key.clone()));
+        let (cx_public_key, cx_private_key) =
+            match crate::confidentiality::load_or_create_node_cx_key(&cfg.node_id, &cfg.endpoint) {
+                Ok((public_key, private_key)) => (Some(public_key), Some(private_key)),
+                Err(err) => {
+                    eprintln!(
+                        "[iicp-node] IICP-CX provider key unavailable; node will not advertise CX: {err}"
+                    );
+                    (None, None)
+                }
+            };
         Self {
             cfg,
             http,
@@ -1239,6 +1285,8 @@ impl IicpNode {
             registered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
             endpoint_override: Arc::new(std::sync::RwLock::new(None)),
             registered_endpoint: Arc::new(std::sync::RwLock::new(String::new())),
+            cx_public_key,
+            cx_private_key,
         }
     }
 
@@ -1540,6 +1588,9 @@ impl IicpNode {
         }
         payload["sdk_language"] = json!("rust");
         payload["sdk_version"] = json!(env!("CARGO_PKG_VERSION"));
+        if let Some(cx_public_key) = &self.cx_public_key {
+            payload["cx_public_key"] = json!(cx_public_key);
+        }
         if self.cfg.relay_capable {
             payload["relay_capable"] = json!(true);
             payload["relay_accept_port"] = json!(self.cfg.relay_accept_port);
@@ -1861,6 +1912,7 @@ impl IicpNode {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
             task_rate_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            cx_private_key: self.cx_private_key,
         });
 
         // Capture the availability handle before `state` is moved into the router,
@@ -2255,6 +2307,9 @@ impl IicpNode {
                                 .unwrap_or("")
                                 .to_string(),
                             payload: task.get("payload").cloned().unwrap_or(Value::Null),
+                            iicp_conf: task
+                                .get("iicp_conf")
+                                .and_then(|v| serde_json::from_value(v.clone()).ok()),
                             constraints: task.get("constraints").cloned(),
                             auth: task.get("auth").cloned(),
                             nonce: None,
@@ -2328,6 +2383,7 @@ impl IicpNode {
                             task_id: t.task_id,
                             intent: t.intent,
                             payload: t.payload,
+                            iicp_conf: None,
                             constraints: None,
                             auth: None,
                             nonce: None,
