@@ -1243,9 +1243,9 @@ pub struct IicpNode {
     /// Arc so the background heartbeat task can read and update it.
     registered_models: Arc<std::sync::RwLock<Vec<String>>>,
     /// #527 — endpoint override set by the tunnel watchdog when a Quick Tunnel
-    /// URL rotates (the watchdog runs on a sync thread with only an Arc handle;
-    /// this is the "&self endpoint setter" WQ-088 deferred). `None` = use
-    /// `cfg.endpoint`. `build_register_payload` reads the effective endpoint.
+    /// URL rotates (the watchdog runs on a sync thread with only an Arc handle).
+    /// `None` = use `cfg.endpoint`. `build_register_payload` reads the effective
+    /// endpoint.
     endpoint_override: Arc<std::sync::RwLock<Option<String>>>,
     /// #527 — endpoint registered at last register(); compared each heartbeat
     /// tick so a rotated endpoint triggers a live re-registration (the new URL
@@ -1302,6 +1302,18 @@ impl IicpNode {
 
     /// #527 — handle for the tunnel watchdog to publish a rotated Quick Tunnel
     /// URL from its sync thread; the heartbeat loop re-registers on the change.
+    /// #527 — update the effective endpoint at runtime. `endpoint` is stored as
+    /// an override so the background watchdog can push rotations into the same
+    /// running node instance (and the loop re-registers when it changes).
+    pub fn set_endpoint(&self, endpoint: String) {
+        let mut g = self.endpoint_override.write().expect("poisoned");
+        if endpoint.is_empty() {
+            *g = None;
+        } else {
+            *g = Some(endpoint);
+        }
+    }
+
     pub fn endpoint_override_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
         Arc::clone(&self.endpoint_override)
     }
@@ -2684,6 +2696,25 @@ mod operator_wiring_tests {
             .build_register_payload();
         assert!(p.get("operator_delegation").is_none());
         assert!(p.get("operator_display_name").is_none());
+    }
+
+    #[test]
+    fn endpoint_override_updates_register_payload_endpoint() {
+        let node = IicpNode::new(NodeConfig::new("n3", "https://seed.example.com", CHAT));
+        assert_eq!(
+            node.build_register_payload()["endpoint"],
+            serde_json::json!("https://seed.example.com")
+        );
+        node.set_endpoint("https://rotated.example.net".to_string());
+        assert_eq!(
+            node.build_register_payload()["endpoint"],
+            serde_json::json!("https://rotated.example.net")
+        );
+        node.set_endpoint(String::new());
+        assert_eq!(
+            node.build_register_payload()["endpoint"],
+            serde_json::json!("https://seed.example.com")
+        );
     }
 
     /// TC-9c — token extraction: handler returns the unwrapped OpenAI completion response, so

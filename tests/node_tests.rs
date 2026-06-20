@@ -499,12 +499,10 @@ async fn test_register_payload_spec_compliant() {
     let register_payload = node.register_payload_for_test();
     assert_eq!(register_payload["cx_public_key"]["algorithm"], "X25519");
     assert_eq!(register_payload["cx_public_key"]["encoding"], "base64url");
-    assert!(
-        register_payload["cx_public_key"]["key_id"]
-            .as_str()
-            .unwrap()
-            .starts_with("cx-")
-    );
+    assert!(register_payload["cx_public_key"]["key_id"]
+        .as_str()
+        .unwrap()
+        .starts_with("cx-"));
     let token = node.register().await.unwrap();
     assert_eq!(token, "tok-1");
 }

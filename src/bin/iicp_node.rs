@@ -3070,6 +3070,9 @@ fn apply_tunnel_profile(node: &mut iicp_client::node::IicpNode, url: &str) {
         ipv6: None,
     };
     node.apply_nat_profile(&profile);
+    // Keep the live endpoint override in sync with runtime URL rotation
+    // so direct calls can re-register without mutating internals.
+    node.set_endpoint(url.to_string());
 }
 
 #[cfg(not(feature = "nat"))]

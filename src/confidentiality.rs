@@ -41,7 +41,11 @@ fn cx_key_dir() -> PathBuf {
 
 fn cx_key_path(node_id: &str, endpoint: &str) -> PathBuf {
     use sha2::Digest;
-    let stable = if !node_id.is_empty() { node_id } else { endpoint };
+    let stable = if !node_id.is_empty() {
+        node_id
+    } else {
+        endpoint
+    };
     let digest = sha2::Sha256::digest(stable.as_bytes());
     let digest_hex = hex::encode(digest);
     cx_key_dir().join(format!("{}.json", &digest_hex[..24]))
@@ -62,7 +66,10 @@ fn public_key_from_raw(pub_bytes: &[u8; 32]) -> CxPublicKey {
 ///
 /// The private key remains local under `$IICP_CX_KEY_DIR` or `$IICP_HOME/cx`; the
 /// public half is safe to advertise in REGISTER as `cx_public_key`.
-pub fn load_or_create_node_cx_key(node_id: &str, endpoint: &str) -> Result<(CxPublicKey, [u8; 32])> {
+pub fn load_or_create_node_cx_key(
+    node_id: &str,
+    endpoint: &str,
+) -> Result<(CxPublicKey, [u8; 32])> {
     let path = cx_key_path(node_id, endpoint);
     if path.exists() {
         let raw = std::fs::read(&path)
@@ -76,7 +83,9 @@ pub fn load_or_create_node_cx_key(node_id: &str, endpoint: &str) -> Result<(CxPu
         let private_bytes = b64url_decode(private_str)
             .map_err(|e| IicpError::Node(format!("CX private_key decode: {e}")))?;
         if private_bytes.len() != 32 {
-            return Err(IicpError::Node("CX private_key must be 32 bytes".to_string()));
+            return Err(IicpError::Node(
+                "CX private_key must be 32 bytes".to_string(),
+            ));
         }
         let mut private_arr = [0u8; 32];
         private_arr.copy_from_slice(&private_bytes);
