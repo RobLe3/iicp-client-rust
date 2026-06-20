@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.64] — 2026-06-20
+
+### Changed — provider-side IICP-CX
+- Provider nodes now persist an X25519 CX key locally and advertise the public half as
+  `cx_public_key` during registration.
+- `POST /v1/task` decrypts incoming `iicp_conf` envelopes before invoking the task handler,
+  closing the missing provider-side half of mandatory payload confidentiality.
+- Added regression coverage for CX key advertisement and encrypted task handling.
+
 ## [0.7.63] — 2026-06-20
 
 ### Changed
