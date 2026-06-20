@@ -117,6 +117,11 @@ pub fn auto_update_interval_secs() -> u64 {
         .unwrap_or(21600)
 }
 
+/// Delay before the first background check; never later than five minutes.
+pub fn auto_update_initial_delay_secs(interval: u64) -> u64 {
+    interval.min(300)
+}
+
 /// `cargo install iicp-client --force --features <features>`. True on success.
 /// Blocking (recompiles) — call from a blocking context.
 pub fn perform_self_update(features: &str) -> bool {
@@ -169,6 +174,13 @@ mod tests {
             auto_update_decision("0.7.60", Some("0.7.59"), true),
             UpdateAction::Current
         );
+    }
+
+    #[test]
+    fn auto_update_initial_delay_is_at_most_five_minutes() {
+        assert_eq!(auto_update_initial_delay_secs(300), 300);
+        assert_eq!(auto_update_initial_delay_secs(900), 300);
+        assert_eq!(auto_update_initial_delay_secs(21_600), 300);
     }
 
     #[test]

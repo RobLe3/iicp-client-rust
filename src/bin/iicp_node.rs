@@ -2109,7 +2109,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             let interval = iicp_client::updater::auto_update_interval_secs();
             // First check soon after startup (≤5 min) so a freshly-published release propagates
             // fast + observably, instead of waiting a full interval (default 6h); then the cadence.
-            let mut delay = interval.min(300);
+            let mut delay = iicp_client::updater::auto_update_initial_delay_secs(interval);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 delay = interval;

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.63] — 2026-06-20
+
+### Changed
+- Tier-3+ reachability now tries the node's own Quick Tunnel before electing a third-party relay; `--no-tunnel` retains relay-first behavior.
+- The background updater performs its first check within five minutes of startup, then returns to the configured cadence.
+
+### Fixed
+- `--tunnel` help now describes the actual tunnel-first reachability order.
+- Reachability order is produced by the same pure planner covered by unit tests.
+- Added a targeted test for the updater's initial-delay rule.
+
 ## [0.7.62] — 2026-06-13
 
 ### Changed — privacy-first (mandatory E2E, no opt-out)
