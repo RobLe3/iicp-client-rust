@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.65] — 2026-06-21
+
+### Fixed — discover CX key alias
+- Consumers prefer canonical `cx_public_key` and treat a directory `public_key` field as a deprecated alias, so keyed live nodes are encrypted instead of receiving the
+  transitional plaintext fallback warning.
+- Added regression coverage for the alias path.
+
 ## [0.7.64] — 2026-06-20
 
 ### Changed — provider-side IICP-CX

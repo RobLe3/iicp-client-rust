@@ -97,8 +97,8 @@ pub struct Node {
     #[serde(default)]
     pub exposure_mode: Option<String>,
     /// IICP-CX S.16 §3.1 — X25519 public key for E2E payload confidentiality.
-    /// Present only when the node registered with cx_public_key (directory v1.10.7+).
-    #[serde(default)]
+    /// Canonical IICP-CX key advertised by discovery; `public_key` is a deprecated alias.
+    #[serde(default, alias = "public_key")]
     pub cx_public_key: Option<CxPublicKey>,
     /// #397 — transport protocols the node speaks (e.g. ["https","iicp-native"]).
     /// Empty/absent against a directory predating the field.

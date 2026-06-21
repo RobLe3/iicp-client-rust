@@ -15,6 +15,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ed25519_dalek::{Signer, SigningKey};
 use iicp_client::node::{IicpNode, NodeConfig};
 use iicp_client::relay_session::{HttpPollWorkerSession, RelaySession, RelaySessionRegistry};
 use serde_json::{json, Value};
@@ -30,10 +32,14 @@ fn free_port() -> u16 {
 }
 
 async fn spawn_relay() -> u16 {
-    let port = free_port();
     let mut cfg = NodeConfig::new("relay-node", "http://relay.local", INTENT);
     cfg.relay_capable = true;
     cfg.relay_accept_port = free_port();
+    spawn_relay_with_config(cfg).await
+}
+
+async fn spawn_relay_with_config(cfg: NodeConfig) -> u16 {
+    let port = free_port();
     let node = Arc::new(IicpNode::new(cfg));
     tokio::spawn(async move {
         let handler =
@@ -57,6 +63,23 @@ async fn spawn_relay() -> u16 {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     port
+}
+
+fn signed_ticket(worker_id: &str, relay_id: &str) -> (String, String) {
+    let sk = SigningKey::from_bytes(&[9u8; 32]);
+    let payload = serde_json::json!({
+        "v": 1, "typ": "relay-bind-ticket", "iss": "test", "sub": worker_id, "aud": relay_id,
+        "iat": 1, "exp": 9_999_999_999_i64,
+    })
+    .to_string();
+    let b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+    let mut msg = b"iicp:relay-bind-ticket:v1\n".to_vec();
+    msg.extend_from_slice(b64.as_bytes());
+    let sig = sk.sign(&msg);
+    (
+        format!("{}.{}", b64, hex::encode(sig.to_bytes())),
+        hex::encode(sk.verifying_key().to_bytes()),
+    )
 }
 
 async fn bind(
@@ -157,6 +180,40 @@ async fn alive_rebind_rejected_409() {
     assert_eq!(resp2.status(), 409);
     let body: Value = resp2.json().await.unwrap();
     assert_eq!(body["error"]["code"], "IICP-E038");
+}
+
+#[tokio::test]
+async fn strict_bind_ticket_mode_accepts_valid_http_poll_ticket_and_rejects_wrong_worker() {
+    let (good_ticket, pub_hex) = signed_ticket("w-http-ticket", "relay-node");
+    let (bad_ticket, _) = signed_ticket("attacker", "relay-node");
+    let mut cfg = NodeConfig::new("relay-node", "http://relay.local", INTENT);
+    cfg.relay_capable = true;
+    cfg.relay_accept_port = free_port();
+    cfg.relay_bind_ticket_public_key_hex = Some(pub_hex);
+    cfg.relay_require_bind_ticket = true;
+    let port = spawn_relay_with_config(cfg).await;
+    let client = reqwest::Client::new();
+
+    let ok = client
+        .post(format!("http://127.0.0.1:{port}/v1/relay/bind"))
+        .json(&json!({"worker_id": "w-http-ticket", "intent": INTENT, "models": [], "bind_ticket": good_ticket}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+
+    let wrong = client
+        .post(format!("http://127.0.0.1:{port}/v1/relay/bind"))
+        .json(&json!({"worker_id": "w-http-ticket-2", "intent": INTENT, "models": [], "bind_ticket": bad_ticket}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 401);
+    let body: Value = wrong.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "IICP-E040");
+
+    let missing = bind(&client, port, "w-http-ticket-missing", &[]).await;
+    assert_eq!(missing.status(), 401);
 }
 
 #[tokio::test]

@@ -16,11 +16,16 @@ urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
 cargo add iicp-client
 ```
 
+> **Upgrade note (0.7.65)** — upgrade clients and nodes so discovery prefers the canonical
+> IICP-CX `cx_public_key` field while still accepting the temporary `public_key` alias.
+> This prevents keyed live nodes from being treated as plaintext-only during the migration
+> and prepares your install for the later removal of the ambiguous alias.
+
 Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.64"
+iicp-client = "0.7.65"
 ```
 
 To run a provider node from the command line, install the `iicp-node` binary:

@@ -27,6 +27,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
+use crate::backend_stability::{observe_backend_stability, BackendStabilityObservation};
 use crate::errors::{IicpError, Result};
 
 const DEFAULT_DIRECTORY: &str = "https://iicp.network/api";
@@ -262,6 +263,10 @@ pub struct NodeConfig {
     /// R2: when set, this node acts as a relay WORKER — connects outbound to the
     /// specified relay endpoint. Format: "host:port" (e.g. "relay.example.com:9485").
     pub relay_worker_endpoint: Option<String>,
+    /// #510 — optional directory Ed25519 public key used to verify HTTP-poll relay bind tickets.
+    pub relay_bind_ticket_public_key_hex: Option<String>,
+    /// #510 — when true, HTTP-poll relay binds without a valid ticket are rejected.
+    pub relay_require_bind_ticket: bool,
     /// Directory for persistent log files (`<node_id>.log` + `events.jsonl`).
     /// `None` disables file logging (stderr only). Overridden by `IICP_LOG_DIR`.
     pub log_dir: Option<std::path::PathBuf>,
@@ -316,6 +321,13 @@ impl NodeConfig {
             relay_capable: false,
             relay_accept_port: 9485,
             relay_worker_endpoint: None,
+            relay_bind_ticket_public_key_hex: std::env::var("IICP_RELAY_BIND_TICKET_PUBLIC_KEY")
+                .ok()
+                .filter(|s| !s.is_empty()),
+            relay_require_bind_ticket: std::env::var("IICP_RELAY_REQUIRE_BIND_TICKET")
+                .ok()
+                .as_deref()
+                == Some("1"),
             log_dir: None,
             operator_delegation: None,
             operator_display_name: None,
@@ -408,6 +420,8 @@ struct AppState {
     cip_policy: Arc<crate::cip_policy::CooperativeInferencePolicy>,
     idempotency: Arc<crate::idempotency::IdempotencyGuard>,
     enable_idempotency: bool,
+    relay_bind_ticket_public_key_hex: Option<String>,
+    relay_require_bind_ticket: bool,
     peer_manager: Arc<crate::peer_manager::PeerManager>,
     http: reqwest::Client,
     nonce_cache: Arc<Mutex<HashMap<String, Instant>>>,
@@ -424,6 +438,7 @@ struct AppState {
     task_rate_buckets: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
     /// IICP-CX provider private key for decrypting incoming iicp_conf task payloads.
     cx_private_key: Option<[u8; 32]>,
+    backend_stability: Arc<std::sync::RwLock<BackendStabilityObservation>>,
 }
 
 const TASK_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -484,6 +499,7 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "models": state.models,
         "intent": state.intent,
         "pinhole_state": pinhole_state,
+        "backend_stability": state.backend_stability.read().expect("poisoned").public_json(),
     }))
 }
 
@@ -693,6 +709,50 @@ async fn relay_bind_endpoint(
                 .into_response(),
         );
     }
+    let bind_ticket = payload
+        .get("bind_ticket")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let ticket_public_key = state
+        .relay_bind_ticket_public_key_hex
+        .as_deref()
+        .unwrap_or("");
+    if !bind_ticket.is_empty() && !ticket_public_key.is_empty() {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if crate::relay_ticket::verify_relay_bind_ticket(
+            bind_ticket,
+            ticket_public_key,
+            worker_id,
+            &state.node_id,
+            now_s,
+        )
+        .is_none()
+        {
+            return relay_cors(
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(
+                        json!({"error":{"code":"IICP-E040","message":"relay bind ticket invalid"}}),
+                    ),
+                )
+                    .into_response(),
+            );
+        }
+    } else if state.relay_require_bind_ticket {
+        return relay_cors(
+            (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":{"code":"IICP-E040","message":"relay bind ticket required"}})),
+            )
+                .into_response(),
+        );
+    } else if bind_ticket.is_empty() {
+        tracing::warn!("HTTP-poll relay bind without ticket: {}", worker_id);
+    }
+
     // #510 interim-C parity: never displace an ALIVE bound session.
     if let Some(existing) = state.relay_sessions.get(worker_id) {
         if existing.is_alive() {
@@ -1054,6 +1114,29 @@ async fn task_endpoint(
             .into_response();
     }
 
+    // #553 / WQ-180 — provider-local backend drain guard.
+    let stability = state.backend_stability.read().expect("poisoned").clone();
+    if stability.is_draining() {
+        if let Some(retry) = stability.retry_after_s() {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [
+                    ("Retry-After", retry.to_string()),
+                    ("Content-Type", "application/json".to_string()),
+                ],
+                Json(json!({
+                    "error": {
+                        "code": "IICP-E024",
+                        "message": "backend temporarily draining",
+                        "reason": stability.reason_class,
+                        "retry_after_ms": retry * 1000,
+                    }
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // QoS-aware admission — IICP-E021
     let qos = req
         .constraints
@@ -1268,6 +1351,7 @@ pub struct IicpNode {
     /// IICP-CX provider key advertised in REGISTER and used to decrypt iicp_conf.
     cx_public_key: Option<crate::types::CxPublicKey>,
     cx_private_key: Option<[u8; 32]>,
+    backend_stability: Arc<std::sync::RwLock<BackendStabilityObservation>>,
 }
 
 impl IicpNode {
@@ -1301,6 +1385,9 @@ impl IicpNode {
             registered_endpoint: Arc::new(std::sync::RwLock::new(String::new())),
             cx_public_key,
             cx_private_key,
+            backend_stability: Arc::new(std::sync::RwLock::new(
+                BackendStabilityObservation::default(),
+            )),
         }
     }
 
@@ -1348,6 +1435,36 @@ impl IicpNode {
     /// #494 — expose registered_models for test inspection and background-task wiring.
     pub fn registered_models(&self) -> &Arc<std::sync::RwLock<Vec<String>>> {
         &self.registered_models
+    }
+
+    #[doc(hidden)]
+    pub fn set_backend_stability_for_test(&self, observation: BackendStabilityObservation) {
+        *self.backend_stability.write().expect("poisoned") = observation;
+    }
+
+    fn set_backend_stability(&self, observation: BackendStabilityObservation) {
+        let mut guard = self.backend_stability.write().expect("poisoned");
+        if guard.is_draining() && !observation.is_draining() {
+            return;
+        }
+        *guard = observation;
+    }
+
+    async fn observe_backend_stability(&self) -> BackendStabilityObservation {
+        let obs = if let Some(url) = self.cfg.backend_url.as_deref() {
+            observe_backend_stability(
+                &self.http,
+                url,
+                self.cfg.backend.as_deref(),
+                self.cfg.model.as_deref(),
+                self.cfg.backend_api_key.as_deref(),
+            )
+            .await
+        } else {
+            BackendStabilityObservation::default()
+        };
+        self.set_backend_stability(obs.clone());
+        obs
     }
 
     /// #494 — check for model drift and re-register if the live set differs from registered.
@@ -1810,6 +1927,8 @@ impl IicpNode {
             if let Some(models) = self.probe_health_models().await {
                 body["health_models"] = json!(models);
             }
+            let stability = self.observe_backend_stability().await;
+            body["backend_stability"] = stability.public_json();
         }
 
         let resp = self
@@ -1919,6 +2038,8 @@ impl IicpNode {
                 .unwrap_or_else(crate::cip_policy::get_cip_policy),
             idempotency: Arc::new(crate::idempotency::IdempotencyGuard::default()),
             enable_idempotency: self.cfg.enable_idempotency,
+            relay_bind_ticket_public_key_hex: self.cfg.relay_bind_ticket_public_key_hex.clone(),
+            relay_require_bind_ticket: self.cfg.relay_require_bind_ticket,
             peer_manager: Arc::new(crate::peer_manager::PeerManager::with_opts(
                 self.cfg.directory_url.clone(),
                 self.cfg.node_hmac_key.clone(),
@@ -1941,6 +2062,7 @@ impl IicpNode {
                 .unwrap_or(120),
             task_rate_buckets: Arc::new(std::sync::Mutex::new(HashMap::new())),
             cx_private_key: self.cx_private_key,
+            backend_stability: Arc::clone(&self.backend_stability),
         });
 
         // Capture the availability handle before `state` is moved into the router,
@@ -2083,6 +2205,9 @@ impl IicpNode {
             // #494 — model drift detection: capture backend probe config + registered models.
             let hb_backend_url = self.cfg.backend_url.clone();
             let hb_backend_api_key = self.cfg.backend_api_key.clone();
+            let hb_backend = self.cfg.backend.clone();
+            let hb_model = self.cfg.model.clone();
+            let hb_backend_stability = Arc::clone(&self.backend_stability);
             let hb_intent = self.cfg.intent.clone();
             let hb_max_tokens = self.cfg.max_tokens;
             let hb_registered_models = Arc::clone(&self.registered_models);
@@ -2120,6 +2245,24 @@ impl IicpNode {
                     } else {
                         None
                     };
+                    let backend_stability = if let Some(ref bu) = hb_backend_url {
+                        let obs = observe_backend_stability(
+                            &http,
+                            bu,
+                            hb_backend.as_deref(),
+                            hb_model.as_deref(),
+                            hb_backend_api_key.as_deref(),
+                        )
+                        .await;
+                        if let Ok(mut guard) = hb_backend_stability.write() {
+                            if !guard.is_draining() || obs.is_draining() {
+                                *guard = obs.clone();
+                            }
+                        }
+                        Some(obs)
+                    } else {
+                        None
+                    };
                     // Build the heartbeat payload with optional health_models.
                     let mut hb_body = json!({
                         "node_id": &node_id,
@@ -2137,6 +2280,9 @@ impl IicpNode {
                     });
                     if let Some(ref hm) = live_models {
                         hb_body["health_models"] = json!(hm);
+                    }
+                    if let Some(ref obs) = backend_stability {
+                        hb_body["backend_stability"] = obs.public_json();
                     }
                     match http
                         // /v1/heartbeat — see heartbeat() above for the doubled-prefix

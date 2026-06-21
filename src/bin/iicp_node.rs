@@ -18,7 +18,9 @@
 //! entry points so operators choosing Rust get the same one-liner setup.
 
 use std::env;
+use std::fs;
 use std::io::{self, BufRead, Write};
+use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
 
@@ -129,6 +131,7 @@ fn print_help() {
          \x20 operator decrypt           Remove at-rest encryption of the operator secret\n\
          \x20 proxy                      Run the local OpenAI/Ollama/Anthropic compat gateway (loopback)\n\
          \x20 mcp-gateway                Bridge a local MCP server as an IICP provider node\n\
+         \x20 service                    Generate/install OS supervisor units for unattended node serving\n\
          \x20 help                       Print this help\n\n\
          Global flags:\n\
          \x20 --version, -V              Print version and exit\n\
@@ -245,6 +248,342 @@ fn print_proxy_help() {
          \x20 --region REGION       IICP_PROXY_PREFERRED_REGION\n\
          \x20 -h, --help            Print this help\n"
     );
+}
+
+#[derive(Debug, Clone)]
+struct ServiceUnit {
+    platform: String,
+    name: String,
+    path: PathBuf,
+    content: String,
+    status_hint: String,
+    restart_hint: String,
+    uninstall_hint: String,
+    log_hint: String,
+}
+
+fn sanitize_service_name(value: &str) -> Result<String, String> {
+    let mut out = String::new();
+    let mut prev_dash = false;
+    for ch in value.trim().chars() {
+        let safe = ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-');
+        if safe {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    let cleaned = out
+        .trim_matches(&['-', '.'][..])
+        .chars()
+        .take(80)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        return Err("service/node name must contain at least one safe character".to_string());
+    }
+    Ok(cleaned)
+}
+
+fn service_label(node: &str, name: Option<&str>) -> Result<String, String> {
+    match name {
+        Some(v) => sanitize_service_name(v),
+        None => Ok(format!(
+            "network.iicp.node.{}",
+            sanitize_service_name(node)?
+        )),
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    if value
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "_/:=.,@%+-".contains(c))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+fn home_dir() -> PathBuf {
+    env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn env_value(key: &str, default: String) -> String {
+    env::var(key).unwrap_or(default)
+}
+
+fn detect_service_platform(requested: &str) -> Result<&'static str, String> {
+    match requested {
+        "launchd" => Ok("launchd"),
+        "systemd" => Ok("systemd"),
+        "auto" => {
+            if cfg!(target_os = "macos") {
+                Ok("launchd")
+            } else {
+                Ok("systemd")
+            }
+        }
+        _ => Err("platform must be auto, launchd or systemd".to_string()),
+    }
+}
+
+fn render_launchd_service(
+    node: &str,
+    name: Option<&str>,
+    executable: &str,
+) -> Result<ServiceUnit, String> {
+    let label = service_label(node, name)?;
+    let home = home_dir();
+    let log_dir = PathBuf::from(env_value(
+        "IICP_LOG_DIR",
+        home.join(".iicp")
+            .join("logs")
+            .to_string_lossy()
+            .to_string(),
+    ));
+    let plist = home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{label}.plist"));
+    let envs = [
+        ("IICP_NODE_NAME", node.to_string()),
+        (
+            "IICP_AUTO_UPDATE",
+            env_value("IICP_AUTO_UPDATE", "1".to_string()),
+        ),
+        (
+            "IICP_AUTO_UPDATE_INTERVAL_S",
+            env_value("IICP_AUTO_UPDATE_INTERVAL_S", "3600".to_string()),
+        ),
+        ("IICP_LOG_DIR", log_dir.to_string_lossy().to_string()),
+    ];
+    let env_xml = envs
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "    <key>{}</key><string>{}</string>",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let out_log = log_dir.join(format!("{label}.out.log"));
+    let err_log = log_dir.join(format!("{label}.err.log"));
+    let content = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>serve</string>
+    <string>--node</string>
+    <string>{}</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+{}
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>{}</string>
+  <key>StandardErrorPath</key><string>{}</string>
+</dict>
+</plist>
+"#,
+        xml_escape(&label),
+        xml_escape(executable),
+        xml_escape(node),
+        env_xml,
+        xml_escape(&out_log.to_string_lossy()),
+        xml_escape(&err_log.to_string_lossy()),
+    );
+    Ok(ServiceUnit {
+        platform: "launchd".to_string(),
+        name: label.clone(),
+        path: plist.clone(),
+        content,
+        status_hint: format!("launchctl print gui/$(id -u)/{label}"),
+        restart_hint: format!("launchctl kickstart -k gui/$(id -u)/{label}"),
+        uninstall_hint: format!(
+            "launchctl bootout gui/$(id -u) {}; rm -f {}",
+            shell_quote(&plist.to_string_lossy()),
+            shell_quote(&plist.to_string_lossy())
+        ),
+        log_hint: format!(
+            "tail -f {} {}",
+            shell_quote(&out_log.to_string_lossy()),
+            shell_quote(&err_log.to_string_lossy())
+        ),
+    })
+}
+
+fn render_systemd_service(
+    node: &str,
+    name: Option<&str>,
+    executable: &str,
+) -> Result<ServiceUnit, String> {
+    let label = service_label(node, name)?;
+    let home = home_dir();
+    let unit_path = home
+        .join(".config")
+        .join("systemd")
+        .join("user")
+        .join(format!("{label}.service"));
+    let log_dir = PathBuf::from(env_value(
+        "IICP_LOG_DIR",
+        home.join(".iicp")
+            .join("logs")
+            .to_string_lossy()
+            .to_string(),
+    ));
+    let envs = [
+        ("IICP_NODE_NAME", node.to_string()),
+        (
+            "IICP_AUTO_UPDATE",
+            env_value("IICP_AUTO_UPDATE", "1".to_string()),
+        ),
+        (
+            "IICP_AUTO_UPDATE_INTERVAL_S",
+            env_value("IICP_AUTO_UPDATE_INTERVAL_S", "3600".to_string()),
+        ),
+        ("IICP_LOG_DIR", log_dir.to_string_lossy().to_string()),
+    ];
+    let env_lines = envs
+        .iter()
+        .map(|(k, v)| format!("Environment={k}={}", shell_quote(v)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!(
+        "[Unit]\nDescription=IICP node {node}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={executable} serve --node {}\n{env_lines}\nRestart=on-failure\nRestartSec=30\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
+        shell_quote(node),
+        shell_quote(&home.to_string_lossy()),
+    );
+    Ok(ServiceUnit {
+        platform: "systemd".to_string(),
+        name: label.clone(),
+        path: unit_path.clone(),
+        content,
+        status_hint: format!("systemctl --user status {label}.service"),
+        restart_hint: format!("systemctl --user restart {label}.service"),
+        uninstall_hint: format!(
+            "systemctl --user disable --now {label}.service; rm -f {}; systemctl --user daemon-reload",
+            shell_quote(&unit_path.to_string_lossy())
+        ),
+        log_hint: format!("journalctl --user -u {label}.service -f"),
+    })
+}
+
+fn render_service_unit(
+    node: &str,
+    name: Option<&str>,
+    platform: &str,
+    executable: &str,
+) -> Result<ServiceUnit, String> {
+    match detect_service_platform(platform)? {
+        "launchd" => render_launchd_service(node, name, executable),
+        _ => render_systemd_service(node, name, executable),
+    }
+}
+
+fn run_service(args: &[String]) -> Result<(), String> {
+    let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
+    if subcmd.is_empty() || matches!(subcmd, "--help" | "-h" | "help") {
+        println!(
+            "usage: iicp-node service <install|status|restart|uninstall> --node NAME [options]\n\n\
+             Generate user-level launchd/systemd supervisor units. The service runs foreground:\n\
+             \x20 iicp-node serve --node <NAME>\n\n\
+             Options:\n\
+             \x20 --node NAME        Saved node name to serve (required)\n\
+             \x20 --name NAME        Override service label/unit name\n\
+             \x20 --platform KIND    auto | launchd | systemd (default auto)\n\
+             \x20 --dry-run          For install: print the generated unit without writing files"
+        );
+        return if subcmd.is_empty() {
+            Err("service requires a subcommand".to_string())
+        } else {
+            Ok(())
+        };
+    }
+    if !matches!(subcmd, "install" | "status" | "restart" | "uninstall") {
+        return Err(format!("unknown service subcommand '{subcmd}'"));
+    }
+    let mut node: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut platform = "auto".to_string();
+    let mut dry_run = false;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--node" => {
+                i += 1;
+                node = args.get(i).cloned();
+            }
+            "--name" => {
+                i += 1;
+                name = args.get(i).cloned();
+            }
+            "--platform" => {
+                i += 1;
+                platform = args.get(i).cloned().ok_or("--platform requires a value")?;
+            }
+            "--dry-run" => dry_run = true,
+            "--help" | "-h" => return run_service(&["help".to_string()]),
+            other => return Err(format!("unknown service option '{other}'")),
+        }
+        i += 1;
+    }
+    let node = node.ok_or("service requires --node NAME")?;
+    let unit = render_service_unit(&node, name.as_deref(), &platform, "iicp-node")?;
+    match subcmd {
+        "install" => {
+            if dry_run {
+                print!(
+                    "# {} service: {}\n# path: {}\n{}",
+                    unit.platform,
+                    unit.name,
+                    unit.path.display(),
+                    unit.content
+                );
+            } else {
+                if let Some(parent) = unit.path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                fs::write(&unit.path, unit.content.as_bytes()).map_err(|e| e.to_string())?;
+                println!(
+                    "Installed {} service unit: {}",
+                    unit.platform,
+                    unit.path.display()
+                );
+            }
+            println!("status:   {}", unit.status_hint);
+            println!("restart:  {}", unit.restart_hint);
+            println!("logs:     {}", unit.log_hint);
+            println!("Note: no classic --daemon fork is used; the OS supervisor runs foreground `iicp-node serve`.");
+        }
+        "status" => println!("{}", unit.status_hint),
+        "restart" => println!("{}", unit.restart_hint),
+        "uninstall" => println!("{}", unit.uninstall_hint),
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 fn print_init_help() {
@@ -2983,6 +3322,13 @@ async fn main() {
         }
         return;
     }
+    if cmd == "service" {
+        if let Err(e) = run_service(&args[2..]) {
+            eprintln!("ERROR: {e}");
+            process::exit(2);
+        }
+        return;
+    }
     if cmd == "update" {
         // #521 P1 — read-only version check. Exit 10 when a newer release
         // exists (cron/scripts can act), 0 when current/unreachable. No install.
@@ -3157,6 +3503,50 @@ mod tests {
         assert!(wants_help(&["foo".to_string(), "--help".to_string()]));
         assert!(!wants_help(&["foo".to_string(), "--bar".to_string()]));
         assert!(!wants_help(&[]));
+    }
+
+    #[test]
+    fn launchd_service_runs_foreground_serve_with_hourly_auto_update() {
+        env::remove_var("IICP_AUTO_UPDATE");
+        env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+        let unit = render_launchd_service("mynode", None, "iicp-node").unwrap();
+        assert_eq!(unit.platform, "launchd");
+        assert!(unit
+            .path
+            .to_string_lossy()
+            .contains("network.iicp.node.mynode.plist"));
+        assert!(unit.content.contains("<string>serve</string>"));
+        assert!(unit.content.contains("<string>--node</string>"));
+        assert!(unit.content.contains("<string>mynode</string>"));
+        assert!(unit
+            .content
+            .contains("<key>IICP_AUTO_UPDATE</key><string>1</string>"));
+        assert!(unit
+            .content
+            .contains("<key>IICP_AUTO_UPDATE_INTERVAL_S</key><string>3600</string>"));
+        assert!(unit.content.contains("<key>KeepAlive</key><true/>"));
+        assert!(!unit.content.contains("--daemon"));
+    }
+
+    #[test]
+    fn systemd_service_runs_foreground_serve_with_hourly_auto_update() {
+        env::remove_var("IICP_AUTO_UPDATE");
+        env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+        let unit = render_systemd_service("mynode", None, "iicp-node").unwrap();
+        assert_eq!(unit.platform, "systemd");
+        assert!(unit
+            .path
+            .to_string_lossy()
+            .contains("network.iicp.node.mynode.service"));
+        assert!(unit
+            .content
+            .contains("ExecStart=iicp-node serve --node mynode"));
+        assert!(unit.content.contains("Environment=IICP_AUTO_UPDATE=1"));
+        assert!(unit
+            .content
+            .contains("Environment=IICP_AUTO_UPDATE_INTERVAL_S=3600"));
+        assert!(unit.content.contains("Restart=on-failure"));
+        assert!(!unit.content.contains("--daemon"));
     }
 
     // --no-auto-detect-nat is parsed as an off-switch (parity with Python) and flips the

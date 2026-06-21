@@ -972,3 +972,69 @@ async fn test_no_reregister_on_empty_backend_models() {
 
     _m_reg.assert_async().await; // expect 0 calls
 }
+
+#[tokio::test]
+async fn test_backend_stability_health_and_task_drain() {
+    use iicp_client::backend_stability::BackendStabilityObservation;
+
+    let port = free_port();
+    let mut cfg = NodeConfig::new(
+        "drain-rust-node",
+        "http://drain-rust.local",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.model = Some("test-model".into());
+    let node = IicpNode::new(cfg);
+    node.set_backend_stability_for_test(BackendStabilityObservation::draining(
+        "backend_loading",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 30,
+        json!({"model_size_bytes": 123, "loaded_instances": [{"id":"secret"}]}),
+    ));
+    let addr = format!("127.0.0.1:{port}");
+    let handle = tokio::spawn(async move {
+        let _ = node
+            .serve(
+                |_task| Box::pin(async move { Ok(json!({"ok": true})) }),
+                &addr,
+                None,
+            )
+            .await;
+    });
+    wait_port(port).await;
+
+    let health: Value = reqwest::get(format!("http://127.0.0.1:{port}/iicp/health"))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["backend_stability"]["backend_state"], "draining");
+    assert_eq!(
+        health["backend_stability"]["reason_class"],
+        "backend_loading"
+    );
+    assert!(health["backend_stability"]
+        .get("model_size_bytes")
+        .is_none());
+    assert!(health["backend_stability"]
+        .get("loaded_instances")
+        .is_none());
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/task"))
+        .json(&json!({"task_id":"t-drain","intent":"urn:iicp:intent:llm:chat:v1","payload":{}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(resp.headers().get("retry-after").is_some());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["error"]["code"], "IICP-E024");
+    assert_eq!(body["error"]["reason"], "backend_loading");
+
+    handle.abort();
+}

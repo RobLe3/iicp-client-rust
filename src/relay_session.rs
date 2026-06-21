@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ciborium::value::Value as CborVal;
 use serde_json::Value;
@@ -14,6 +15,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
+
+use crate::relay_ticket::verify_relay_bind_ticket;
 
 const IICP_MAGIC: &[u8] = b"IICP";
 const FRAMING_VERSION: u8 = 0x01;
@@ -416,6 +419,9 @@ pub struct RelayAcceptServer {
     /// The relay's public HTTP task port — advertised in RELAY_ACK (field 4)
     /// so workers can register {relay}:{http_port}/v1/relay-for/<wid> (#450).
     pub http_port: u16,
+    pub require_bind_ticket: bool,
+    pub bind_ticket_public_key_hex: Option<String>,
+    pub relay_node_id: String,
 }
 
 impl RelayAcceptServer {
@@ -434,7 +440,25 @@ impl RelayAcceptServer {
             host: host.into(),
             port,
             http_port,
+            require_bind_ticket: std::env::var("IICP_RELAY_REQUIRE_BIND_TICKET")
+                .ok()
+                .as_deref()
+                == Some("1"),
+            bind_ticket_public_key_hex: std::env::var("IICP_RELAY_BIND_TICKET_PUBLIC_KEY").ok(),
+            relay_node_id: std::env::var("IICP_NODE_ID").unwrap_or_else(|_| "*".to_string()),
         }
+    }
+
+    pub fn with_bind_ticket_auth(
+        mut self,
+        require: bool,
+        public_key_hex: Option<String>,
+        relay_node_id: impl Into<String>,
+    ) -> Self {
+        self.require_bind_ticket = require;
+        self.bind_ticket_public_key_hex = public_key_hex;
+        self.relay_node_id = relay_node_id.into();
+        self
     }
 
     pub async fn serve(self: Arc<Self>) -> Result<(), String> {
@@ -449,8 +473,20 @@ impl RelayAcceptServer {
                     tracing::debug!("Relay accept: connection from {peer}");
                     let reg = self.registry.clone();
                     let http_port = self.http_port;
+                    let require_bind_ticket = self.require_bind_ticket;
+                    let bind_ticket_public_key_hex = self.bind_ticket_public_key_hex.clone();
+                    let relay_node_id = self.relay_node_id.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_relay_connection(stream, reg, http_port).await {
+                        if let Err(e) = handle_relay_connection(
+                            stream,
+                            reg,
+                            http_port,
+                            require_bind_ticket,
+                            bind_ticket_public_key_hex,
+                            relay_node_id,
+                        )
+                        .await
+                        {
                             tracing::warn!("Relay session error from {peer}: {e}");
                         }
                     });
@@ -491,6 +527,9 @@ async fn handle_relay_connection(
     stream: TcpStream,
     registry: RelaySessionRegistry,
     http_port: u16,
+    require_bind_ticket: bool,
+    bind_ticket_public_key_hex: Option<String>,
+    relay_node_id: String,
 ) -> Result<(), String> {
     let peer = stream
         .peer_addr()
@@ -518,8 +557,48 @@ async fn handle_relay_connection(
     let body = cbor_decode_int_map(&payload).ok_or("RELAY_BIND decode failed")?;
     let worker_id = cbor_text_or_bytes(body.get(&1)).unwrap_or_default();
     let intent = cbor_text_or_bytes(body.get(&2)).unwrap_or_default();
+    let bind_ticket = cbor_text_or_bytes(body.get(&4)).unwrap_or_default();
     if worker_id.is_empty() {
         return Err("RELAY_BIND missing worker_id".into());
+    }
+
+    if !bind_ticket.is_empty() {
+        if let Some(pub_hex) = &bind_ticket_public_key_hex {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if verify_relay_bind_ticket(&bind_ticket, pub_hex, &worker_id, &relay_node_id, now)
+                .is_none()
+            {
+                let nack = cbor_encode_int_map(&[
+                    (1, CborVal::Text("error".into())),
+                    (2, CborVal::Text(worker_id.clone())),
+                    (3, CborVal::Text("relay bind ticket invalid".into())),
+                ]);
+                writer
+                    .write_all(&make_frame(MT_RELAY_ACK, &nack))
+                    .await
+                    .map_err(|e| e.to_string())?;
+                return Ok(());
+            }
+        }
+    } else if require_bind_ticket {
+        let nack = cbor_encode_int_map(&[
+            (1, CborVal::Text("error".into())),
+            (2, CborVal::Text(worker_id.clone())),
+            (3, CborVal::Text("relay bind ticket required".into())),
+        ]);
+        writer
+            .write_all(&make_frame(MT_RELAY_ACK, &nack))
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
+    } else {
+        tracing::warn!(
+            "Relay: unsigned RELAY_BIND for worker={} — #510 ticket auth not yet enforced",
+            worker_id
+        );
     }
 
     // #510 interim hardening: RELAY_BIND is unauthenticated, so refuse to
@@ -711,7 +790,8 @@ mod tests {
                 if let Ok((stream, _peer)) = listener.accept().await {
                     let reg = registry.clone();
                     tokio::spawn(async move {
-                        let _ = handle_relay_connection(stream, reg, 9484).await;
+                        let _ = handle_relay_connection(stream, reg, 9484, false, None, "*".into())
+                            .await;
                     });
                 }
             }
@@ -721,15 +801,27 @@ mod tests {
 
     /// Wire-level worker: INIT/ACK + RELAY_BIND; returns the RELAY_ACK body.
     async fn wire_bind(stream: &mut TcpStream, worker_id: &str) -> HashMap<i64, CborVal> {
+        wire_bind_with_ticket(stream, worker_id, None).await
+    }
+
+    async fn wire_bind_with_ticket(
+        stream: &mut TcpStream,
+        worker_id: &str,
+        bind_ticket: Option<String>,
+    ) -> HashMap<i64, CborVal> {
         let init = cbor_encode_int_map(&[(1, CborVal::Integer(1i64.into()))]);
         stream.write_all(&make_frame(MT_INIT, &init)).await.unwrap();
         let (mt, _payload) = read_frame(stream).await.unwrap();
         assert_eq!(mt, MT_ACK, "expected ACK after INIT");
-        let bind = cbor_encode_int_map(&[
+        let mut fields = vec![
             (1, CborVal::Text(worker_id.into())),
             (2, CborVal::Text("urn:iicp:intent:llm:chat:v1".into())),
             (3, CborVal::Array(vec![])),
-        ]);
+        ];
+        if let Some(ticket) = bind_ticket {
+            fields.push((4, CborVal::Text(ticket)));
+        }
+        let bind = cbor_encode_int_map(&fields);
         stream
             .write_all(&make_frame(MT_RELAY_BIND, &bind))
             .await
@@ -737,6 +829,26 @@ mod tests {
         let (mt, payload) = read_frame(stream).await.unwrap();
         assert_eq!(mt, MT_RELAY_ACK, "expected RELAY_ACK after RELAY_BIND");
         cbor_decode_int_map(&payload).unwrap()
+    }
+
+    fn signed_ticket(worker_id: &str, relay_id: &str) -> (String, String) {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine as _;
+        use ed25519_dalek::{Signer, SigningKey};
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let payload = serde_json::json!({
+            "v": 1, "typ": "relay-bind-ticket", "iss": "test",
+            "sub": worker_id, "aud": relay_id, "iat": 1, "exp": 9999999999i64
+        })
+        .to_string();
+        let b64 = URL_SAFE_NO_PAD.encode(payload.as_bytes());
+        let mut msg = b"iicp:relay-bind-ticket:v1\n".to_vec();
+        msg.extend_from_slice(b64.as_bytes());
+        let sig = sk.sign(&msg);
+        (
+            format!("{}.{}", b64, hex::encode(sig.to_bytes())),
+            hex::encode(sk.verifying_key().to_bytes()),
+        )
     }
 
     fn ack_status(ack: &HashMap<i64, CborVal>) -> String {
@@ -821,5 +933,54 @@ mod tests {
             "rebind after socket death must succeed"
         );
         assert!(reg.is_bound("w-reconnect"));
+    }
+
+    #[tokio::test]
+    async fn strict_bind_ticket_accepts_valid_and_rejects_wrong_worker() {
+        let reg = RelaySessionRegistry::new();
+        let (good_ticket, pub_hex) = signed_ticket("w-ticket", "relay-test");
+        let (bad_ticket, _) = signed_ticket("attacker", "relay-test");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let reg_clone = reg.clone();
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _peer)) = listener.accept().await {
+                    let reg = reg_clone.clone();
+                    let pub_hex = pub_hex.clone();
+                    tokio::spawn(async move {
+                        let _ = handle_relay_connection(
+                            stream,
+                            reg,
+                            9484,
+                            true,
+                            Some(pub_hex),
+                            "relay-test".into(),
+                        )
+                        .await;
+                    });
+                }
+            }
+        });
+
+        let mut worker_a = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let ack_a = wire_bind_with_ticket(&mut worker_a, "w-ticket", Some(good_ticket)).await;
+        assert_eq!(ack_status(&ack_a), "ok");
+        drop(worker_a);
+        for _ in 0..200 {
+            match reg.get("w-ticket") {
+                None => break,
+                Some(s) if !s.is_alive() => break,
+                Some(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+
+        let mut worker_b = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let ack_b = wire_bind_with_ticket(&mut worker_b, "w-ticket", Some(bad_ticket)).await;
+        assert_eq!(ack_status(&ack_b), "error");
+        assert_eq!(
+            cbor_text_or_bytes(ack_b.get(&3)).unwrap_or_default(),
+            "relay bind ticket invalid"
+        );
     }
 }

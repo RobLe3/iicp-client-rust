@@ -16,6 +16,8 @@ use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::relay_ticket::fetch_relay_bind_ticket;
+
 const IICP_MAGIC: &[u8] = b"IICP";
 const FRAMING_VERSION: u8 = 0x01;
 const FRAME_HEADER_LEN: usize = 12;
@@ -127,6 +129,10 @@ pub struct RelayWorkerClient {
     handler: RelayHandlerFn,
     models: Vec<String>,
     on_bind: Option<OnBindFn>,
+    bind_ticket: Option<String>,
+    directory_url: Option<String>,
+    node_token: Option<String>,
+    relay_node_id: Option<String>,
 }
 
 impl RelayWorkerClient {
@@ -146,11 +152,32 @@ impl RelayWorkerClient {
             handler,
             models,
             on_bind: None,
+            bind_ticket: None,
+            directory_url: None,
+            node_token: None,
+            relay_node_id: None,
         }
     }
 
     pub fn with_on_bind(mut self, cb: OnBindFn) -> Self {
         self.on_bind = Some(cb);
+        self
+    }
+
+    pub fn with_bind_ticket(mut self, ticket: impl Into<String>) -> Self {
+        self.bind_ticket = Some(ticket.into());
+        self
+    }
+
+    pub fn with_directory_ticket(
+        mut self,
+        directory_url: impl Into<String>,
+        node_token: impl Into<String>,
+        relay_node_id: Option<String>,
+    ) -> Self {
+        self.directory_url = Some(directory_url.into());
+        self.node_token = Some(node_token.into());
+        self.relay_node_id = relay_node_id;
         self
     }
 
@@ -203,7 +230,7 @@ impl RelayWorkerClient {
         }
 
         // Step 2: RELAY_BIND → RELAY_ACK
-        let bind = cbor_encode_int_map(&[
+        let mut fields = vec![
             (1, CborVal::Text(self.worker_id.clone())),
             (2, CborVal::Text(self.intent.clone())),
             (
@@ -215,7 +242,24 @@ impl RelayWorkerClient {
                         .collect(),
                 ),
             ),
-        ]);
+        ];
+        let mut bind_ticket = self.bind_ticket.clone();
+        if bind_ticket.is_none() {
+            if let (Some(directory_url), Some(node_token)) = (&self.directory_url, &self.node_token)
+            {
+                bind_ticket = fetch_relay_bind_ticket(
+                    directory_url,
+                    node_token,
+                    &self.worker_id,
+                    self.relay_node_id.as_deref(),
+                )
+                .await;
+            }
+        }
+        if let Some(ticket) = bind_ticket {
+            fields.push((4, CborVal::Text(ticket)));
+        }
+        let bind = cbor_encode_int_map(&fields);
         writer
             .write_all(&make_frame(MT_RELAY_BIND, &bind))
             .await

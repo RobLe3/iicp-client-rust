@@ -108,6 +108,57 @@ async fn sdk03_accepts_valid_intent() {
     assert!(!matches!(err, IicpError::InvalidIntent(_)));
 }
 
+#[tokio::test]
+async fn discover_accepts_deprecated_public_key_alias_for_cx_key() {
+    use serde_json::json;
+
+    let mut server = mockito::Server::new_async().await;
+    let _discover = server
+        .mock("GET", mockito::Matcher::Regex("/api/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "count": 1,
+                "nodes": [{
+                    "node_id": "n1",
+                    "endpoint": "https://1.2.3.4:9484",
+                    "score": 0.95,
+                    "available": true,
+                    "region": "eu",
+                    "public_key": {
+                        "algorithm": "X25519",
+                        "encoding": "base64url",
+                        "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "key_id": "cx-1"
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let client = IicpClient::new(ClientConfig {
+        directory_url: format!("{}/api", server.url()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let nodes = client
+        .discover("urn:iicp:intent:llm:chat:v1", None, None)
+        .await
+        .unwrap();
+    assert_eq!(nodes.nodes.len(), 1);
+    assert_eq!(
+        nodes.nodes[0]
+            .cx_public_key
+            .as_ref()
+            .map(|key| key.key_id.as_str()),
+        Some("cx-1")
+    );
+}
+
 // ε-greedy provider selection (R4 / #486)
 // These tests verify the config plumbing without a live network.
 

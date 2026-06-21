@@ -39,6 +39,7 @@ pub mod proxy;
 pub mod qualify;
 
 pub mod availability;
+pub mod backend_stability;
 pub mod backends;
 pub mod cip_policy;
 pub mod concurrency;
@@ -53,6 +54,8 @@ pub mod peer_manager;
 pub mod pricing;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_session;
+#[cfg(feature = "iicp-tcp")]
+pub mod relay_ticket;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_worker_client;
 pub mod scheduler;
