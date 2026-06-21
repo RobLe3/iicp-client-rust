@@ -150,3 +150,17 @@ fn epsilon_greedy_env_override() {
         "env IICP_ROUTING_EPSILON=0.0 should set routing_epsilon to 0.0"
     );
 }
+
+#[test]
+fn routing_strategy_env_overrides() {
+    unsafe { std::env::set_var("IICP_ROUTING_STRATEGY", "softmax_top_k") };
+    unsafe { std::env::set_var("IICP_ROUTING_TOP_K", "2") };
+    unsafe { std::env::set_var("IICP_ROUTING_SOFTMAX_TAU", "0.02") };
+    let cfg = ClientConfig::default();
+    unsafe { std::env::remove_var("IICP_ROUTING_STRATEGY") };
+    unsafe { std::env::remove_var("IICP_ROUTING_TOP_K") };
+    unsafe { std::env::remove_var("IICP_ROUTING_SOFTMAX_TAU") };
+    assert_eq!(cfg.routing_strategy, "softmax_top_k");
+    assert_eq!(cfg.routing_top_k, 2);
+    assert!((cfg.routing_softmax_tau - 0.02).abs() < 1e-9);
+}

@@ -401,6 +401,7 @@ struct AppState {
     /// Incremental task success/failure counters reset on each heartbeat.
     tasks_success: Arc<AtomicUsize>,
     tasks_failed: Arc<AtomicUsize>,
+    tasks_latency_total_ms: Arc<AtomicUsize>,
     max_concurrent: usize,
     availability: Arc<crate::availability::AvailabilityEvaluator>,
     /// #403 — CIP per-task admission policy (tool-execution gate).
@@ -1147,6 +1148,7 @@ async fn task_endpoint(
     // `tracing-opentelemetry` bridge propagates this to an OTLP collector when
     // OTEL_EXPORTER_OTLP_ENDPOINT is set and the operator configures the bridge
     // at startup (e.g. via opentelemetry-otlp + tracing-opentelemetry).
+    let started = Instant::now();
     let result = {
         let span = tracing::info_span!(
             "iicp.task.execute",
@@ -1160,7 +1162,13 @@ async fn task_endpoint(
 
     match result {
         Ok(value) => {
+            let latency_ms = started.elapsed().as_millis().min(usize::MAX as u128) as usize;
             state.tasks_success.fetch_add(1, Ordering::Relaxed);
+            if latency_ms > 0 {
+                state
+                    .tasks_latency_total_ms
+                    .fetch_add(latency_ms, Ordering::Relaxed);
+            }
             // TC-9c: background credit award — extract token count, snapshot credentials,
             // and spawn a best-effort receipt POST so the task response is never delayed.
             let hmac_key = state.node_hmac_key.read().expect("poisoned").clone();
@@ -1199,7 +1207,13 @@ async fn task_endpoint(
             .into_response()
         }
         Err(e) => {
+            let latency_ms = started.elapsed().as_millis().min(usize::MAX as u128) as usize;
             state.tasks_failed.fetch_add(1, Ordering::Relaxed);
+            if latency_ms > 0 {
+                state
+                    .tasks_latency_total_ms
+                    .fetch_add(latency_ms, Ordering::Relaxed);
+            }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(TaskResponse {
@@ -1869,6 +1883,7 @@ impl IicpNode {
 
         let tasks_success = Arc::new(AtomicUsize::new(0));
         let tasks_failed = Arc::new(AtomicUsize::new(0));
+        let tasks_latency_total_ms = Arc::new(AtomicUsize::new(0));
         let mut all_models: Vec<String> = match &self.cfg.model {
             Some(m) => vec![m.clone()],
             None => Vec::new(),
@@ -1891,6 +1906,7 @@ impl IicpNode {
             node_hmac_key: Arc::clone(&self.runtime_hmac_key),
             tasks_success: Arc::clone(&tasks_success),
             tasks_failed: Arc::clone(&tasks_failed),
+            tasks_latency_total_ms: Arc::clone(&tasks_latency_total_ms),
             max_concurrent: self.cfg.max_concurrent,
             availability: Arc::new(crate::availability::AvailabilityEvaluator::new(
                 self.cfg.availability_windows.clone(),
@@ -2057,6 +2073,7 @@ impl IicpNode {
             let hb_node_id = node_id.clone();
             let hb_tasks_success = Arc::clone(&tasks_success);
             let hb_tasks_failed = Arc::clone(&tasks_failed);
+            let hb_tasks_latency_total_ms = Arc::clone(&tasks_latency_total_ms);
             // #399 — re-registration recovery: capture the register payload + the
             // shared runtime token so the loop can re-register and update the token
             // if the directory drops the node (deregister/TTL-expiry/restart).
@@ -2084,6 +2101,19 @@ impl IicpNode {
                     // expects incremental, not cumulative counts).
                     let ok = hb_tasks_success.swap(0, Ordering::Relaxed);
                     let fail = hb_tasks_failed.swap(0, Ordering::Relaxed);
+                    let latency_total_ms = hb_tasks_latency_total_ms.swap(0, Ordering::Relaxed);
+                    let metrics = if ok > 0 || fail > 0 {
+                        let mut m = json!({"tasks_success": ok, "tasks_failed": fail});
+                        let total = ok + fail;
+                        if total > 0 && latency_total_ms > 0 {
+                            m["avg_latency_ms"] = json!(
+                                (latency_total_ms as f64 / total as f64 * 100.0).round() / 100.0
+                            );
+                        }
+                        m
+                    } else {
+                        json!({})
+                    };
                     // #494 — probe the backend for the current model list before heartbeat.
                     let live_models = if let Some(ref bu) = hb_backend_url {
                         probe_health_models_bg(&http, bu, &hb_backend_api_key).await
@@ -2103,11 +2133,7 @@ impl IicpNode {
                         "max_concurrent": avail.effective_max_concurrent(max_c),
                         // Task outcome metrics — only sent when non-zero to
                         // avoid moving reputation on idle periods.
-                        "metrics": if ok > 0 || fail > 0 {
-                            json!({"tasks_success": ok, "tasks_failed": fail})
-                        } else {
-                            json!({})
-                        },
+                        "metrics": metrics,
                     });
                     if let Some(ref hm) = live_models {
                         hb_body["health_models"] = json!(hm);

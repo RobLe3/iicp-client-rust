@@ -187,26 +187,58 @@ impl IicpClient {
             .filter(|n| n.available)
             .collect();
 
-        // ε-greedy provider selection (R4): with probability ε pick a random node
-        // from the full set; otherwise use the directory-sorted top pick.
         let candidates: Vec<_> = {
             let mut rng = rand::thread_rng();
-            let epsilon = self.config.routing_epsilon;
-            if safe_nodes.len() > 1 && rng.gen::<f64>() < epsilon {
+            let max_retries = MAX_RETRIES as usize;
+            if self.config.routing_strategy == "deterministic" || safe_nodes.len() <= 1 {
+                safe_nodes.into_iter().take(max_retries).collect()
+            } else if self.config.routing_strategy == "softmax_top_k" {
+                let top_k = self.config.routing_top_k.max(1).min(safe_nodes.len());
+                let pool = &safe_nodes[..top_k];
+                let max_score = pool
+                    .iter()
+                    .map(|n| n.score)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let tau = self.config.routing_softmax_tau.max(0.001);
+                let weights: Vec<f64> = pool
+                    .iter()
+                    .map(|n| ((n.score - max_score) / tau).exp())
+                    .collect();
+                let total: f64 = weights.iter().sum();
+                let mut r = rng.gen::<f64>() * total;
+                let mut chosen = pool[0].clone();
+                for (node, weight) in pool.iter().zip(weights.iter()) {
+                    r -= weight;
+                    if r <= 0.0 {
+                        chosen = node.clone();
+                        break;
+                    }
+                }
+                let mut c = vec![chosen.clone()];
+                c.extend(
+                    safe_nodes
+                        .iter()
+                        .take(max_retries)
+                        .filter(|n| n.node_id != chosen.node_id)
+                        .take(max_retries - 1)
+                        .cloned(),
+                );
+                c
+            } else if rng.gen::<f64>() < self.config.routing_epsilon {
                 let explore_idx = rng.gen_range(0..safe_nodes.len());
                 let explore_node = safe_nodes[explore_idx].clone();
                 let mut c = vec![explore_node.clone()];
                 c.extend(
                     safe_nodes
                         .iter()
-                        .take(MAX_RETRIES as usize)
+                        .take(max_retries)
                         .filter(|n| n.node_id != explore_node.node_id)
-                        .take(MAX_RETRIES as usize - 1)
+                        .take(max_retries - 1)
                         .cloned(),
                 );
                 c
             } else {
-                safe_nodes.into_iter().take(MAX_RETRIES as usize).collect()
+                safe_nodes.into_iter().take(max_retries).collect()
             }
         };
 

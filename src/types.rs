@@ -14,6 +14,12 @@ pub struct ClientConfig {
     /// ε-greedy exploration probability for provider selection (R4). Default: 0.05.
     /// Override with IICP_ROUTING_EPSILON env var. Set to 0.0 to disable.
     pub routing_epsilon: f64,
+    /// Selection strategy: deterministic | epsilon | softmax_top_k.
+    pub routing_strategy: String,
+    /// Candidate pool size for softmax_top_k.
+    pub routing_top_k: usize,
+    /// Softmax temperature for softmax_top_k.
+    pub routing_softmax_tau: f64,
 }
 
 impl Default for ClientConfig {
@@ -23,6 +29,20 @@ impl Default for ClientConfig {
             .and_then(|s| s.parse::<f64>().ok())
             .map(|v| v.clamp(0.0, 1.0))
             .unwrap_or(0.05);
+        let strategy = std::env::var("IICP_ROUTING_STRATEGY")
+            .ok()
+            .filter(|s| matches!(s.as_str(), "deterministic" | "epsilon" | "softmax_top_k"))
+            .unwrap_or_else(|| "epsilon".into());
+        let top_k = std::env::var("IICP_ROUTING_TOP_K")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|v| v.max(1))
+            .unwrap_or(3);
+        let tau = std::env::var("IICP_ROUTING_SOFTMAX_TAU")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|v| v.max(0.001))
+            .unwrap_or(0.04);
         Self {
             directory_url: "https://iicp.network/api".into(),
             timeout_ms: 30_000,
@@ -30,6 +50,9 @@ impl Default for ClientConfig {
             node_token: None,
             use_confidentiality: false,
             routing_epsilon: epsilon,
+            routing_strategy: strategy,
+            routing_top_k: top_k,
+            routing_softmax_tau: tau,
         }
     }
 }
