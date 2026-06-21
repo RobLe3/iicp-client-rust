@@ -184,6 +184,32 @@ mod tests {
     }
 
     #[test]
+    fn auto_update_enabled_env_opt_out() {
+        std::env::remove_var("IICP_AUTO_UPDATE");
+        assert!(auto_update_enabled());
+        for value in ["0", "false", "no", "off"] {
+            std::env::set_var("IICP_AUTO_UPDATE", value);
+            assert!(!auto_update_enabled());
+        }
+        std::env::set_var("IICP_AUTO_UPDATE", "1");
+        assert!(auto_update_enabled());
+        std::env::remove_var("IICP_AUTO_UPDATE");
+    }
+
+    #[test]
+    fn auto_update_interval_env_floor_and_bad_value() {
+        std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+        assert_eq!(auto_update_interval_secs(), 21600);
+        std::env::set_var("IICP_AUTO_UPDATE_INTERVAL_S", "42");
+        assert_eq!(auto_update_interval_secs(), 300);
+        std::env::set_var("IICP_AUTO_UPDATE_INTERVAL_S", "900");
+        assert_eq!(auto_update_interval_secs(), 900);
+        std::env::set_var("IICP_AUTO_UPDATE_INTERVAL_S", "not-a-number");
+        assert_eq!(auto_update_interval_secs(), 21600);
+        std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+    }
+
+    #[test]
     fn outdated_is_numeric_not_lexicographic() {
         assert!(is_outdated("0.7.56", "0.7.57"));
         assert!(!is_outdated("0.7.57", "0.7.57"));
