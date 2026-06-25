@@ -35,7 +35,16 @@ pub const MAX_RESPAWNS: u32 = 3;
 /// dead-endpoint bug, #538). Probe every interval; after this many consecutive
 /// failures, force a tunnel restart (kill → respawn → new URL → re-register).
 pub const TUNNEL_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
-pub const TUNNEL_HEALTH_MAX_FAILS: u32 = 3;
+pub const TUNNEL_HEALTH_MAX_FAILS: u32 = 2;
+pub const TUNNEL_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelState {
+    Ready,
+    Twilight,
+    Recovering,
+    Dead,
+}
 
 /// GET `<url>/iicp/health` round-trips through the Cloudflare edge back to the local
 /// node — the same path a browser consumer takes — so it detects an edge-drop, not
@@ -51,6 +60,31 @@ async fn tunnel_url_reachable(url: &str) -> bool {
     };
     let probe = format!("{}/iicp/health", url.trim_end_matches('/'));
     matches!(client.get(&probe).send().await, Ok(r) if r.status().is_success())
+}
+
+fn tunnel_url_reachable_sync(url: &str) -> bool {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map(|rt| rt.block_on(tunnel_url_reachable(url)))
+        .unwrap_or(true)
+}
+
+fn wait_until_reachable(
+    url: &str,
+    probe: &(dyn Fn(&str) -> bool + Send + Sync),
+    timeout: Duration,
+) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if probe(url) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
 }
 
 pub const INSTALL_HINT: &str = "cloudflared not found — install it to become reachable \
@@ -216,6 +250,145 @@ impl QuickTunnel {
                 }
             })
             .expect("spawn watchdog thread");
+    }
+
+    /// Elastic watchdog: public-URL keepalive + twilight/recovery states.
+    ///
+    /// Unlike [`Self::watch`], this callback does not publish a rotated URL until the
+    /// new public URL has passed `/iicp/health`. This lets callers heartbeat
+    /// `available:false` while a tunnel is stale/recovering and only re-register once
+    /// the tunnel is publicly usable again.
+    pub fn watch_elastic(
+        &self,
+        initial_url: String,
+        on_new_url: impl Fn(String) + Send + 'static,
+        on_state: impl Fn(TunnelState) + Send + 'static,
+        on_dead: impl FnOnce() + Send + 'static,
+    ) {
+        self.watch_elastic_with_probe(
+            initial_url,
+            on_new_url,
+            on_state,
+            on_dead,
+            Arc::new(tunnel_url_reachable_sync),
+            TUNNEL_HEALTH_INTERVAL,
+            TUNNEL_VERIFY_TIMEOUT,
+        );
+    }
+
+    #[doc(hidden)]
+    pub fn watch_elastic_with_probe(
+        &self,
+        initial_url: String,
+        on_new_url: impl Fn(String) + Send + 'static,
+        on_state: impl Fn(TunnelState) + Send + 'static,
+        on_dead: impl FnOnce() + Send + 'static,
+        probe: Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>,
+        health_interval: Duration,
+        verify_timeout: Duration,
+    ) {
+        let child = Arc::clone(&self.child);
+        let closed = Arc::clone(&self.closed);
+        let respawns = Arc::clone(&self.respawns);
+        let binary = self.binary.clone();
+        let local_port = self.local_port;
+        std::thread::Builder::new()
+            .name("quick-tunnel-elastic-watchdog".into())
+            .spawn(move || {
+                let mut current_url = initial_url;
+                let mut health_fails: u32 = 0;
+                let mut state = TunnelState::Ready;
+                on_state(state);
+                let mut last_health = Instant::now();
+
+                let set_state = |state_ref: &mut TunnelState, next: TunnelState| {
+                    if *state_ref != next {
+                        *state_ref = next;
+                        on_state(next);
+                    }
+                };
+
+                loop {
+                    loop {
+                        {
+                            let mut guard = child.lock().unwrap();
+                            if let Ok(Some(_)) = guard.try_wait() {
+                                break;
+                            }
+                        }
+                        if closed.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        if last_health.elapsed() >= health_interval {
+                            last_health = Instant::now();
+                            if probe(&current_url) {
+                                health_fails = 0;
+                                respawns.store(0, Ordering::Relaxed);
+                                set_state(&mut state, TunnelState::Ready);
+                            } else {
+                                health_fails += 1;
+                                set_state(&mut state, TunnelState::Twilight);
+                                if health_fails >= TUNNEL_HEALTH_MAX_FAILS {
+                                    eprintln!(
+                                        "[quick-tunnel] {current_url} unreachable {health_fails}× \
+                                         while cloudflared is up (twilight) — rebuilding tunnel."
+                                    );
+                                    set_state(&mut state, TunnelState::Recovering);
+                                    let _ = child.lock().unwrap().kill();
+                                    health_fails = 0;
+                                }
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    if closed.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    set_state(&mut state, TunnelState::Recovering);
+                    let n = respawns.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n > MAX_RESPAWNS {
+                        eprintln!(
+                            "[quick-tunnel] {} consecutive respawns failed to recover a healthy \
+                             tunnel — giving up. Node is no longer publicly reachable; restart \
+                             `iicp-node serve`.",
+                            n - 1
+                        );
+                        set_state(&mut state, TunnelState::Dead);
+                        on_dead();
+                        return;
+                    }
+                    eprintln!("[quick-tunnel] tunnel down — respawning ({n}/{MAX_RESPAWNS})…");
+                    match spawn_and_parse(local_port, TUNNEL_START_TIMEOUT, &binary) {
+                        Ok((fresh_child, url)) => {
+                            *child.lock().unwrap() = fresh_child;
+                            current_url = url.clone();
+                            health_fails = 0;
+                            eprintln!(
+                                "[quick-tunnel] candidate tunnel up at {url}; verifying public health…"
+                            );
+                            if wait_until_reachable(&url, probe.as_ref(), verify_timeout) {
+                                last_health = Instant::now();
+                                respawns.store(0, Ordering::Relaxed);
+                                set_state(&mut state, TunnelState::Ready);
+                                eprintln!("[quick-tunnel] verified at {url} — re-registering.");
+                                on_new_url(url);
+                            } else {
+                                eprintln!(
+                                    "[quick-tunnel] candidate {url} did not become reachable; rebuilding."
+                                );
+                                let _ = child.lock().unwrap().kill();
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[quick-tunnel] respawn failed: {e}");
+                            set_state(&mut state, TunnelState::Dead);
+                            on_dead();
+                            return;
+                        }
+                    }
+                }
+            })
+            .expect("spawn elastic watchdog thread");
     }
 
     /// Terminate the tunnel child. Idempotent; also runs on Drop.

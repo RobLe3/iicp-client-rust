@@ -2300,18 +2300,25 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
     }
     if let Some(t) = &tunnel {
-        // #527 — Quick Tunnel URLs rotate per process. The watchdog (sync thread)
-        // publishes the new URL into the node's endpoint_override; the heartbeat
-        // loop re-registers it live (current_node_token → IICP-E050 token path).
-        // No restart needed (parity with Python/TypeScript).
+        // #527/#elastic-tunnel — Quick Tunnel URLs rotate per process. The elastic
+        // watchdog marks the node unavailable while the public edge is twilight or
+        // rebuilding, and only publishes a new URL after public /iicp/health passes.
         let ep_override = node.endpoint_override_handle();
-        t.watch(
+        let runtime_available = node.runtime_available_handle();
+        t.watch_elastic(
             t.url.clone(),
             move |url| {
                 if let Ok(mut g) = ep_override.write() {
                     *g = Some(url.to_string());
                 }
-                eprintln!("[iicp-node] Quick Tunnel URL rotated to {url} — re-registering live.");
+                eprintln!(
+                    "[iicp-node] Quick Tunnel URL verified and rotated to {url} — re-registering live."
+                );
+            },
+            move |state| {
+                use iicp_client::tunnel::TunnelState;
+                runtime_available.store(matches!(state, TunnelState::Ready), std::sync::atomic::Ordering::Relaxed);
+                eprintln!("[iicp-node] Quick Tunnel state: {state:?}");
             },
             || {
                 eprintln!(

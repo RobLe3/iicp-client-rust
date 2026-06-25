@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1355,6 +1355,9 @@ pub struct IicpNode {
     /// `None` = use `cfg.endpoint`. `build_register_payload` reads the effective
     /// endpoint.
     endpoint_override: Arc<std::sync::RwLock<Option<String>>>,
+    /// Runtime public reachability gate. Quick Tunnel recovery can set this false
+    /// while the local server is alive but the public edge is stale/rebuilding.
+    runtime_available: Arc<AtomicBool>,
     /// #527 — endpoint registered at last register(); compared each heartbeat
     /// tick so a rotated endpoint triggers a live re-registration (the new URL
     /// is accepted via the IICP-E050 token path, current_node_token #529).
@@ -1393,6 +1396,7 @@ impl IicpNode {
             liveness_challenge: Arc::new(std::sync::RwLock::new(None)),
             registered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
             endpoint_override: Arc::new(std::sync::RwLock::new(None)),
+            runtime_available: Arc::new(AtomicBool::new(true)),
             registered_endpoint: Arc::new(std::sync::RwLock::new(String::new())),
             cx_public_key,
             cx_private_key,
@@ -1428,6 +1432,10 @@ impl IicpNode {
 
     pub fn endpoint_override_handle(&self) -> Arc<std::sync::RwLock<Option<String>>> {
         Arc::clone(&self.endpoint_override)
+    }
+
+    pub fn runtime_available_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.runtime_available)
     }
 
     /// Current HMAC key in use for ADR-019 pricing signatures (empty if
@@ -1906,16 +1914,17 @@ impl IicpNode {
 
     /// Send a single heartbeat to the directory.
     pub async fn heartbeat(&self, node_token: &str) -> Result<()> {
+        let public_available = self.runtime_available.load(Ordering::Relaxed);
         let mut body = json!({
             "node_id": self.cfg.node_id,
             "node_token": node_token,
-            "status": "available",
+            "status": if public_available { "available" } else { "recovering" },
             // Explicit availability boolean. The directory keys discover eligibility
             // off `available` (not the `status` string); sending it lets a node that
             // briefly went dormant (host sleep) be restored on the very next beat —
             // robust even against directory builds older than v1.10.17 whose heartbeat
             // handler defaulted to the stored (possibly false) value.
-            "available": true,
+            "available": public_available,
             // Live capacity after availability shaping (ADR-006).
             "max_concurrent": crate::availability::AvailabilityEvaluator::new(
                 self.cfg.availability_windows.clone(),
@@ -2230,6 +2239,7 @@ impl IicpNode {
             let hb_registered_endpoint = Arc::clone(&self.registered_endpoint);
             let hb_liveness_challenge = Arc::clone(&self.liveness_challenge);
             let hb_runtime_hmac_key = Arc::clone(&self.runtime_hmac_key);
+            let hb_runtime_available = Arc::clone(&self.runtime_available);
             tokio::spawn(async move {
                 let mut token = token;
                 let mut seq: u64 = 0;
@@ -2279,14 +2289,15 @@ impl IicpNode {
                         None
                     };
                     // Build the heartbeat payload with optional health_models.
+                    let public_available = hb_runtime_available.load(Ordering::Relaxed);
                     let mut hb_body = json!({
                         "node_id": &node_id,
                         "node_token": &token,
-                        "status": "available",
+                        "status": if public_available { "available" } else { "recovering" },
                         // Explicit availability boolean — see heartbeat() above.
                         // Lets the directory restore a briefly-dormant node on the
                         // next beat, even on directory builds older than v1.10.17.
-                        "available": true,
+                        "available": public_available,
                         // Live capacity after availability shaping (ADR-006).
                         "max_concurrent": avail.effective_max_concurrent(max_c),
                         // Task outcome metrics — only sent when non-zero to
@@ -2374,7 +2385,7 @@ impl IicpNode {
                             if let Some(ep) = override_ep {
                                 let registered_ep =
                                     hb_registered_endpoint.read().expect("poisoned").clone();
-                                if ep != registered_ep {
+                                if public_available && ep != registered_ep {
                                     let mut new_payload = hb_register_payload.clone();
                                     new_payload["endpoint"] = json!(ep);
                                     new_payload["current_node_token"] = json!(token);

@@ -6,7 +6,10 @@
 use std::io::Write;
 use std::time::Duration;
 
-use iicp_client::tunnel::{open_quick_tunnel_with, INSTALL_HINT, MAX_RESPAWNS};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
+use iicp_client::tunnel::{open_quick_tunnel_with, TunnelState, INSTALL_HINT, MAX_RESPAWNS};
 
 fn fake_bin(name: &str, lifetime_secs: f64, silent: bool) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("iicp-tunnel-{}", uuid::Uuid::new_v4()));
@@ -110,5 +113,38 @@ fn supervision_gives_up_after_max_respawns() {
     rx.recv_timeout(Duration::from_secs(30))
         .expect("on_dead fires");
     assert!(t.respawns() >= 1);
+    t.close();
+}
+
+#[test]
+fn elastic_watchdog_marks_twilight_then_rebuilds_after_public_health_recovers() {
+    let bin = fake_bin("elastic", 60.0, false);
+    let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let probe_calls = Arc::clone(&calls);
+    let probe = Arc::new(move |_url: &str| probe_calls.fetch_add(1, Ordering::SeqCst) >= 2);
+    let (state_tx, state_rx) = std::sync::mpsc::channel::<TunnelState>();
+    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+    t.watch_elastic_with_probe(
+        t.url.clone(),
+        move |url| {
+            let _ = url_tx.send(url);
+        },
+        move |state| {
+            let _ = state_tx.send(state);
+        },
+        || {},
+        probe,
+        Duration::from_millis(20),
+        Duration::from_secs(2),
+    );
+    let verified = url_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("elastic watchdog verifies rebuilt tunnel");
+    assert_eq!(verified, "https://elastic.trycloudflare.com");
+    let states: Vec<TunnelState> = state_rx.try_iter().collect();
+    assert!(states.contains(&TunnelState::Twilight), "{states:?}");
+    assert!(states.contains(&TunnelState::Recovering), "{states:?}");
+    assert!(states.contains(&TunnelState::Ready), "{states:?}");
     t.close();
 }

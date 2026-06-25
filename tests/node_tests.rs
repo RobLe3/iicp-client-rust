@@ -459,6 +459,41 @@ async fn test_heartbeat_payload_includes_available_true() {
     );
 }
 
+#[tokio::test]
+async fn test_heartbeat_payload_reports_unavailable_during_tunnel_recovery() {
+    use std::sync::atomic::Ordering;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = oneshot::channel::<String>();
+
+    tokio::spawn(async move {
+        let (mut s, _) = listener.accept().await.unwrap();
+        let mut b = vec![0u8; 8192];
+        let n = s.read(&mut b).await.unwrap();
+        let resp = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"ok\":true}";
+        let _ = s.write_all(resp.as_bytes()).await;
+        let _ = tx.send(String::from_utf8_lossy(&b[..n]).to_string());
+    });
+
+    let mut cfg = NodeConfig::new(
+        "n-1",
+        "https://h.example.com",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = format!("http://{addr}");
+    let node = IicpNode::new(cfg);
+    node.runtime_available_handle()
+        .store(false, Ordering::Relaxed);
+    node.heartbeat("tok").await.unwrap();
+
+    let req = rx.await.unwrap();
+    assert!(req.contains("\"available\":false"), "got: {req}");
+    assert!(req.contains("\"status\":\"recovering\""), "got: {req}");
+}
+
 /// iter-1413: register payload matches spec/iicp-dir.md §3.1 —
 /// capabilities is an array of {intent, models, max_tokens} objects, not a flat intent string.
 #[tokio::test]

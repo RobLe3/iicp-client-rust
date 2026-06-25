@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.70] — 2026-06-25
+
+### Added — elastic Quick Tunnel recovery
+- Quick Tunnel providers now mark themselves unavailable while the public tunnel URL is in twilight/recovery and only re-register a rotated URL after public `/iicp/health` verifies.
+- Added a tunnel state callback (`ready`, `twilight`, `recovering`, `dead`) so service heartbeats reflect real public reachability instead of local process liveness.
+
 ## [0.7.68] — 2026-06-25
 
 ### Fixed — fail-closed IICP-CX routing

@@ -16,16 +16,16 @@ urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
 cargo add iicp-client
 ```
 
-> **Upgrade note (0.7.69)** — upgrade provider nodes so unattended updater checks
-> stay visible, keyless plaintext remains refused by default, and Docker/home-network
-> nodes automatically try a Quick Tunnel before relay when direct reachability is
-> unavailable. This improves adoption without weakening IICP-CX.
+> **Upgrade note (0.7.70)** — upgrade provider nodes so Quick Tunnel endpoints
+> recover more elastically after sleep, idle, or Cloudflare edge drops. A tunnel in
+> twilight/recovery now heartbeats as unavailable and only re-registers once the
+> public `/iicp/health` route verifies again.
 
 Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.69"
+iicp-client = "0.7.70"
 ```
 
 To run a provider node from the command line, install the `iicp-node` binary:
