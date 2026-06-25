@@ -2447,12 +2447,20 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         tokio::spawn(async move {
             let interval = iicp_client::updater::auto_update_interval_secs();
             // First check soon after startup (≤5 min) so a freshly-published release propagates
-            // fast + observably, instead of waiting a full interval (default 6h); then the cadence.
+            // fast + observably, instead of waiting a full interval (default 1h); then the cadence.
             let mut delay = iicp_client::updater::auto_update_initial_delay_secs(interval);
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
                 delay = interval;
                 let latest = iicp_client::updater::latest_crates_version(5).await;
+                iicp_client::updater::record_update_check(
+                    latest.clone(),
+                    if latest.is_some() {
+                        None
+                    } else {
+                        Some("latest_unknown".to_string())
+                    },
+                );
                 if iicp_client::updater::auto_update_decision(&current, latest.as_deref(), true)
                     == iicp_client::updater::UpdateAction::ShouldUpgrade
                 {

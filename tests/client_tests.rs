@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-use iicp_client::{make_traceparent, ClientConfig, IicpClient, IicpError};
+use iicp_client::{make_traceparent, ClientConfig, DiscoverOptions, IicpClient, IicpError};
+use std::sync::{Mutex, OnceLock};
+
+fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
 
 // is_transient() — used by retry logic (SDK-05)
 #[test]
@@ -126,6 +132,10 @@ async fn discover_accepts_deprecated_public_key_alias_for_cx_key() {
                     "score": 0.95,
                     "available": true,
                     "region": "eu",
+                    "directory_observed_reachable": true,
+                    "route_evidence": "directory_observed",
+                    "routing_hint": "https_direct",
+                    "browser_usable": true,
                     "public_key": {
                         "algorithm": "X25519",
                         "encoding": "base64url",
@@ -157,6 +167,129 @@ async fn discover_accepts_deprecated_public_key_alias_for_cx_key() {
             .map(|key| key.key_id.as_str()),
         Some("cx-1")
     );
+    assert_eq!(nodes.nodes[0].directory_observed_reachable, Some(true));
+    assert_eq!(
+        nodes.nodes[0].route_evidence.as_deref(),
+        Some("directory_observed")
+    );
+    assert_eq!(nodes.nodes[0].routing_hint.as_deref(), Some("https_direct"));
+    assert_eq!(nodes.nodes[0].browser_usable, Some(true));
+}
+
+#[tokio::test]
+async fn discover_accepts_both_cx_public_key_and_public_key_without_duplicate_error() {
+    use serde_json::json;
+
+    let mut server = mockito::Server::new_async().await;
+    let _discover = server
+        .mock("GET", mockito::Matcher::Regex("/api/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "count": 1,
+                "nodes": [{
+                    "node_id": "n1",
+                    "endpoint": "https://1.2.3.4:9484",
+                    "score": 0.95,
+                    "available": true,
+                    "region": "eu",
+                    "cx_public_key": {
+                        "algorithm": "X25519",
+                        "encoding": "base64url",
+                        "key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                        "key_id": "cx-canonical"
+                    },
+                    "public_key": {
+                        "algorithm": "X25519",
+                        "encoding": "base64url",
+                        "key": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                        "key_id": "cx-alias"
+                    }
+                }]
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let client = IicpClient::new(ClientConfig {
+        directory_url: format!("{}/api", server.url()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let nodes = client
+        .discover("urn:iicp:intent:llm:chat:v1", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        nodes.nodes[0]
+            .cx_public_key
+            .as_ref()
+            .map(|key| key.key_id.as_str()),
+        Some("cx-canonical")
+    );
+}
+
+#[tokio::test]
+async fn discover_browser_usable_only_filters_http_ipv6_nodes() {
+    use serde_json::json;
+
+    let mut server = mockito::Server::new_async().await;
+    let _discover = server
+        .mock("GET", mockito::Matcher::Regex("/api/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "count": 2,
+                "nodes": [
+                    {
+                        "node_id": "n-ipv6",
+                        "endpoint": "http://[2a0a:a543:df54::8ae]:9484",
+                        "score": 0.9,
+                        "available": true,
+                        "region": "eu",
+                        "routing_hint": "http_ipv6",
+                        "browser_usable": false
+                    },
+                    {
+                        "node_id": "n-https",
+                        "endpoint": "https://relay.example.com",
+                        "score": 0.8,
+                        "available": true,
+                        "region": "eu",
+                        "routing_hint": "relay_service",
+                        "browser_usable": true
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+
+    let client = IicpClient::new(ClientConfig {
+        directory_url: format!("{}/api", server.url()),
+        ..Default::default()
+    })
+    .unwrap();
+
+    let nodes = client
+        .discover(
+            "urn:iicp:intent:llm:chat:v1",
+            Some(DiscoverOptions {
+                browser_usable_only: Some(true),
+                ..Default::default()
+            }),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(nodes.nodes.len(), 1);
+    assert_eq!(nodes.nodes[0].node_id, "n-https");
+    assert_eq!(nodes.count, 1);
 }
 
 // ε-greedy provider selection (R4 / #486)
@@ -164,6 +297,7 @@ async fn discover_accepts_deprecated_public_key_alias_for_cx_key() {
 
 #[test]
 fn epsilon_greedy_default_is_0_05() {
+    let _guard = env_test_lock();
     // ClientConfig::default() must set routing_epsilon = 0.05 (R4 / #486).
     // This test fails if the field is absent or defaults to 0.
     let cfg = ClientConfig::default();
@@ -189,6 +323,7 @@ fn epsilon_greedy_explicit_zero_disables_exploration() {
 
 #[test]
 fn epsilon_greedy_env_override() {
+    let _guard = env_test_lock();
     // IICP_ROUTING_EPSILON env var must override the default (R4 / #486).
     // Run in a subprocess context to avoid polluting other parallel tests.
     // We just verify the parse/clamp logic by setting the env var before Default::default().
@@ -204,6 +339,7 @@ fn epsilon_greedy_env_override() {
 
 #[test]
 fn routing_strategy_env_overrides() {
+    let _guard = env_test_lock();
     unsafe { std::env::set_var("IICP_ROUTING_STRATEGY", "softmax_top_k") };
     unsafe { std::env::set_var("IICP_ROUTING_TOP_K", "2") };
     unsafe { std::env::set_var("IICP_ROUTING_SOFTMAX_TAU", "0.02") };

@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.67] — 2026-06-25
+
+### Changed — updater observability
+- Auto-update checks default to hourly and provider heartbeats report update
+  evidence so directories can identify downlevel nodes that are stuck.
+
+## [0.7.66] — 2026-06-21
+
+### Fixed — discover CX key duplicate-field tolerance
+- Rust discovery now tolerates transitional directory responses that contain both canonical `cx_public_key` and deprecated `public_key`, preferring `cx_public_key` instead of failing with `duplicate field cx_public_key`.
+- Kept the deprecated alias path for older directory responses and retained the new browser/routing signal parsing.
+
 ## [0.7.65] — 2026-06-21
 
 ### Fixed — discover CX key alias
@@ -61,7 +73,7 @@ in the main repo).
   and, on a newer release, `cargo install --force`s and re-execs onto the new version — no
   operator intervention. **Once a node reaches 0.7.60, every future release self-propagates.**
   Default-on; opt out with `IICP_AUTO_UPDATE=0` (`IICP_AUTO_UPDATE_INTERVAL_S` sets cadence,
-  default 6h, min 5m). Loop-safe and failure-isolated. NB: the Rust upgrade recompiles from
+  default 1h, min 5m). Loop-safe and failure-isolated. NB: the Rust upgrade recompiles from
   source, so it can take a few minutes; the node keeps serving until the re-exec.
 
 ### Added

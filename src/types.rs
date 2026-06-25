@@ -64,6 +64,8 @@ pub struct DiscoverOptions {
     pub model: Option<String>,
     pub min_reputation: Option<f64>,
     pub limit: Option<u32>,
+    /// Browser-like consumers can keep only HTTPS/loopback endpoints. Native default: false.
+    pub browser_usable_only: Option<bool>,
 }
 
 /// X25519 public key advertised by a CX-Provider node (IICP-CX S.16 §3.1).
@@ -80,7 +82,7 @@ pub struct CxPublicKey {
 }
 
 /// A single IICP node returned by `/v1/discover`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct Node {
     pub node_id: String,
     pub endpoint: String,
@@ -91,19 +93,83 @@ pub struct Node {
     pub cip_policy: Option<CipPolicy>,
     /// ADR-044 composed health label (healthy/degraded/impaired/critical/offline).
     /// `None` against a directory predating v1.10.0.
-    #[serde(default)]
     pub health_label: Option<String>,
     /// ADR-043 8-category network exposure classification. `None` if unset.
-    #[serde(default)]
     pub exposure_mode: Option<String>,
     /// IICP-CX S.16 §3.1 — X25519 public key for E2E payload confidentiality.
     /// Canonical IICP-CX key advertised by discovery; `public_key` is a deprecated alias.
-    #[serde(default, alias = "public_key")]
     pub cx_public_key: Option<CxPublicKey>,
     /// #397 — transport protocols the node speaks (e.g. ["https","iicp-native"]).
     /// Empty/absent against a directory predating the field.
+    pub transport: Vec<String>,
+    /// Additive routing-signal split from directory v1.10.50+.
+    pub directory_observed_reachable: Option<bool>,
+    pub route_evidence: Option<String>,
+    pub routing_hint: Option<String>,
+    pub browser_usable: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct NodeWire {
+    pub node_id: String,
+    pub endpoint: String,
+    pub score: f64,
+    pub available: bool,
+    pub region: String,
+    pub models: Option<Vec<String>>,
+    pub cip_policy: Option<CipPolicy>,
+    #[serde(default)]
+    pub health_label: Option<String>,
+    #[serde(default)]
+    pub exposure_mode: Option<String>,
+    #[serde(default)]
+    pub cx_public_key: Option<CxPublicKey>,
+    #[serde(default)]
+    pub public_key: Option<CxPublicKey>,
     #[serde(default)]
     pub transport: Vec<String>,
+    #[serde(default)]
+    pub directory_observed_reachable: Option<bool>,
+    #[serde(default)]
+    pub route_evidence: Option<String>,
+    #[serde(default)]
+    pub routing_hint: Option<String>,
+    #[serde(default)]
+    pub browser_usable: Option<bool>,
+}
+
+impl From<NodeWire> for Node {
+    fn from(wire: NodeWire) -> Self {
+        Self {
+            node_id: wire.node_id,
+            endpoint: wire.endpoint,
+            score: wire.score,
+            available: wire.available,
+            region: wire.region,
+            models: wire.models,
+            cip_policy: wire.cip_policy,
+            health_label: wire.health_label,
+            exposure_mode: wire.exposure_mode,
+            // Prefer the canonical field if both appear. The deprecated alias is
+            // tolerated so a transitional directory response cannot break query
+            // with serde's "duplicate field `cx_public_key`" error.
+            cx_public_key: wire.cx_public_key.or(wire.public_key),
+            transport: wire.transport,
+            directory_observed_reachable: wire.directory_observed_reachable,
+            route_evidence: wire.route_evidence,
+            routing_hint: wire.routing_hint,
+            browser_usable: wire.browser_usable,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Node {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        NodeWire::deserialize(deserializer).map(Self::from)
+    }
 }
 
 /// CIP policy block from the discover response.
@@ -241,5 +307,55 @@ mod tests {
         let n: Node = serde_json::from_str(json).unwrap();
         assert!(n.health_label.is_none());
         assert!(n.exposure_mode.is_none());
+    }
+
+    #[test]
+    fn node_accepts_deprecated_public_key_alias_for_cx_key() {
+        let json = r#"{
+            "node_id":"n1",
+            "endpoint":"https://x",
+            "score":0.9,
+            "available":true,
+            "region":"eu",
+            "public_key":{
+                "algorithm":"X25519",
+                "encoding":"base64url",
+                "key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "key_id":"cx-alias"
+            }
+        }"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            n.cx_public_key.as_ref().map(|key| key.key_id.as_str()),
+            Some("cx-alias")
+        );
+    }
+
+    #[test]
+    fn node_accepts_both_canonical_and_alias_without_duplicate_field_error() {
+        let json = r#"{
+            "node_id":"n1",
+            "endpoint":"https://x",
+            "score":0.9,
+            "available":true,
+            "region":"eu",
+            "cx_public_key":{
+                "algorithm":"X25519",
+                "encoding":"base64url",
+                "key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "key_id":"cx-canonical"
+            },
+            "public_key":{
+                "algorithm":"X25519",
+                "encoding":"base64url",
+                "key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "key_id":"cx-alias"
+            }
+        }"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            n.cx_public_key.as_ref().map(|key| key.key_id.as_str()),
+            Some("cx-canonical")
+        );
     }
 }

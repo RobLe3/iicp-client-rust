@@ -102,6 +102,36 @@ fn is_ssrf_safe(url: &str) -> bool {
     true
 }
 
+fn is_browser_usable_endpoint(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    if lower.starts_with("https://") {
+        return true;
+    }
+    if !lower.starts_with("http://") {
+        return false;
+    }
+
+    let host = if let Some(rest) = lower.strip_prefix("http://") {
+        if rest.starts_with('[') {
+            rest.split(']')
+                .next()
+                .map(|s| s.trim_start_matches('['))
+                .unwrap_or("")
+        } else {
+            rest.split('/')
+                .next()
+                .unwrap_or("")
+                .split(':')
+                .next()
+                .unwrap_or("")
+        }
+    } else {
+        ""
+    };
+
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+}
+
 /// Reject model/region strings containing query-separator or newline characters (#388 §FINDING-4-5).
 fn is_safe_query_param(s: &str) -> bool {
     !s.contains(['&', '=', '\n', '\r', '\0'])
@@ -154,7 +184,16 @@ impl IicpClient {
             url.push_str(&format!("&min_reputation={rep}"));
         }
         url.push_str(&format!("&limit={}", opts.limit.unwrap_or(10)));
-        self.http.get_json(&url, traceparent).await
+        let mut list: NodeList = self.http.get_json(&url, traceparent).await?;
+        if opts.browser_usable_only.unwrap_or(false) {
+            list.nodes.retain(|n| {
+                n.browser_usable
+                    .unwrap_or_else(|| is_browser_usable_endpoint(&n.endpoint))
+            });
+            list.count = list.nodes.len() as u32;
+        }
+
+        Ok(list)
     }
 
     /// Discover → select best node → submit task (SDK-01/02).

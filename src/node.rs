@@ -34,6 +34,17 @@ const DEFAULT_DIRECTORY: &str = "https://iicp.network/api";
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const NONCE_TTL_SECS: u64 = 300;
 
+fn attach_update_status(body: &mut Value) {
+    if let (Some(dst), Some(src)) = (
+        body.as_object_mut(),
+        crate::updater::auto_update_status_json().as_object(),
+    ) {
+        for (k, v) in src {
+            dst.insert(k.clone(), v.clone());
+        }
+    }
+}
+
 /// #494 — standalone health-model probe for use in background tasks that don't have `&self`.
 /// Tries Ollama /api/tags then OpenAI /v1/models. Returns None on any error (soft).
 async fn probe_health_models_bg(
@@ -1731,6 +1742,7 @@ impl IicpNode {
         }
         payload["sdk_language"] = json!("rust");
         payload["sdk_version"] = json!(env!("CARGO_PKG_VERSION"));
+        attach_update_status(&mut payload);
         if let Some(cx_public_key) = &self.cx_public_key {
             payload["cx_public_key"] = json!(cx_public_key);
         }
@@ -1910,6 +1922,7 @@ impl IicpNode {
             )
             .effective_max_concurrent(self.cfg.max_concurrent),
         });
+        attach_update_status(&mut body);
         // ADR-047 Part A (#411) — answer the directory's liveness challenge from the
         // previous beat: HMAC the nonce with node_hmac_key (proves key control with
         // no dial-back; works for CGNAT/IPv6). No-op until both nonce + key exist.
@@ -2278,6 +2291,7 @@ impl IicpNode {
                         // avoid moving reputation on idle periods.
                         "metrics": metrics,
                     });
+                    attach_update_status(&mut hb_body);
                     if let Some(ref hm) = live_models {
                         hb_body["health_models"] = json!(hm);
                     }

@@ -5,6 +5,23 @@
 //! Inert by design: reports whether a newer release exists and prints the
 //! upgrade command. No download/install/restart (P2/P3 — opt-in, signed).
 
+use std::sync::{Mutex, OnceLock};
+
+const DEFAULT_AUTO_UPDATE_INTERVAL_SECS: u64 = 3600;
+
+#[derive(Default, Clone)]
+struct UpdateStatus {
+    latest_seen: Option<String>,
+    last_checked_at: Option<String>,
+    error_class: Option<String>,
+}
+
+static UPDATE_STATUS: OnceLock<Mutex<UpdateStatus>> = OnceLock::new();
+
+fn update_status() -> &'static Mutex<UpdateStatus> {
+    UPDATE_STATUS.get_or_init(|| Mutex::new(UpdateStatus::default()))
+}
+
 /// Parse a dotted version into a comparable vec; truncate at the first
 /// non-numeric segment ("1.2.3-rc1" → [1,2,3]).
 pub fn parse_version(v: &str) -> Vec<u64> {
@@ -108,13 +125,13 @@ pub fn auto_update_enabled() -> bool {
     )
 }
 
-/// Check cadence in seconds (default 6h), floored at 5 min.
+/// Check cadence in seconds (default 1h), floored at 5 min.
 pub fn auto_update_interval_secs() -> u64 {
     std::env::var("IICP_AUTO_UPDATE_INTERVAL_S")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .map(|n| n.max(300))
-        .unwrap_or(21600)
+        .unwrap_or(DEFAULT_AUTO_UPDATE_INTERVAL_SECS)
 }
 
 /// Delay before the first background check; never later than five minutes.
@@ -130,6 +147,29 @@ pub fn perform_self_update(features: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+/// Record the latest updater check for heartbeat observability.
+pub fn record_update_check(latest: Option<String>, error_class: Option<String>) {
+    let mut status = update_status().lock().expect("poisoned update status");
+    status.latest_seen = latest;
+    status.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
+    status.error_class = error_class;
+}
+
+/// Optional heartbeat fields that let the directory see updater health.
+pub fn auto_update_status_json() -> serde_json::Value {
+    let status = update_status()
+        .lock()
+        .expect("poisoned update status")
+        .clone();
+    serde_json::json!({
+        "auto_update_enabled": auto_update_enabled(),
+        "auto_update_interval_s": auto_update_interval_secs(),
+        "sdk_latest_seen": status.latest_seen,
+        "sdk_update_last_checked_at": status.last_checked_at,
+        "sdk_update_error_class": status.error_class,
+    })
 }
 
 /// Re-exec the current command so the just-installed binary runs. On Unix this
@@ -199,14 +239,27 @@ mod tests {
     #[test]
     fn auto_update_interval_env_floor_and_bad_value() {
         std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
-        assert_eq!(auto_update_interval_secs(), 21600);
+        assert_eq!(auto_update_interval_secs(), 3600);
         std::env::set_var("IICP_AUTO_UPDATE_INTERVAL_S", "42");
         assert_eq!(auto_update_interval_secs(), 300);
         std::env::set_var("IICP_AUTO_UPDATE_INTERVAL_S", "900");
         assert_eq!(auto_update_interval_secs(), 900);
         std::env::set_var("IICP_AUTO_UPDATE_INTERVAL_S", "not-a-number");
-        assert_eq!(auto_update_interval_secs(), 21600);
+        assert_eq!(auto_update_interval_secs(), 3600);
         std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+    }
+
+    #[test]
+    fn auto_update_status_payload_defaults_hourly() {
+        std::env::remove_var("IICP_AUTO_UPDATE");
+        std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+        record_update_check(Some("0.7.67".into()), None);
+        let payload = auto_update_status_json();
+        assert_eq!(payload["auto_update_enabled"], true);
+        assert_eq!(payload["auto_update_interval_s"], 3600);
+        assert_eq!(payload["sdk_latest_seen"], "0.7.67");
+        assert!(payload["sdk_update_last_checked_at"].is_string());
+        assert!(payload["sdk_update_error_class"].is_null());
     }
 
     #[test]
