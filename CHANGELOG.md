@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.68] — 2026-06-25
+
+### Fixed — fail-closed IICP-CX routing
+- Consumers now skip keyless discovered nodes by default and refuse plaintext when no keyed node remains.
+- Transitional plaintext requires explicit `IICP_CX_ALLOW_PLAINTEXT=1` for debugging only.
+- Updater environment-variable unit tests now serialize env mutation to avoid false release-gate failures.
+
 ## [0.7.67] — 2026-06-25
 
 ### Changed — updater observability

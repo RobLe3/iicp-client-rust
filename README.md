@@ -16,7 +16,7 @@ urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
 cargo add iicp-client
 ```
 
-> **Upgrade note (0.7.67)** — upgrade provider nodes so unattended updater checks
+> **Upgrade note (0.7.68)** — upgrade provider nodes so unattended updater checks
 > run hourly by default and report updater evidence to the directory. This helps the
 > mesh route away from stuck downlevel or non-key-ready nodes without weakening
 > IICP-CX requirements.
@@ -25,7 +25,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.67"
+iicp-client = "0.7.68"
 ```
 
 To run a provider node from the command line, install the `iicp-node` binary:

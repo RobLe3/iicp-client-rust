@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-use iicp_client::{make_traceparent, ClientConfig, DiscoverOptions, IicpClient, IicpError};
+use iicp_client::{
+    make_traceparent, ClientConfig, DiscoverOptions, IicpClient, IicpError, TaskRequest,
+};
 use std::sync::{Mutex, OnceLock};
 
 fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -230,6 +232,145 @@ async fn discover_accepts_both_cx_public_key_and_public_key_without_duplicate_er
             .map(|key| key.key_id.as_str()),
         Some("cx-canonical")
     );
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn submit_skips_keyless_nodes_by_default() {
+    use serde_json::json;
+
+    let _guard = env_test_lock();
+    unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
+    unsafe { std::env::remove_var("IICP_CX_ALLOW_PLAINTEXT") };
+
+    let mut server = mockito::Server::new_async().await;
+    let keyed_endpoint = format!("{}/keyed", server.url());
+    let keyless_endpoint = format!("{}/keyless", server.url());
+    let _discover = server
+        .mock("GET", mockito::Matcher::Regex("/api/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({
+                "count": 2,
+                "nodes": [
+                    {
+                        "node_id": "n-keyless",
+                        "endpoint": keyless_endpoint,
+                        "score": 0.99,
+                        "available": true,
+                        "region": "eu"
+                    },
+                    {
+                        "node_id": "n-keyed",
+                        "endpoint": keyed_endpoint,
+                        "score": 0.50,
+                        "available": true,
+                        "region": "eu",
+                        "cx_public_key": {
+                            "algorithm": "X25519",
+                            "encoding": "base64url",
+                            "key": "-LKZgrZEnFMr9ctB3uQDKsME07ZzS4Ce-SapFAePul0",
+                            "key_id": "cx-fixture"
+                        }
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let _keyless = server
+        .mock("POST", "/keyless/v1/task")
+        .with_status(500)
+        .expect(0)
+        .create_async()
+        .await;
+    let _keyed = server
+        .mock("POST", "/keyed/v1/task")
+        .match_body(mockito::Matcher::PartialJson(json!({
+            "iicp_conf": {"recipient_key_id": "cx-fixture"}
+        })))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({"task_id":"t1","status":"success","result":{},"metrics":{"node_id":"n-keyed"}})
+                .to_string(),
+        )
+        .expect(1)
+        .create_async()
+        .await;
+
+    let client = IicpClient::new(ClientConfig {
+        directory_url: format!("{}/api", server.url()),
+        routing_strategy: "deterministic".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let resp = client
+        .submit(TaskRequest {
+            task_id: String::new(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            payload: json!({"messages": []}),
+            constraints: None,
+            auth: None,
+            source_node_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(resp.status, "success");
+    _keyless.assert_async().await;
+    _keyed.assert_async().await;
+
+    unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn submit_refuses_all_keyless_nodes_by_default() {
+    use serde_json::json;
+
+    let _guard = env_test_lock();
+    unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
+    unsafe { std::env::remove_var("IICP_CX_ALLOW_PLAINTEXT") };
+
+    let mut server = mockito::Server::new_async().await;
+    let endpoint = format!("{}/keyless", server.url());
+    let _discover = server
+        .mock("GET", mockito::Matcher::Regex("/api/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"count":1,"nodes":[{"node_id":"n-keyless","endpoint":endpoint,"score":1.0,"available":true,"region":"eu"}]}).to_string())
+        .create_async()
+        .await;
+    let _task = server
+        .mock("POST", "/keyless/v1/task")
+        .with_status(200)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let client = IicpClient::new(ClientConfig {
+        directory_url: format!("{}/api", server.url()),
+        routing_strategy: "deterministic".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let err = client
+        .submit(TaskRequest {
+            task_id: String::new(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            payload: json!({"messages": []}),
+            constraints: None,
+            auth: None,
+            source_node_id: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("confidentiality required"));
+    _task.assert_async().await;
+
+    unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
 }
 
 #[tokio::test]

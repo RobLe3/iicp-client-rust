@@ -186,6 +186,13 @@ pub fn reexec() -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn auto_update_decision_matrix() {
@@ -225,6 +232,7 @@ mod tests {
 
     #[test]
     fn auto_update_enabled_env_opt_out() {
+        let _guard = env_lock().lock().unwrap();
         std::env::remove_var("IICP_AUTO_UPDATE");
         assert!(auto_update_enabled());
         for value in ["0", "false", "no", "off"] {
@@ -238,6 +246,7 @@ mod tests {
 
     #[test]
     fn auto_update_interval_env_floor_and_bad_value() {
+        let _guard = env_lock().lock().unwrap();
         std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
         assert_eq!(auto_update_interval_secs(), 3600);
         std::env::set_var("IICP_AUTO_UPDATE_INTERVAL_S", "42");
@@ -251,13 +260,14 @@ mod tests {
 
     #[test]
     fn auto_update_status_payload_defaults_hourly() {
+        let _guard = env_lock().lock().unwrap();
         std::env::remove_var("IICP_AUTO_UPDATE");
         std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
-        record_update_check(Some("0.7.67".into()), None);
+        record_update_check(Some("0.7.68".into()), None);
         let payload = auto_update_status_json();
         assert_eq!(payload["auto_update_enabled"], true);
         assert_eq!(payload["auto_update_interval_s"], 3600);
-        assert_eq!(payload["sdk_latest_seen"], "0.7.67");
+        assert_eq!(payload["sdk_latest_seen"], "0.7.68");
         assert!(payload["sdk_update_last_checked_at"].is_string());
         assert!(payload["sdk_update_error_class"].is_null());
     }

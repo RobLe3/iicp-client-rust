@@ -102,6 +102,22 @@ fn is_ssrf_safe(url: &str) -> bool {
     true
 }
 
+fn cx_plaintext_fallback_allowed() -> bool {
+    std::env::var("IICP_CX_ALLOW_PLAINTEXT")
+        .ok()
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn node_short_id(node_id: &str) -> &str {
+    &node_id[..node_id.len().min(8)]
+}
+
 fn is_browser_usable_endpoint(url: &str) -> bool {
     let lower = url.to_lowercase();
     if lower.starts_with("https://") {
@@ -207,7 +223,12 @@ impl IicpClient {
 
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
         let nodes = self.discover(&request.intent, None, Some(&tp)).await?;
-        // Filter to safe, available nodes before candidate selection.
+        // Filter to safe, available and confidentiality-capable nodes before candidate
+        // selection. A keyless provider must never receive plaintext by default; the
+        // temporary escape hatch is intentionally explicit and noisy for controlled
+        // transition/debugging only.
+        let allow_plaintext = cx_plaintext_fallback_allowed();
+        let mut skipped_keyless = 0usize;
         let safe_nodes: Vec<_> = nodes
             .nodes
             .into_iter()
@@ -218,13 +239,29 @@ impl IicpClient {
                         &n.node_id[..n.node_id.len().min(8)],
                         n.endpoint
                     );
-                    false
-                } else {
-                    true
+                    return false;
                 }
+                if !n.available {
+                    return false;
+                }
+                if n.cx_public_key.is_none() && !allow_plaintext {
+                    skipped_keyless += 1;
+                    eprintln!(
+                        "[iicp-cx] skipping keyless node {} — refusing plaintext by default \
+                         (set IICP_CX_ALLOW_PLAINTEXT=1 only for transitional debugging).",
+                        node_short_id(&n.node_id)
+                    );
+                    return false;
+                }
+                true
             })
-            .filter(|n| n.available)
             .collect();
+
+        if safe_nodes.is_empty() && skipped_keyless > 0 {
+            return Err(IicpError::Node(format!(
+                "IICP-CX confidentiality required: {skipped_keyless} discovered node(s) advertised no encryption key; refusing plaintext fallback"
+            )));
+        }
 
         let candidates: Vec<_> = {
             let mut rng = rand::thread_rng();
@@ -306,10 +343,9 @@ impl IicpClient {
                 None
             };
 
-            // IICP-CX S.16: encryption is MANDATORY (privacy-first #360) — no opt-out.
-            // Always encrypt when the node advertises a cx_public_key. During the migration
-            // window (#532) a node with no key yet gets a loud warning + plaintext; fail-closed
-            // at P0b once the mesh is key-ready. use_confidentiality no longer gates this.
+            // IICP-CX S.16: encryption is mandatory by default. Always encrypt when
+            // the node advertises a cx_public_key. Plaintext fallback is refused unless
+            // the caller explicitly sets IICP_CX_ALLOW_PLAINTEXT=1 for transitional debugging.
             let body: serde_json::Value = if let Some(ref cx_key) = node.cx_public_key {
                 let iicp_conf =
                     encrypt_payload(&request.payload, cx_key, &request.task_id, &request.intent)?;
@@ -322,7 +358,7 @@ impl IicpClient {
             } else {
                 eprintln!(
                     "[iicp-cx] node {} advertises no encryption key — sending UNENCRYPTED \
-                     (transitional; will be refused once the mesh is key-ready).",
+                     only because IICP_CX_ALLOW_PLAINTEXT=1 is set.",
                     node.node_id
                 );
                 serde_json::to_value(&request)?
