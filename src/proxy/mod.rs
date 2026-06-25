@@ -308,7 +308,7 @@ async fn ollama_chat(State(b): State<Backend>, Json(body): Json<Value>) -> Respo
     let model = model_of(&body);
     let stream = body
         .get("stream")
-        .map_or(true, |v| v.as_bool().unwrap_or(true)); // default true
+        .is_none_or(|v| v.as_bool().unwrap_or(true)); // default true
     match run_task(&b, messages_of(&body), &model, &body).await {
         Outcome::Ok(resp) => {
             let payload = to_ollama(&resp, &model);
@@ -330,7 +330,7 @@ async fn ollama_generate(State(b): State<Backend>, Json(body): Json<Value>) -> R
     let model = model_of(&body);
     let stream = body
         .get("stream")
-        .map_or(true, |v| v.as_bool().unwrap_or(true));
+        .is_none_or(|v| v.as_bool().unwrap_or(true));
     let prompt = body
         .get("prompt")
         .and_then(|v| v.as_str())

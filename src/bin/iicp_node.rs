@@ -158,7 +158,7 @@ fn print_help() {
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
          \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
-         \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: on tier ≥ 3 the node tries a tunnel FIRST, relay only if it fails; --no-tunnel = relay-first\n\
+         \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: use a tunnel when direct IPv4/IPv6/pinhole reachability is unavailable or unverified, then relay; --no-tunnel disables tunnel fallback\n\
          \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485).\n\
          \x20                            Note: relay bind authentication is pending (#510) — only run a relay\n\
          \x20                            accept port on networks you trust until the signed-bind mechanism ships.\n\
@@ -1962,6 +1962,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // #520 rung 5 — Quick Tunnel escalation state (see src/tunnel.rs).
     // Held for the serve lifetime; Drop/close() tears the child down.
     let mut tunnel: Option<iicp_client::tunnel::QuickTunnel> = None;
+    #[cfg(feature = "nat")]
+    let mut nat_profile_for_fallback: Option<iicp_client::nat_detection::NatProfile> = None;
 
     let tier0_pinhole = if !opts.auto_detect_nat && opts.public_endpoint.contains('[') {
         let r = iicp_client::nat_detection::try_open_v6_pinhole_for_endpoint(
@@ -2188,6 +2190,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             eprintln!("[iicp-node] NAT guidance: {guidance}");
         }
         node.apply_nat_profile(&profile);
+        nat_profile_for_fallback = Some(profile.clone());
 
         // Propagate detected public endpoint back to opts so the NAT-4 guard
         // (which checks opts.public_endpoint) sees the real reachable URL.
@@ -2256,6 +2259,46 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             opts.public_endpoint = t.url.clone();
         }
     }
+    // Maximum-adoption fallback: if direct serving is local/private, IPv6-only
+    // without a verified pinhole, or otherwise not externally routable, publish
+    // a Quick Tunnel by default.  The node still listens on the original direct
+    // host:port; only the directory-advertised public route changes.  Operators
+    // can opt out with --no-tunnel / IICP_TUNNEL=0.
+    #[cfg(feature = "nat")]
+    if opts.tunnel != Some(false)
+        && tunnel.is_none()
+        && opts.relay_worker_endpoint.is_empty()
+        && !opts.skip_registration
+    {
+        if let Some(reason) = direct_tunnel_fallback_reason(
+            &opts.public_endpoint,
+            nat_profile_for_fallback.as_ref(),
+            tier0_pinhole.as_ref(),
+        ) {
+            eprintln!(
+                "[iicp-node] direct endpoint needs public fallback ({reason}) — opening Quick Tunnel automatically…"
+            );
+            tunnel = try_tunnel_rung(opts.port, false);
+            if let Some(t) = &tunnel {
+                apply_tunnel_profile(&mut node, &t.url);
+                opts.public_endpoint = t.url.clone();
+            } else if opts.relay_worker_endpoint.is_empty() {
+                eprintln!(
+                    "[iicp-node] no tunnel available — auto-electing a relay from directory (last resort)…"
+                );
+                if let Some((relay_host, relay_port)) =
+                    auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
+                {
+                    opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
+                    node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                    eprintln!(
+                        "[iicp-node] auto-elected relay (last resort): {}:{}",
+                        relay_host, relay_port
+                    );
+                }
+            }
+        }
+    }
     if let Some(t) = &tunnel {
         // #527 — Quick Tunnel URLs rotate per process. The watchdog (sync thread)
         // publishes the new URL into the node's endpoint_override; the heartbeat
@@ -2306,14 +2349,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // NAT-4 guard: if the endpoint is non-routable (localhost/private) and no relay
     // is configured, registration will always fail with 422. Skip it early and print
     // a clear diagnostic instead of a confusing "422 Unprocessable Entity" error.
-    let endpoint_is_local = {
-        let ep = opts.public_endpoint.to_lowercase();
-        ep.contains("localhost")
-            || ep.contains("127.")
-            || ep.contains("0.0.0.0")
-            || ep.contains("192.168.")
-            || ep.contains("10.")
-    };
+    let endpoint_is_local = endpoint_is_local_or_private(&opts.public_endpoint);
     if endpoint_is_local && opts.relay_worker_endpoint.is_empty() && !opts.skip_registration {
         eprintln!(
             "[iicp-node] no routable endpoint detected and no relay configured — \
@@ -2562,6 +2598,58 @@ fn plan_reachability(tier: u8, relay_configured: bool, tunnel_enabled: bool) -> 
     steps.push("relay");
     steps.push("gossip");
     steps
+}
+
+fn endpoint_is_local_or_private(endpoint: &str) -> bool {
+    let ep = endpoint.to_lowercase();
+    ep.contains("://localhost")
+        || ep.contains("://127.")
+        || ep.contains("://0.0.0.0")
+        || ep.contains("://192.168.")
+        || ep.contains("://10.")
+        || (16..=31).any(|n| ep.contains(&format!("://172.{n}.")))
+        || ep.contains("://[::1]")
+        || ep.contains("://[fc")
+        || ep.contains("://[fd")
+}
+
+fn endpoint_is_bracketed_ipv6(endpoint: &str) -> bool {
+    endpoint.contains("://[")
+}
+
+#[cfg(feature = "nat")]
+fn direct_tunnel_fallback_reason(
+    endpoint: &str,
+    profile: Option<&iicp_client::nat_detection::NatProfile>,
+    tier0_pinhole: Option<&iicp_client::nat_detection::PinholeOpenResult>,
+) -> Option<&'static str> {
+    if endpoint_is_local_or_private(endpoint) {
+        return Some("local/private endpoint");
+    }
+
+    if let Some(p) = profile {
+        if p.tier >= 3
+            || matches!(
+                p.transport_method,
+                iicp_client::nat_detection::TransportMethod::Unreachable
+            )
+        {
+            return Some("NAT traversal did not produce a direct public route");
+        }
+    }
+
+    if endpoint_is_bracketed_ipv6(endpoint) {
+        let profile_pinhole = profile
+            .and_then(|p| p.ipv6.as_ref())
+            .map(|v6| v6.pinhole_active)
+            .unwrap_or(false);
+        let explicit_pinhole = tier0_pinhole.map(|p| p.pinhole_active).unwrap_or(false);
+        if !profile_pinhole && !explicit_pinhole {
+            return Some("IPv6 direct endpoint has no verified inbound pinhole");
+        }
+    }
+
+    None
 }
 
 /// Query the directory for relay-capable peers and elect one deterministically.
@@ -3452,6 +3540,46 @@ mod tests {
         assert_eq!(plan_reachability(3, false, false), vec!["relay", "gossip"]); // --no-tunnel
         assert!(plan_reachability(2, false, true).is_empty()); // tier<3
         assert!(plan_reachability(3, true, true).is_empty()); // configured relay
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn test_direct_tunnel_fallback_reason_preserves_verified_direct() {
+        use iicp_client::nat_detection::{NatProfile, TransportMethod};
+
+        let mut direct = NatProfile {
+            tier: 0,
+            transport_method: TransportMethod::Direct,
+            public_endpoint: Some("http://203.0.113.10:9484".to_string()),
+            transport_endpoint: None,
+            internal_endpoint: None,
+            operator_guidance: None,
+            detection_log: Vec::new(),
+            ipv6: None,
+        };
+        assert_eq!(
+            direct_tunnel_fallback_reason("http://203.0.113.10:9484", Some(&direct), None),
+            None
+        );
+
+        direct.tier = 3;
+        assert_eq!(
+            direct_tunnel_fallback_reason("http://203.0.113.10:9484", Some(&direct), None),
+            Some("NAT traversal did not produce a direct public route")
+        );
+    }
+
+    #[cfg(feature = "nat")]
+    #[test]
+    fn test_direct_tunnel_fallback_reason_flags_local_and_unverified_ipv6() {
+        assert_eq!(
+            direct_tunnel_fallback_reason("http://localhost:9484", None, None),
+            Some("local/private endpoint")
+        );
+        assert_eq!(
+            direct_tunnel_fallback_reason("http://[2a0a:a543::1]:9484", None, None),
+            Some("IPv6 direct endpoint has no verified inbound pinhole")
+        );
     }
 
     // #410 — saved-node backend_url must be applied when no flag/env supplied it.

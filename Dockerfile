@@ -10,25 +10,43 @@
 # Required env vars:
 #   IICP_BACKEND_URL    — OpenAI-compatible backend (Ollama / vLLM / LM Studio)
 #   IICP_BACKEND_MODEL  — model name (e.g. qwen2.5:0.5b)
-#   IICP_PUBLIC_ENDPOINT — externally reachable URL of this node
+#
+# Optional:
+#   IICP_PUBLIC_ENDPOINT — externally reachable URL of this node. If omitted,
+#                          the node tries automatic reachability (Quick Tunnel
+#                          first, relay last-resort) before staying local.
 #
 # See https://iicp.network/docs/sdk-quickstart-docker for the full setup guide.
 
-FROM rust:1.83-slim AS build
+FROM rust:1.86-slim AS build
 WORKDIR /app
 # Cache deps separately from source so subsequent rebuilds are quick.
 COPY Cargo.toml Cargo.lock* ./
 COPY src ./src
 COPY examples ./examples
-# Build the iicp-node binary release-optimised. Includes default features
-# (no IICP TCP / NAT — HTTP /v1/task is enough for an MVP node; operators
-# who want native TCP can rebuild with --features iicp-tcp,nat).
+# Build the iicp-node binary release-optimised. Default features include NAT
+# detection and native IICP TCP; library consumers can still opt out with
+# --no-default-features outside this Docker image.
 RUN cargo build --release --bin iicp-node
 
-FROM debian:bookworm-slim AS runtime
+# Keep the Rust toolchain in the runtime image so the default-on provider
+# self-updater can run `cargo install iicp-client --force` inside Docker and
+# re-exec onto the newer binary. This is intentionally larger than a scratchy
+# binary-only image; operators who prefer immutable containers can disable the
+# updater with IICP_AUTO_UPDATE=0 and rebuild from source instead.
+FROM rust:1.86-slim AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+  && arch="$(dpkg --print-architecture)" \
+  && case "$arch" in \
+      amd64) cf_arch=amd64 ;; \
+      arm64) cf_arch=arm64 ;; \
+      *) echo "unsupported architecture for cloudflared: $arch" >&2; exit 1 ;; \
+    esac \
+  && curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${cf_arch}" -o /usr/local/bin/cloudflared \
+  && chmod +x /usr/local/bin/cloudflared \
+  && cloudflared --version >/dev/null \
   && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /app/target/release/iicp-node /usr/local/bin/iicp-node

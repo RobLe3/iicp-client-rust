@@ -1,8 +1,8 @@
 [package]
 name = "iicp-client"
-version = "0.7.68"
+version = "0.7.69"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.86"
 description = "Official Rust client SDK for the IICP protocol (ADR-016)"
 license = "Apache-2.0"
 keywords = ["iicp", "ai-agents", "protocol", "sdk"]

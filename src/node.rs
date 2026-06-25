@@ -1346,7 +1346,7 @@ pub struct IicpNode {
     pinhole_lease_seconds: std::sync::RwLock<u32>,
     /// ADR-047 Part A (#411) — latest liveness nonce from the heartbeat response,
     /// answered (HMAC) on the next beat. None until the first response.
-    liveness_challenge: std::sync::RwLock<Option<String>>,
+    liveness_challenge: Arc<std::sync::RwLock<Option<String>>>,
     /// #494 — model set registered at last register(); compared each heartbeat tick for drift.
     /// Arc so the background heartbeat task can read and update it.
     registered_models: Arc<std::sync::RwLock<Vec<String>>>,
@@ -1390,7 +1390,7 @@ impl IicpNode {
             runtime_token: Arc::new(std::sync::RwLock::new(String::new())),
             pinhole_uid: std::sync::RwLock::new(None),
             pinhole_lease_seconds: std::sync::RwLock::new(3600),
-            liveness_challenge: std::sync::RwLock::new(None),
+            liveness_challenge: Arc::new(std::sync::RwLock::new(None)),
             registered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
             endpoint_override: Arc::new(std::sync::RwLock::new(None)),
             registered_endpoint: Arc::new(std::sync::RwLock::new(String::new())),
@@ -2228,6 +2228,8 @@ impl IicpNode {
             // the new URL into endpoint_override; the loop re-registers on drift.
             let hb_endpoint_override = self.endpoint_override_handle();
             let hb_registered_endpoint = Arc::clone(&self.registered_endpoint);
+            let hb_liveness_challenge = Arc::clone(&self.liveness_challenge);
+            let hb_runtime_hmac_key = Arc::clone(&self.runtime_hmac_key);
             tokio::spawn(async move {
                 let mut token = token;
                 let mut seq: u64 = 0;
@@ -2292,6 +2294,18 @@ impl IicpNode {
                         "metrics": metrics,
                     });
                     attach_update_status(&mut hb_body);
+                    // ADR-047 Part A (#411) — answer the directory's liveness
+                    // challenge in the long-running serve loop, not only in the
+                    // one-shot heartbeat() helper.  This lets the directory trust
+                    // live direct/IPv6 nodes without a dial-back probe.
+                    let stored_challenge = hb_liveness_challenge.read().expect("poisoned").clone();
+                    let hmac_key = hb_runtime_hmac_key.read().expect("poisoned").clone();
+                    if let Some(challenge) = stored_challenge {
+                        if !hmac_key.is_empty() {
+                            hb_body["challenge_response"] =
+                                json!(crate::pricing::sign_body(challenge.as_bytes(), &hmac_key));
+                        }
+                    }
                     if let Some(ref hm) = live_models {
                         hb_body["health_models"] = json!(hm);
                     }
@@ -2310,6 +2324,12 @@ impl IicpNode {
                         Ok(resp) if resp.status().is_success() => {
                             if let Some(ref log) = hb_log {
                                 log.write("heartbeat_ok", &hb_node_id, &format!("seq={seq}"));
+                            }
+                            if let Ok(data) = resp.json::<Value>().await {
+                                if let Some(ch) = data["challenge"].as_str() {
+                                    *hb_liveness_challenge.write().expect("poisoned") =
+                                        Some(ch.to_string());
+                                }
                             }
                             // #494 — detect model drift; re-register when live set differs.
                             if let Some(live) = live_models {

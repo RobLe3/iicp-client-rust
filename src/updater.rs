@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Self-updater P1 — read-only version check (#521 WQ-089).
+//! Self-updater for provider nodes (#521 WQ-089).
 //! Rust parity with iicp-client-python/updater.py and -typescript/updater.ts.
 //!
-//! Inert by design: reports whether a newer release exists and prints the
-//! upgrade command. No download/install/restart (P2/P3 — opt-in, signed).
+//! `iicp-node update` still supports the safe read-only version check, but
+//! normal long-running `iicp-node serve` processes now also run a default-on
+//! background loop: check crates.io hourly (first check within five minutes),
+//! `cargo install --force` when a newer stable release exists, and re-exec the
+//! process so the node comes back on the new binary. The loop is
+//! failure-isolated and opt-out via `IICP_AUTO_UPDATE=0`.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -263,11 +267,11 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var("IICP_AUTO_UPDATE");
         std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
-        record_update_check(Some("0.7.68".into()), None);
+        record_update_check(Some("0.7.69".into()), None);
         let payload = auto_update_status_json();
         assert_eq!(payload["auto_update_enabled"], true);
         assert_eq!(payload["auto_update_interval_s"], 3600);
-        assert_eq!(payload["sdk_latest_seen"], "0.7.68");
+        assert_eq!(payload["sdk_latest_seen"], "0.7.69");
         assert!(payload["sdk_update_last_checked_at"].is_string());
         assert!(payload["sdk_update_error_class"].is_null());
     }
