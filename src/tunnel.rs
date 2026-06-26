@@ -15,6 +15,7 @@
 //! (`close()` idempotent; Drop kills the child so a normal exit never
 //! orphans it).
 
+use std::collections::VecDeque;
 use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -37,6 +38,7 @@ pub const MAX_RESPAWNS: u32 = 3;
 pub const TUNNEL_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 pub const TUNNEL_HEALTH_MAX_FAILS: u32 = 2;
 pub const TUNNEL_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
+pub const TUNNEL_DOH_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelState {
@@ -52,10 +54,75 @@ pub enum TunnelDeadDecision {
     RetryAfter(Duration),
 }
 
+fn trycloudflare_host(url: &str) -> Option<&str> {
+    let rest = url.trim_start().strip_prefix("https://")?;
+    let host = rest.split('/').next().unwrap_or(rest);
+    if host.ends_with(".trycloudflare.com")
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        Some(host)
+    } else {
+        None
+    }
+}
+
+fn is_likely_dns_error(err: &reqwest::Error) -> bool {
+    error_message_is_likely_dns(&err.to_string())
+}
+
+fn error_message_is_likely_dns(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("dns")
+        || msg.contains("failed to lookup address")
+        || msg.contains("nodename nor servname")
+        || msg.contains("name or service not known")
+        || msg.contains("temporary failure in name resolution")
+}
+
+async fn doh_has_answer(client: &reqwest::Client, host: &str, record_type: &str) -> bool {
+    let url = format!("https://cloudflare-dns.com/dns-query?name={host}&type={record_type}");
+    let resp = match client
+        .get(url)
+        .header("accept", "application/dns-json")
+        .timeout(TUNNEL_DOH_TIMEOUT)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(_) => return false,
+    };
+    if !resp.status().is_success() {
+        return false;
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(body) => body,
+        Err(_) => return false,
+    };
+    body.get("Status").and_then(|v| v.as_u64()) == Some(0)
+        && body
+            .get("Answer")
+            .and_then(|v| v.as_array())
+            .is_some_and(|answers| !answers.is_empty())
+}
+
+async fn trycloudflare_published_via_doh(client: &reqwest::Client, url: &str) -> bool {
+    let Some(host) = trycloudflare_host(url) else {
+        return false;
+    };
+    doh_has_answer(client, host, "A").await || doh_has_answer(client, host, "AAAA").await
+}
+
 /// GET `<url>/iicp/health` round-trips through the Cloudflare edge back to the local
 /// node — the same path a browser consumer takes — so it detects an edge-drop, not
 /// just a local-process death. Build error → treat as healthy (never self-restart on
-/// our own client error). Used by the watchdog from its own (non-tokio) thread.
+/// our own client error). For accountless Quick Tunnels, local macOS DNS can lag
+/// Cloudflare's authoritative publication by long enough to create a destructive
+/// create→verify→kill loop. If local resolution fails but Cloudflare DoH already
+/// returns an A/AAAA answer, keep the tunnel and publish it: external resolvers can
+/// reach it even while this host's resolver cache is stale. Used by the watchdog from
+/// its own (non-tokio) thread.
 async fn tunnel_url_reachable(url: &str) -> bool {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
@@ -65,7 +132,21 @@ async fn tunnel_url_reachable(url: &str) -> bool {
         Err(_) => return true,
     };
     let probe = format!("{}/iicp/health", url.trim_end_matches('/'));
-    matches!(client.get(&probe).send().await, Ok(r) if r.status().is_success())
+    match client.get(&probe).send().await {
+        Ok(r) => r.status().is_success(),
+        Err(err) if is_likely_dns_error(&err) => {
+            if trycloudflare_published_via_doh(&client, url).await {
+                eprintln!(
+                    "[quick-tunnel] local DNS has not resolved {url} yet, but Cloudflare DoH \
+                     already publishes it — keeping tunnel alive."
+                );
+                true
+            } else {
+                false
+            }
+        }
+        Err(_) => false,
+    }
 }
 
 fn tunnel_url_reachable_sync(url: &str) -> bool {
@@ -579,31 +660,59 @@ fn spawn_and_parse(
     drop(tx);
 
     let deadline = Instant::now() + timeout;
+    let mut last_lines: VecDeque<String> = VecDeque::with_capacity(6);
+    let error_with_output = |reason: &str, last_lines: &VecDeque<String>| {
+        if last_lines.is_empty() {
+            reason.to_string()
+        } else {
+            format!(
+                "{reason}; last cloudflared output: {}",
+                last_lines
+                    .iter()
+                    .map(|line| line.trim())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )
+        }
+    };
     let url = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             let _ = child.kill();
-            return Err(format!(
-                "cloudflared produced no tunnel URL within {}s",
-                timeout.as_secs()
+            return Err(error_with_output(
+                &format!(
+                    "cloudflared produced no tunnel URL within {}s",
+                    timeout.as_secs()
+                ),
+                &last_lines,
             ));
         }
         match rx.recv_timeout(remaining) {
             Ok(line) => {
+                if last_lines.len() == 6 {
+                    last_lines.pop_front();
+                }
+                last_lines.push_back(line.clone());
                 if let Some(u) = extract_url(&line) {
                     break u;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let _ = child.kill();
-                return Err(format!(
-                    "cloudflared produced no tunnel URL within {}s",
-                    timeout.as_secs()
+                return Err(error_with_output(
+                    &format!(
+                        "cloudflared produced no tunnel URL within {}s",
+                        timeout.as_secs()
+                    ),
+                    &last_lines,
                 ));
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
-                return Err("cloudflared exited before printing a tunnel URL".into());
+                return Err(error_with_output(
+                    "cloudflared exited before printing a tunnel URL",
+                    &last_lines,
+                ));
             }
         }
     };
@@ -624,5 +733,30 @@ mod tests {
         );
         assert_eq!(extract_url("INF | https://example.com"), None);
         assert_eq!(extract_url("no url here"), None);
+    }
+
+    #[test]
+    fn trycloudflare_host_accepts_only_safe_quick_tunnel_hosts() {
+        assert_eq!(
+            trycloudflare_host("https://blue-fox-1.trycloudflare.com/iicp/health"),
+            Some("blue-fox-1.trycloudflare.com")
+        );
+        assert_eq!(trycloudflare_host("https://example.com"), None);
+        assert_eq!(
+            trycloudflare_host("http://blue-fox-1.trycloudflare.com"),
+            None
+        );
+        assert_eq!(
+            trycloudflare_host("https://blue_fox.trycloudflare.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn likely_dns_error_detection_covers_macos_resolver_wording() {
+        assert!(error_message_is_likely_dns(
+            "error trying to connect: dns error: failed to lookup address information: \
+                 nodename nor servname provided, or not known"
+        ));
     }
 }

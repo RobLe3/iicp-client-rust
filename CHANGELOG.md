@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.72] — 2026-06-26
+
+### Fixed — Quick Tunnel DNS-lag stability
+- Quick Tunnel verification now avoids destructive tunnel rotation when local
+  DNS has not resolved a freshly-created `trycloudflare.com` hostname yet but
+  Cloudflare DoH already publishes the A/AAAA record.
+- This prevents local macOS resolver lag from causing provider nodes to churn
+  public endpoints and disappear from the directory even though local
+  `/iicp/health` is healthy.
+
 ## [0.7.71] — 2026-06-26
 
 ### Fixed — supervised Quick Tunnel dead-state recovery

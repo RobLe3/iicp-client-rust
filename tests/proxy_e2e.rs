@@ -67,6 +67,7 @@ async fn proxy_e2e_all_surfaces_through_real_binary() {
         .args(["proxy", "--port", &proxy_port.to_string()])
         .env("IICP_DIRECTORY_URL", format!("{}/api", server.url()))
         .env("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1")
+        .env("IICP_CX_ALLOW_PLAINTEXT", "1")
         .env("IICP_NODE_TOKEN", "")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
