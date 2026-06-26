@@ -6,8 +6,8 @@
 //! normal long-running `iicp-node serve` processes now also run a default-on
 //! background loop: check crates.io hourly (first check within five minutes),
 //! `cargo install --force` when a newer stable release exists, and re-exec the
-//! process so the node comes back on the new binary. The loop is
-//! failure-isolated and opt-out via `IICP_AUTO_UPDATE=0`.
+//! process so the node comes back on the new binary in covered service paths.
+//! The loop is failure-isolated and opt-out via `IICP_AUTO_UPDATE=0`.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -89,9 +89,9 @@ pub async fn latest_crates_version(timeout_secs: u64) -> Option<String> {
 // ── P2 — background self-updater (#521) ─────────────────────────────────────────
 // A node running `serve` periodically checks crates.io and, on a newer release,
 // `cargo install --force`s and re-execs onto it. Removes the manual-upgrade
-// dependency on downlevel hosters — once a node reaches the first release carrying
-// this updater, every future release self-propagates. Default-on; opt out with
-// IICP_AUTO_UPDATE=0. Loop-safe (post-upgrade running == latest) + failure-isolated.
+// dependency on manual upgrades in covered service paths. Nodes older than the
+// hardened 0.7.67 serve wiring may need one manual upgrade/restart first.
+// Default-on; opt out with IICP_AUTO_UPDATE=0. Loop-safe (post-upgrade running == latest) + failure-isolated.
 // NB: the Rust upgrade recompiles from source (cargo install), so it can take several
 // minutes; the node keeps serving until the re-exec.
 

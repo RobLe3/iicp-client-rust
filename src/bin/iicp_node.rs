@@ -54,6 +54,62 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+const TUNNEL_DEAD_EXIT_CODE: i32 = 75;
+const TUNNEL_DEAD_RETRY_INITIAL: Duration = Duration::from_secs(30);
+const TUNNEL_DEAD_RETRY_MAX: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelDeadPolicy {
+    Auto,
+    Retry,
+    Exit,
+    LogOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TunnelDeadBehavior {
+    ExitProcess,
+    Retry,
+    LogOnly,
+}
+
+fn tunnel_dead_policy_value(value: &str) -> Option<TunnelDeadPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "" => Some(TunnelDeadPolicy::Auto),
+        "retry" => Some(TunnelDeadPolicy::Retry),
+        "exit" => Some(TunnelDeadPolicy::Exit),
+        "log-only" | "log_only" | "logonly" => Some(TunnelDeadPolicy::LogOnly),
+        _ => None,
+    }
+}
+
+fn tunnel_dead_policy_from_env() -> TunnelDeadPolicy {
+    match env::var("IICP_TUNNEL_DEAD_POLICY") {
+        Ok(value) => tunnel_dead_policy_value(&value).unwrap_or_else(|| {
+            eprintln!(
+                "[iicp-node] ignoring invalid IICP_TUNNEL_DEAD_POLICY={value:?}; using auto."
+            );
+            TunnelDeadPolicy::Auto
+        }),
+        Err(_) => TunnelDeadPolicy::Auto,
+    }
+}
+
+fn tunnel_dead_behavior(policy: TunnelDeadPolicy, supervised: bool) -> TunnelDeadBehavior {
+    match policy {
+        TunnelDeadPolicy::Auto if supervised => TunnelDeadBehavior::ExitProcess,
+        TunnelDeadPolicy::Auto => TunnelDeadBehavior::Retry,
+        TunnelDeadPolicy::Retry => TunnelDeadBehavior::Retry,
+        TunnelDeadPolicy::Exit => TunnelDeadBehavior::ExitProcess,
+        TunnelDeadPolicy::LogOnly => TunnelDeadBehavior::LogOnly,
+    }
+}
+
+fn tunnel_dead_retry_delay(attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1).min(4);
+    (TUNNEL_DEAD_RETRY_INITIAL * (1u32 << shift)).min(TUNNEL_DEAD_RETRY_MAX)
+}
+
 /// Return the first bindable TCP port >= `start` on `host`.
 ///
 /// The official IICP port 9484 is the starting point; when running multiple
@@ -158,7 +214,7 @@ fn print_help() {
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
          \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
-         \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: use a tunnel when direct IPv4/IPv6/pinhole reachability is unavailable or unverified, then relay; --no-tunnel disables tunnel fallback\n\
+         \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: use a tunnel when direct IPv4/IPv6/pinhole reachability is unavailable or unverified, then relay; --no-tunnel disables tunnel fallback. Dead policy: IICP_TUNNEL_DEAD_POLICY=auto|retry|exit|log-only; generated services set IICP_SUPERVISED=1\n\
          \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485).\n\
          \x20                            Note: relay bind authentication is pending (#510) — only run a relay\n\
          \x20                            accept port on networks you trust until the signed-bind mechanism ships.\n\
@@ -368,6 +424,14 @@ fn render_launchd_service(
             "IICP_AUTO_UPDATE_INTERVAL_S",
             env_value("IICP_AUTO_UPDATE_INTERVAL_S", "3600".to_string()),
         ),
+        (
+            "IICP_SUPERVISED",
+            env_value("IICP_SUPERVISED", "1".to_string()),
+        ),
+        (
+            "IICP_TUNNEL_DEAD_POLICY",
+            env_value("IICP_TUNNEL_DEAD_POLICY", "auto".to_string()),
+        ),
         ("IICP_LOG_DIR", log_dir.to_string_lossy().to_string()),
     ];
     let env_xml = envs
@@ -463,6 +527,14 @@ fn render_systemd_service(
         (
             "IICP_AUTO_UPDATE_INTERVAL_S",
             env_value("IICP_AUTO_UPDATE_INTERVAL_S", "3600".to_string()),
+        ),
+        (
+            "IICP_SUPERVISED",
+            env_value("IICP_SUPERVISED", "1".to_string()),
+        ),
+        (
+            "IICP_TUNNEL_DEAD_POLICY",
+            env_value("IICP_TUNNEL_DEAD_POLICY", "auto".to_string()),
         ),
         ("IICP_LOG_DIR", log_dir.to_string_lossy().to_string()),
     ];
@@ -2303,9 +2375,17 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         // #527/#elastic-tunnel — Quick Tunnel URLs rotate per process. The elastic
         // watchdog marks the node unavailable while the public edge is twilight or
         // rebuilding, and only publishes a new URL after public /iicp/health passes.
+        use iicp_client::tunnel::TunnelDeadDecision;
         let ep_override = node.endpoint_override_handle();
         let runtime_available = node.runtime_available_handle();
-        t.watch_elastic(
+        let runtime_available_for_state = runtime_available.clone();
+        let runtime_available_for_dead = runtime_available.clone();
+        let tunnel_dead_policy = tunnel_dead_policy_from_env();
+        let tunnel_dead_supervised = env_bool("IICP_SUPERVISED");
+        let tunnel_dead_attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let tunnel_dead_attempts_for_state = tunnel_dead_attempts.clone();
+        let tunnel_dead_attempts_for_dead = tunnel_dead_attempts.clone();
+        t.watch_elastic_managed(
             t.url.clone(),
             move |url| {
                 if let Ok(mut g) = ep_override.write() {
@@ -2317,14 +2397,33 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             },
             move |state| {
                 use iicp_client::tunnel::TunnelState;
-                runtime_available.store(matches!(state, TunnelState::Ready), std::sync::atomic::Ordering::Relaxed);
+                if matches!(state, TunnelState::Ready) {
+                    tunnel_dead_attempts_for_state.store(0, std::sync::atomic::Ordering::Relaxed);
+                }
+                runtime_available_for_state.store(matches!(state, TunnelState::Ready), std::sync::atomic::Ordering::Relaxed);
                 eprintln!("[iicp-node] Quick Tunnel state: {state:?}");
             },
-            || {
+            move || {
+                runtime_available_for_dead.store(false, std::sync::atomic::Ordering::Relaxed);
                 eprintln!(
                     "[iicp-node] Quick Tunnel permanently down — this node is no \
                      longer publicly reachable. Restart `iicp-node serve` to recover."
                 );
+                match tunnel_dead_behavior(tunnel_dead_policy, tunnel_dead_supervised) {
+                    TunnelDeadBehavior::ExitProcess => {
+                        eprintln!(
+                            "[iicp-node] supervised tunnel failure policy is exit — terminating with code {TUNNEL_DEAD_EXIT_CODE} so the supervisor can restart."
+                        );
+                        process::exit(TUNNEL_DEAD_EXIT_CODE);
+                    }
+                    TunnelDeadBehavior::Retry => {
+                        let attempt = tunnel_dead_attempts_for_dead
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            .saturating_add(1);
+                        TunnelDeadDecision::RetryAfter(tunnel_dead_retry_delay(attempt))
+                    }
+                    TunnelDeadBehavior::LogOnly => TunnelDeadDecision::Stop,
+                }
             },
         );
     }
@@ -3667,6 +3766,12 @@ mod tests {
         assert!(unit
             .content
             .contains("<key>IICP_AUTO_UPDATE_INTERVAL_S</key><string>3600</string>"));
+        assert!(unit
+            .content
+            .contains("<key>IICP_SUPERVISED</key><string>1</string>"));
+        assert!(unit
+            .content
+            .contains("<key>IICP_TUNNEL_DEAD_POLICY</key><string>auto</string>"));
         assert!(unit.content.contains("<key>KeepAlive</key><true/>"));
         assert!(!unit.content.contains("--daemon"));
     }
@@ -3688,8 +3793,57 @@ mod tests {
         assert!(unit
             .content
             .contains("Environment=IICP_AUTO_UPDATE_INTERVAL_S=3600"));
+        assert!(unit.content.contains("Environment=IICP_SUPERVISED=1"));
+        assert!(unit
+            .content
+            .contains("Environment=IICP_TUNNEL_DEAD_POLICY=auto"));
         assert!(unit.content.contains("Restart=on-failure"));
         assert!(!unit.content.contains("--daemon"));
+    }
+
+    #[test]
+    fn tunnel_dead_policy_auto_exits_only_when_supervised() {
+        assert_eq!(
+            tunnel_dead_behavior(TunnelDeadPolicy::Auto, true),
+            TunnelDeadBehavior::ExitProcess
+        );
+        assert_eq!(
+            tunnel_dead_behavior(TunnelDeadPolicy::Auto, false),
+            TunnelDeadBehavior::Retry
+        );
+        assert_eq!(
+            tunnel_dead_behavior(TunnelDeadPolicy::Retry, true),
+            TunnelDeadBehavior::Retry
+        );
+        assert_eq!(
+            tunnel_dead_behavior(TunnelDeadPolicy::Exit, false),
+            TunnelDeadBehavior::ExitProcess
+        );
+        assert_eq!(
+            tunnel_dead_behavior(TunnelDeadPolicy::LogOnly, true),
+            TunnelDeadBehavior::LogOnly
+        );
+    }
+
+    #[test]
+    fn tunnel_dead_policy_parser_accepts_expected_values() {
+        assert_eq!(
+            tunnel_dead_policy_value("auto"),
+            Some(TunnelDeadPolicy::Auto)
+        );
+        assert_eq!(
+            tunnel_dead_policy_value("retry"),
+            Some(TunnelDeadPolicy::Retry)
+        );
+        assert_eq!(
+            tunnel_dead_policy_value("exit"),
+            Some(TunnelDeadPolicy::Exit)
+        );
+        assert_eq!(
+            tunnel_dead_policy_value("log-only"),
+            Some(TunnelDeadPolicy::LogOnly)
+        );
+        assert_eq!(tunnel_dead_policy_value("nonsense"), None);
     }
 
     // --no-auto-detect-nat is parsed as an off-switch (parity with Python) and flips the

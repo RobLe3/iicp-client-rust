@@ -46,6 +46,12 @@ pub enum TunnelState {
     Dead,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelDeadDecision {
+    Stop,
+    RetryAfter(Duration),
+}
+
 /// GET `<url>/iicp/health` round-trips through the Cloudflare edge back to the local
 /// node — the same path a browser consumer takes — so it detects an edge-drop, not
 /// just a local-process death. Build error → treat as healthy (never self-restart on
@@ -84,6 +90,20 @@ fn wait_until_reachable(
             return false;
         }
         std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+fn sleep_until_closed(closed: &AtomicBool, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if closed.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(200)));
     }
 }
 
@@ -276,13 +296,63 @@ impl QuickTunnel {
         );
     }
 
+    /// Elastic watchdog variant for supervised CLIs. The caller can decide
+    /// whether a confirmed Dead state should stop the watchdog or retry later.
+    pub fn watch_elastic_managed(
+        &self,
+        initial_url: String,
+        on_new_url: impl Fn(String) + Send + 'static,
+        on_state: impl Fn(TunnelState) + Send + 'static,
+        on_dead: impl FnMut() -> TunnelDeadDecision + Send + 'static,
+    ) {
+        self.watch_elastic_with_probe_and_dead_policy(
+            initial_url,
+            on_new_url,
+            on_state,
+            on_dead,
+            Arc::new(tunnel_url_reachable_sync),
+            TUNNEL_HEALTH_INTERVAL,
+            TUNNEL_VERIFY_TIMEOUT,
+        );
+    }
+
     #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
     pub fn watch_elastic_with_probe(
         &self,
         initial_url: String,
         on_new_url: impl Fn(String) + Send + 'static,
         on_state: impl Fn(TunnelState) + Send + 'static,
         on_dead: impl FnOnce() + Send + 'static,
+        probe: Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>,
+        health_interval: Duration,
+        verify_timeout: Duration,
+    ) {
+        let mut on_dead_once = Some(on_dead);
+        self.watch_elastic_with_probe_and_dead_policy(
+            initial_url,
+            on_new_url,
+            on_state,
+            move || {
+                if let Some(on_dead) = on_dead_once.take() {
+                    on_dead();
+                }
+                TunnelDeadDecision::Stop
+            },
+            probe,
+            health_interval,
+            verify_timeout,
+        );
+    }
+
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn watch_elastic_with_probe_and_dead_policy(
+        &self,
+        initial_url: String,
+        on_new_url: impl Fn(String) + Send + 'static,
+        on_state: impl Fn(TunnelState) + Send + 'static,
+        mut on_dead: impl FnMut() -> TunnelDeadDecision + Send + 'static,
         probe: Arc<dyn Fn(&str) -> bool + Send + Sync + 'static>,
         health_interval: Duration,
         verify_timeout: Duration,
@@ -354,8 +424,22 @@ impl QuickTunnel {
                             n - 1
                         );
                         set_state(&mut state, TunnelState::Dead);
-                        on_dead();
-                        return;
+                        match on_dead() {
+                            TunnelDeadDecision::Stop => return,
+                            TunnelDeadDecision::RetryAfter(delay) => {
+                                eprintln!(
+                                    "[quick-tunnel] dead-state retry policy active — retrying in {}s.",
+                                    delay.as_secs()
+                                );
+                                if sleep_until_closed(closed.as_ref(), delay) {
+                                    return;
+                                }
+                                respawns.store(0, Ordering::Relaxed);
+                                health_fails = 0;
+                                set_state(&mut state, TunnelState::Recovering);
+                                continue;
+                            }
+                        }
                     }
                     eprintln!("[quick-tunnel] tunnel down — respawning ({n}/{MAX_RESPAWNS})…");
                     match spawn_and_parse(local_port, TUNNEL_START_TIMEOUT, &binary) {
@@ -382,8 +466,22 @@ impl QuickTunnel {
                         Err(e) => {
                             eprintln!("[quick-tunnel] respawn failed: {e}");
                             set_state(&mut state, TunnelState::Dead);
-                            on_dead();
-                            return;
+                            match on_dead() {
+                                TunnelDeadDecision::Stop => return,
+                                TunnelDeadDecision::RetryAfter(delay) => {
+                                    eprintln!(
+                                        "[quick-tunnel] dead-state retry policy active — retrying in {}s.",
+                                        delay.as_secs()
+                                    );
+                                    if sleep_until_closed(closed.as_ref(), delay) {
+                                        return;
+                                    }
+                                    respawns.store(0, Ordering::Relaxed);
+                                    health_fails = 0;
+                                    set_state(&mut state, TunnelState::Recovering);
+                                    continue;
+                                }
+                            }
                         }
                     }
                 }

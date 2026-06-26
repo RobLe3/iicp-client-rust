@@ -1,15 +1,18 @@
 # Contributing
 
-Issues and discussions for the IICP client SDK are tracked in the main IICP issue tracker:
+Use this repository for **iicp-client-rust** bugs, documentation fixes, tests and pull
+requests:
 
-**https://github.com/RobLe3/IICP/issues**
+- Issues: https://github.com/RobLe3/iicp-client-rust/issues
+- Main website/control-plane/protocol tracker: https://github.com/RobLe3/iicp.network/issues
 
-This repository will accept pull requests once functional code lands (v0.1.0, IICP spec v1.5 stable).
-Until then, use the issue tracker above to:
+Please include the client version, operating mode (`serve`, `relay`, Docker,
+launchd/systemd, library use), relevant logs without secrets, and the command or
+small reproducer you used. For protocol or behaviour changes, keep Rust, Python
+and TypeScript parity in mind and mention which clients are affected.
 
-- Report protocol bugs or ambiguities
-- Propose SDK API design decisions
-- Discuss integration patterns
+Pull requests are welcome. Prefer small, test-backed changes; update the README
+or CHANGELOG whenever operator-facing behaviour changes.
 
 ## License
 

@@ -9,7 +9,9 @@ use std::time::Duration;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use iicp_client::tunnel::{open_quick_tunnel_with, TunnelState, INSTALL_HINT, MAX_RESPAWNS};
+use iicp_client::tunnel::{
+    open_quick_tunnel_with, TunnelDeadDecision, TunnelState, INSTALL_HINT, MAX_RESPAWNS,
+};
 
 fn fake_bin(name: &str, lifetime_secs: f64, silent: bool) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("iicp-tunnel-{}", uuid::Uuid::new_v4()));
@@ -50,6 +52,40 @@ fn initiation_parses_url_from_output() {
     assert_eq!(t.url, "https://fake-fox-1234.trycloudflare.com");
     assert_eq!(t.local_port, 9484);
     assert!(t.is_running());
+    t.close();
+}
+
+#[test]
+fn elastic_watchdog_can_retry_after_dead_policy() {
+    let bin = fake_bin("dead-retry", 0.01, false);
+    let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_dead = Arc::clone(&calls);
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+    let tx_for_dead = Arc::clone(&tx);
+    t.watch_elastic_with_probe_and_dead_policy(
+        t.url.clone(),
+        |_url| {},
+        |_state| {},
+        move || {
+            let n = calls_for_dead.fetch_add(1, Ordering::SeqCst) + 1;
+            if n == 1 {
+                TunnelDeadDecision::RetryAfter(Duration::from_millis(0))
+            } else {
+                if let Some(tx) = tx_for_dead.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+                TunnelDeadDecision::Stop
+            }
+        },
+        Arc::new(|_url| false),
+        Duration::from_millis(20),
+        Duration::from_secs(0),
+    );
+    rx.recv_timeout(Duration::from_secs(30))
+        .expect("dead retry policy should re-enter recovery before stopping");
+    assert!(calls.load(Ordering::SeqCst) >= 2);
     t.close();
 }
 

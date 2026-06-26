@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.71] — 2026-06-26
+
+### Fixed — supervised Quick Tunnel dead-state recovery
+- Added `IICP_TUNNEL_DEAD_POLICY=auto|retry|exit|log-only` so operators can choose whether confirmed Quick Tunnel Dead state retries, exits, or only logs.
+- Generated launchd/systemd units and Docker images now set `IICP_SUPERVISED=1`; default `auto` exits non-zero under a supervisor so launchd/systemd/Docker can restart instead of leaving a publicly unreachable process alive.
+- Foreground/manual runs keep retrying with backoff by default, preserving a low-friction local development experience.
+- Dockerfiles default to `IICP_SUPERVISED=1` and the `auto` dead policy, matching generated launchd/systemd service units.
+- README and contributing docs now describe Docker restart-policy expectations, current issue trackers, and the one-time manual-upgrade caveat for nodes older than 0.7.67.
+
 ## [0.7.70] — 2026-06-25
 
 ### Added — elastic Quick Tunnel recovery
@@ -84,9 +93,10 @@ in the main repo).
 ### Added — background self-updater (#521 P2)
 - A node running `serve` keeps itself current automatically: it periodically checks crates.io
   and, on a newer release, `cargo install --force`s and re-execs onto the new version — no
-  operator intervention. **Once a node reaches 0.7.60, every future release self-propagates.**
-  Default-on; opt out with `IICP_AUTO_UPDATE=0` (`IICP_AUTO_UPDATE_INTERVAL_S` sets cadence,
-  default 1h, min 5m). Loop-safe and failure-isolated. NB: the Rust upgrade recompiles from
+  operator intervention in covered service paths. Early Docker/normal-serve coverage was hardened
+  in 0.7.67, so older nodes may need one manual upgrade/restart first. Default-on; opt
+  out with `IICP_AUTO_UPDATE=0` (`IICP_AUTO_UPDATE_INTERVAL_S` sets cadence, default 1h,
+  min 5m). Loop-safe and failure-isolated. NB: the Rust upgrade recompiles from
   source, so it can take a few minutes; the node keeps serving until the re-exec.
 
 ### Added
