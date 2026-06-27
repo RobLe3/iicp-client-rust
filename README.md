@@ -16,18 +16,18 @@ urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
 cargo add iicp-client
 ```
 
-> **Upgrade note (0.7.72)** — upgrade provider nodes so Quick Tunnel endpoints
+> **Upgrade note (0.7.73)** — upgrade provider nodes so Quick Tunnel endpoints
 > recover safely after sleep, idle, Cloudflare edge drops, and local DNS
 > propagation lag on freshly-created `trycloudflare.com` URLs. Tunnel
 > twilight/recovery still heartbeats as unavailable and only re-registers once
 > public `/iicp/health` verifies; supervised services and Docker containers now
-> fail visibly so launchd/systemd/Docker can restart instead of staying stuck.
+> fail visibly so launchd/systemd/Docker can restart instead of staying stuck. This release also pauses accountless Cloudflare Quick Tunnel creation after `429` / `1015` rate limits; persistent relays should use a named tunnel or `IICP_PUBLIC_ENDPOINT`.
 
 Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.72"
+iicp-client = "0.7.73"
 ```
 
 To run a provider node from the command line, install the `iicp-node` binary:
@@ -47,7 +47,7 @@ node so identity and cached node tokens are preserved.
 If a node is older than 0.7.67, perform one manual upgrade/restart first,
 especially for Dockerized Python or TypeScript providers: early updater wiring
 did not reliably cover every normal `serve` path. For Docker, use a restart
-policy such as `--restart unless-stopped` so 0.7.72 can intentionally exit from
+policy such as `--restart unless-stopped` so 0.7.73 can intentionally exit from
 a confirmed tunnel-dead state and let Docker bring it back cleanly.
 
 

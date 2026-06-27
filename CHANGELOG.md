@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.73] — 2026-06-27
+
+### Fixed — Quick Tunnel rate-limit backoff
+- Accountless Cloudflare Quick Tunnel startup now opens a process-local cooldown when `cloudflared` reports rate limiting (`429` / `1015`) so retries do not hammer Cloudflare; operators should use a named tunnel or `IICP_PUBLIC_ENDPOINT` for persistent relay infrastructure.
+
 ## [0.7.72] — 2026-06-26
 
 ### Fixed — Quick Tunnel DNS-lag stability

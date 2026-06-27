@@ -19,7 +19,7 @@ use std::collections::VecDeque;
 use std::io::BufRead;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// cloudflared usually prints the URL within ~5 s; 20 s covers slow first runs.
@@ -39,6 +39,9 @@ pub const TUNNEL_HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 pub const TUNNEL_HEALTH_MAX_FAILS: u32 = 2;
 pub const TUNNEL_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const TUNNEL_DOH_TIMEOUT: Duration = Duration::from_secs(5);
+pub const TUNNEL_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+
+static QUICK_TUNNEL_RATE_LIMIT_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TunnelState {
@@ -79,6 +82,44 @@ fn error_message_is_likely_dns(message: &str) -> bool {
         || msg.contains("nodename nor servname")
         || msg.contains("name or service not known")
         || msg.contains("temporary failure in name resolution")
+}
+
+fn quick_tunnel_rate_limit_store() -> &'static Mutex<Option<Instant>> {
+    QUICK_TUNNEL_RATE_LIMIT_UNTIL.get_or_init(|| Mutex::new(None))
+}
+
+fn quick_tunnel_rate_limit_cooldown() -> Duration {
+    std::env::var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(TUNNEL_RATE_LIMIT_COOLDOWN)
+}
+
+fn quick_tunnel_rate_limit_remaining() -> Option<Duration> {
+    let guard = quick_tunnel_rate_limit_store().lock().unwrap();
+    let until = (*guard)?;
+    let remaining = until.saturating_duration_since(Instant::now());
+    (!remaining.is_zero()).then_some(remaining)
+}
+
+fn mark_quick_tunnel_rate_limited() -> Duration {
+    let cooldown = quick_tunnel_rate_limit_cooldown();
+    *quick_tunnel_rate_limit_store().lock().unwrap() = Some(Instant::now() + cooldown);
+    cooldown
+}
+
+fn cloudflared_output_is_rate_limited(lines: &VecDeque<String>) -> bool {
+    let joined = lines
+        .iter()
+        .map(|line| line.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.contains("429")
+        || joined.contains("too many requests")
+        || joined.contains("error code: 1015")
+        || joined.contains("rate limit")
 }
 
 async fn doh_has_answer(client: &reqwest::Client, host: &str, record_type: &str) -> bool {
@@ -619,6 +660,14 @@ fn spawn_and_parse(
     timeout: Duration,
     binary: &std::path::Path,
 ) -> Result<(Child, String), String> {
+    if let Some(remaining) = quick_tunnel_rate_limit_remaining() {
+        return Err(format!(
+            "accountless Quick Tunnel creation paused for {}s after Cloudflare rate limiting; \
+             retry later or configure a named tunnel / IICP_PUBLIC_ENDPOINT",
+            remaining.as_secs().max(1)
+        ));
+    }
+
     let mut child = Command::new(binary)
         .args(["tunnel", "--url", &format!("http://127.0.0.1:{local_port}")])
         .stdin(Stdio::null())
@@ -662,7 +711,7 @@ fn spawn_and_parse(
     let deadline = Instant::now() + timeout;
     let mut last_lines: VecDeque<String> = VecDeque::with_capacity(6);
     let error_with_output = |reason: &str, last_lines: &VecDeque<String>| {
-        if last_lines.is_empty() {
+        let mut out = if last_lines.is_empty() {
             reason.to_string()
         } else {
             format!(
@@ -673,7 +722,15 @@ fn spawn_and_parse(
                     .collect::<Vec<_>>()
                     .join(" | ")
             )
+        };
+        if cloudflared_output_is_rate_limited(last_lines) {
+            let cooldown = mark_quick_tunnel_rate_limited();
+            out.push_str(&format!(
+                "; accountless Quick Tunnel rate limit detected — pausing tunnel creation for {}s",
+                cooldown.as_secs()
+            ));
         }
+        out
     };
     let url = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -758,5 +815,19 @@ mod tests {
             "error trying to connect: dns error: failed to lookup address information: \
                  nodename nor servname provided, or not known"
         ));
+    }
+
+    #[test]
+    fn rate_limit_output_opens_process_local_cooldown() {
+        *quick_tunnel_rate_limit_store().lock().unwrap() = None;
+        let mut lines = VecDeque::new();
+        lines
+            .push_back("ERR Error unmarshaling QuickTunnel response: error code: 1015".to_string());
+        lines.push_back("status_code=\"429 Too Many Requests\"".to_string());
+        assert!(cloudflared_output_is_rate_limited(&lines));
+        let cooldown = mark_quick_tunnel_rate_limited();
+        assert!(cooldown.as_secs() >= 60);
+        assert!(quick_tunnel_rate_limit_remaining().is_some());
+        *quick_tunnel_rate_limit_store().lock().unwrap() = None;
     }
 }
