@@ -42,6 +42,11 @@ pub const TUNNEL_HEALTH_MAX_FAILS: u32 = 2;
 pub const TUNNEL_VERIFY_TIMEOUT: Duration = Duration::from_secs(30);
 pub const TUNNEL_DOH_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TUNNEL_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
+/// Host-wide spacing between accountless Quick Tunnel creation attempts. Cloudflare
+/// does not guarantee Quick Tunnel availability for production use; multiple local
+/// IICP services must therefore avoid a create/verify/kill thundering herd.
+pub const TUNNEL_CREATE_MIN_INTERVAL: Duration = Duration::from_secs(120);
+pub const TUNNEL_CREATE_LEASE: Duration = Duration::from_secs(45);
 
 static QUICK_TUNNEL_RATE_LIMIT_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
@@ -123,6 +128,22 @@ fn quick_tunnel_rate_limit_state_path() -> PathBuf {
         })
 }
 
+fn quick_tunnel_create_state_path() -> PathBuf {
+    std::env::var_os("IICP_TUNNEL_CREATE_STATE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            iicp_home()
+                .join("state")
+                .join("quick_tunnel_create_gate.json")
+        })
+}
+
+fn quick_tunnel_create_lock_path() -> PathBuf {
+    std::env::var_os("IICP_TUNNEL_CREATE_LOCK_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| iicp_home().join("state").join("quick_tunnel_create.lock"))
+}
+
 fn read_persistent_rate_limit_until() -> Option<f64> {
     let path = quick_tunnel_rate_limit_state_path();
     let raw = match fs::read_to_string(&path) {
@@ -152,6 +173,189 @@ fn read_persistent_rate_limit_until() -> Option<f64> {
         .filter(|until| *until > 0.0)
 }
 
+fn read_json_field_f64(path: &Path, field: &str) -> Option<f64> {
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            eprintln!(
+                "[quick-tunnel] ignoring unreadable state {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "[quick-tunnel] ignoring invalid state {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    value
+        .get(field)
+        .and_then(|v| v.as_f64())
+        .filter(|v| *v > 0.0)
+}
+
+fn duration_until_epoch(until_epoch_seconds: f64) -> Option<Duration> {
+    let remaining = until_epoch_seconds - epoch_seconds_now();
+    (remaining > 0.0).then(|| Duration::from_secs_f64(remaining))
+}
+
+fn quick_tunnel_create_min_interval() -> Duration {
+    std::env::var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(TUNNEL_CREATE_MIN_INTERVAL)
+}
+
+fn quick_tunnel_create_lease_duration() -> Duration {
+    std::env::var("IICP_TUNNEL_CREATE_LEASE_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(TUNNEL_CREATE_LEASE)
+}
+
+fn clear_create_gate_if_safe() {
+    let path = quick_tunnel_create_state_path();
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!(
+            "[quick-tunnel] could not clear expired create-gate state {}: {err}",
+            path.display()
+        ),
+    }
+}
+
+fn quick_tunnel_create_gate_remaining() -> Option<Duration> {
+    let path = quick_tunnel_create_state_path();
+    let until = read_json_field_f64(&path, "quick_tunnel_create_not_before")?;
+    match duration_until_epoch(until) {
+        Some(remaining) => Some(remaining),
+        None => {
+            clear_create_gate_if_safe();
+            None
+        }
+    }
+}
+
+fn mark_quick_tunnel_create_attempt() {
+    let interval = quick_tunnel_create_min_interval();
+    if interval.is_zero() {
+        clear_create_gate_if_safe();
+        return;
+    }
+    let path = quick_tunnel_create_state_path();
+    let payload = serde_json::json!({
+        "quick_tunnel_create_not_before": epoch_seconds_now() + interval.as_secs_f64(),
+        "interval_s": interval.as_secs_f64(),
+        "pid": std::process::id(),
+        "reason": "host_wide_quick_tunnel_creation_pacing",
+    });
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_file_name(format!(
+            "{}.tmp.{}",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("quick_tunnel_create_gate.json"),
+            std::process::id()
+        ));
+        let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
+        fs::write(&tmp, bytes)?;
+        fs::rename(tmp, &path)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!(
+            "[quick-tunnel] could not persist create-gate state {}: {err}",
+            path.display()
+        );
+    }
+}
+
+#[derive(Debug)]
+struct QuickTunnelCreateLease {
+    path: PathBuf,
+}
+
+impl Drop for QuickTunnelCreateLease {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn acquire_quick_tunnel_create_lease() -> Result<QuickTunnelCreateLease, Duration> {
+    let path = quick_tunnel_create_lock_path();
+    let lease = quick_tunnel_create_lease_duration();
+    let now = epoch_seconds_now();
+    if let Some(parent) = path.parent() {
+        if let Err(err) = fs::create_dir_all(parent) {
+            eprintln!(
+                "[quick-tunnel] could not create lock dir {}: {err}; continuing without lock",
+                parent.display()
+            );
+            return Ok(QuickTunnelCreateLease {
+                path: PathBuf::new(),
+            });
+        }
+    }
+
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                use std::io::Write;
+                let payload = serde_json::json!({
+                    "pid": std::process::id(),
+                    "expires_at": now + lease.as_secs_f64(),
+                    "lease_s": lease.as_secs_f64(),
+                    "reason": "host_wide_quick_tunnel_creation_lock",
+                });
+                let bytes = serde_json::to_vec_pretty(&payload)
+                    .map_err(|_| lease)
+                    .unwrap_or_default();
+                let _ = file.write_all(&bytes);
+                return Ok(QuickTunnelCreateLease { path });
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                let expires = read_json_field_f64(&path, "expires_at").unwrap_or(0.0);
+                if let Some(remaining) = duration_until_epoch(expires) {
+                    return Err(remaining);
+                }
+                let _ = fs::remove_file(&path);
+                continue;
+            }
+            Err(err) => {
+                eprintln!(
+                    "[quick-tunnel] could not acquire create lock {}: {err}; continuing without lock",
+                    path.display()
+                );
+                return Ok(QuickTunnelCreateLease {
+                    path: PathBuf::new(),
+                });
+            }
+        }
+    }
+
+    Err(lease)
+}
+
 fn clear_persistent_rate_limit_if_safe() {
     let path = quick_tunnel_rate_limit_state_path();
     match fs::remove_file(&path) {
@@ -166,12 +370,12 @@ fn clear_persistent_rate_limit_if_safe() {
 
 fn persistent_rate_limit_remaining() -> Option<Duration> {
     let until = read_persistent_rate_limit_until()?;
-    let remaining = until - epoch_seconds_now();
-    if remaining <= 0.0 {
-        clear_persistent_rate_limit_if_safe();
-        None
-    } else {
-        Some(Duration::from_secs_f64(remaining))
+    match duration_until_epoch(until) {
+        Some(remaining) => Some(remaining),
+        None => {
+            clear_persistent_rate_limit_if_safe();
+            None
+        }
     }
 }
 
@@ -227,15 +431,25 @@ fn mark_quick_tunnel_rate_limited() -> Duration {
 }
 
 fn rate_limit_pause_from_error(error: &str) -> Option<Duration> {
-    let marker = "paused for ";
-    let after = error.split(marker).nth(1)?;
-    let seconds = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse::<u64>()
-        .ok()?;
-    (seconds > 0).then_some(Duration::from_secs(seconds))
+    for marker in [
+        "paused for ",
+        "paced for ",
+        "held by another local IICP node for ",
+    ] {
+        let Some(after) = error.split(marker).nth(1) else {
+            continue;
+        };
+        let seconds = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()?;
+        if seconds > 0 {
+            return Some(Duration::from_secs(seconds));
+        }
+    }
+    None
 }
 
 fn extend_retry_for_spawn_error(decision: TunnelDeadDecision, error: &str) -> TunnelDeadDecision {
@@ -804,6 +1018,24 @@ fn spawn_and_parse(
             remaining.as_secs().max(1)
         ));
     }
+    if let Some(remaining) = quick_tunnel_create_gate_remaining() {
+        return Err(format!(
+            "accountless Quick Tunnel creation paced for {}s to avoid Cloudflare rate limits; \
+             falling back to the previous reachability method while the tunnel budget recovers",
+            remaining.as_secs().max(1)
+        ));
+    }
+    let _create_lease = acquire_quick_tunnel_create_lease().map_err(|remaining| {
+        format!(
+            "accountless Quick Tunnel creation held by another local IICP node for {}s; \
+             falling back to the previous reachability method",
+            remaining.as_secs().max(1)
+        )
+    })?;
+    // Record the attempt before spawning cloudflared. This intentionally spaces
+    // both successful and failed creations across local nodes; otherwise a restart
+    // storm can hit Cloudflare before a 429/1015 cooldown marker exists.
+    mark_quick_tunnel_create_attempt();
 
     let mut child = Command::new(binary)
         .args(["tunnel", "--url", &format!("http://127.0.0.1:{local_port}")])
@@ -927,27 +1159,63 @@ mod tests {
             .lock()
             .unwrap();
         let old_state_file = std::env::var_os("IICP_TUNNEL_RATE_LIMIT_STATE_FILE");
+        let old_create_state_file = std::env::var_os("IICP_TUNNEL_CREATE_STATE_FILE");
+        let old_create_lock_file = std::env::var_os("IICP_TUNNEL_CREATE_LOCK_FILE");
         let old_cooldown = std::env::var_os("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S");
+        let old_create_interval = std::env::var_os("IICP_TUNNEL_CREATE_MIN_INTERVAL_S");
+        let old_create_lease = std::env::var_os("IICP_TUNNEL_CREATE_LEASE_S");
         let path = std::env::temp_dir().join(format!(
             "iicp-quick-tunnel-cooldown-{}.json",
             uuid::Uuid::new_v4()
         ));
+        let create_path = std::env::temp_dir().join(format!(
+            "iicp-quick-tunnel-create-gate-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        let lock_path = std::env::temp_dir().join(format!(
+            "iicp-quick-tunnel-create-lock-{}.json",
+            uuid::Uuid::new_v4()
+        ));
         std::env::set_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE", &path);
+        std::env::set_var("IICP_TUNNEL_CREATE_STATE_FILE", &create_path);
+        std::env::set_var("IICP_TUNNEL_CREATE_LOCK_FILE", &lock_path);
         std::env::set_var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S", "60");
+        std::env::set_var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S", "60");
+        std::env::set_var("IICP_TUNNEL_CREATE_LEASE_S", "30");
         *quick_tunnel_rate_limit_store().lock().unwrap() = None;
         clear_persistent_rate_limit_if_safe();
+        clear_create_gate_if_safe();
+        let _ = fs::remove_file(&lock_path);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
 
         *quick_tunnel_rate_limit_store().lock().unwrap() = None;
         clear_persistent_rate_limit_if_safe();
+        clear_create_gate_if_safe();
+        let _ = fs::remove_file(&lock_path);
         match old_state_file {
             Some(value) => std::env::set_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE", value),
             None => std::env::remove_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE"),
         }
+        match old_create_state_file {
+            Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_STATE_FILE", value),
+            None => std::env::remove_var("IICP_TUNNEL_CREATE_STATE_FILE"),
+        }
+        match old_create_lock_file {
+            Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_LOCK_FILE", value),
+            None => std::env::remove_var("IICP_TUNNEL_CREATE_LOCK_FILE"),
+        }
         match old_cooldown {
             Some(value) => std::env::set_var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S", value),
             None => std::env::remove_var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S"),
+        }
+        match old_create_interval {
+            Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S", value),
+            None => std::env::remove_var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S"),
+        }
+        match old_create_lease {
+            Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_LEASE_S", value),
+            None => std::env::remove_var("IICP_TUNNEL_CREATE_LEASE_S"),
         }
 
         match result {
@@ -1024,6 +1292,33 @@ mod tests {
     }
 
     #[test]
+    fn quick_tunnel_creation_gate_spaces_local_services() {
+        with_temp_rate_limit_state(|| {
+            assert!(quick_tunnel_create_gate_remaining().is_none());
+            mark_quick_tunnel_create_attempt();
+            let remaining =
+                quick_tunnel_create_gate_remaining().expect("create gate should be active");
+            assert!(remaining.as_secs() >= 1);
+            assert!(remaining <= quick_tunnel_create_min_interval());
+        });
+    }
+
+    #[test]
+    fn quick_tunnel_creation_lease_serializes_parallel_spawns() {
+        with_temp_rate_limit_state(|| {
+            let lease = acquire_quick_tunnel_create_lease().expect("first lease acquired");
+            let blocked = acquire_quick_tunnel_create_lease()
+                .expect_err("second local node should be paced by the active lease");
+            assert!(blocked.as_secs() >= 1);
+            drop(lease);
+            assert!(
+                acquire_quick_tunnel_create_lease().is_ok(),
+                "lease should release on drop"
+            );
+        });
+    }
+
+    #[test]
     fn managed_retry_delay_respects_persistent_rate_limit_pause() {
         let decision = extend_retry_for_spawn_error(
             TunnelDeadDecision::RetryAfter(Duration::from_secs(300)),
@@ -1033,6 +1328,19 @@ mod tests {
         assert_eq!(
             decision,
             TunnelDeadDecision::RetryAfter(Duration::from_secs(599))
+        );
+    }
+
+    #[test]
+    fn managed_retry_delay_respects_create_pacing_pause() {
+        let decision = extend_retry_for_spawn_error(
+            TunnelDeadDecision::RetryAfter(Duration::from_secs(30)),
+            "accountless Quick Tunnel creation paced for 119s to avoid Cloudflare rate limits",
+        );
+
+        assert_eq!(
+            decision,
+            TunnelDeadDecision::RetryAfter(Duration::from_secs(119))
         );
     }
 }

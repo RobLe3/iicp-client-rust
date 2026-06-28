@@ -7,7 +7,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use iicp_client::tunnel::{
     open_quick_tunnel_with, TunnelDeadDecision, TunnelState, INSTALL_HINT, MAX_RESPAWNS,
@@ -35,6 +35,51 @@ fn fake_bin(name: &str, lifetime_secs: f64, silent: bool) -> std::path::PathBuf 
     file
 }
 
+fn with_isolated_tunnel_state<T>(f: impl FnOnce() -> T) -> T {
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = ENV_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+    let dir = std::env::temp_dir().join(format!("iicp-tunnel-state-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let old_rate = std::env::var_os("IICP_TUNNEL_RATE_LIMIT_STATE_FILE");
+    let old_create = std::env::var_os("IICP_TUNNEL_CREATE_STATE_FILE");
+    let old_lock = std::env::var_os("IICP_TUNNEL_CREATE_LOCK_FILE");
+    let old_interval = std::env::var_os("IICP_TUNNEL_CREATE_MIN_INTERVAL_S");
+    std::env::set_var(
+        "IICP_TUNNEL_RATE_LIMIT_STATE_FILE",
+        dir.join("rate_limit.json"),
+    );
+    std::env::set_var(
+        "IICP_TUNNEL_CREATE_STATE_FILE",
+        dir.join("create_gate.json"),
+    );
+    std::env::set_var("IICP_TUNNEL_CREATE_LOCK_FILE", dir.join("create.lock"));
+    std::env::set_var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S", "0");
+
+    let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+    match old_rate {
+        Some(value) => std::env::set_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE", value),
+        None => std::env::remove_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE"),
+    }
+    match old_create {
+        Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_STATE_FILE", value),
+        None => std::env::remove_var("IICP_TUNNEL_CREATE_STATE_FILE"),
+    }
+    match old_lock {
+        Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_LOCK_FILE", value),
+        None => std::env::remove_var("IICP_TUNNEL_CREATE_LOCK_FILE"),
+    }
+    match old_interval {
+        Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S", value),
+        None => std::env::remove_var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+    match out {
+        Ok(value) => value,
+        Err(payload) => std::panic::resume_unwind(payload),
+    }
+}
+
 #[test]
 fn install_hint_is_actionable() {
     assert!(INSTALL_HINT.contains("brew install cloudflared"));
@@ -43,144 +88,158 @@ fn install_hint_is_actionable() {
 
 #[test]
 fn initiation_parses_url_from_output() {
-    let t = open_quick_tunnel_with(
-        9484,
-        Duration::from_secs(10),
-        &fake_bin("fake-fox-1234", 60.0, false),
-    )
-    .expect("tunnel opens");
-    assert_eq!(t.url, "https://fake-fox-1234.trycloudflare.com");
-    assert_eq!(t.local_port, 9484);
-    assert!(t.is_running());
-    t.close();
+    with_isolated_tunnel_state(|| {
+        let t = open_quick_tunnel_with(
+            9484,
+            Duration::from_secs(10),
+            &fake_bin("fake-fox-1234", 60.0, false),
+        )
+        .expect("tunnel opens");
+        assert_eq!(t.url, "https://fake-fox-1234.trycloudflare.com");
+        assert_eq!(t.local_port, 9484);
+        assert!(t.is_running());
+        t.close();
+    });
 }
 
 #[test]
 fn elastic_watchdog_can_retry_after_dead_policy() {
-    let bin = fake_bin("dead-retry", 0.01, false);
-    let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let calls_for_dead = Arc::clone(&calls);
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
-    let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
-    let tx_for_dead = Arc::clone(&tx);
-    t.watch_elastic_with_probe_and_dead_policy(
-        t.url.clone(),
-        |_url| {},
-        |_state| {},
-        move || {
-            let n = calls_for_dead.fetch_add(1, Ordering::SeqCst) + 1;
-            if n == 1 {
-                TunnelDeadDecision::RetryAfter(Duration::from_millis(0))
-            } else {
-                if let Some(tx) = tx_for_dead.lock().unwrap().take() {
-                    let _ = tx.send(());
+    with_isolated_tunnel_state(|| {
+        let bin = fake_bin("dead-retry", 0.01, false);
+        let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_dead = Arc::clone(&calls);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
+        let tx_for_dead = Arc::clone(&tx);
+        t.watch_elastic_with_probe_and_dead_policy(
+            t.url.clone(),
+            |_url| {},
+            |_state| {},
+            move || {
+                let n = calls_for_dead.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == 1 {
+                    TunnelDeadDecision::RetryAfter(Duration::from_millis(0))
+                } else {
+                    if let Some(tx) = tx_for_dead.lock().unwrap().take() {
+                        let _ = tx.send(());
+                    }
+                    TunnelDeadDecision::Stop
                 }
-                TunnelDeadDecision::Stop
-            }
-        },
-        Arc::new(|_url| false),
-        Duration::from_millis(20),
-        Duration::from_secs(0),
-    );
-    rx.recv_timeout(Duration::from_secs(30))
-        .expect("dead retry policy should re-enter recovery before stopping");
-    assert!(calls.load(Ordering::SeqCst) >= 2);
-    t.close();
+            },
+            Arc::new(|_url| false),
+            Duration::from_millis(20),
+            Duration::from_secs(0),
+        );
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("dead retry policy should re-enter recovery before stopping");
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+        t.close();
+    });
 }
 
 #[test]
 fn initiation_times_out_when_silent() {
-    let err = match open_quick_tunnel_with(
-        9484,
-        Duration::from_millis(500),
-        &fake_bin("x", 60.0, true),
-    ) {
-        Ok(_) => panic!("must time out"),
-        Err(e) => e,
-    };
-    assert!(err.contains("no tunnel URL"), "{err}");
+    with_isolated_tunnel_state(|| {
+        let err = match open_quick_tunnel_with(
+            9484,
+            Duration::from_millis(500),
+            &fake_bin("x", 60.0, true),
+        ) {
+            Ok(_) => panic!("must time out"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no tunnel URL"), "{err}");
+    });
 }
 
 #[test]
 fn teardown_close_kills_child_and_is_idempotent() {
-    let t =
-        open_quick_tunnel_with(9484, Duration::from_secs(10), &fake_bin("f", 60.0, false)).unwrap();
-    assert!(t.is_running());
-    t.close();
-    assert!(!t.is_running());
-    t.close(); // idempotent — must not panic
+    with_isolated_tunnel_state(|| {
+        let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &fake_bin("f", 60.0, false))
+            .unwrap();
+        assert!(t.is_running());
+        t.close();
+        assert!(!t.is_running());
+        t.close(); // idempotent — must not panic
+    });
 }
 
 #[test]
 fn supervision_respawns_with_new_url() {
-    let bin = fake_bin("resp", 60.0, false);
-    let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<String>();
-    t.watch(
-        t.url.clone(),
-        move |url| {
-            let _ = tx.send(url);
-        },
-        || {},
-    );
-    // Simulate unexpected death: kill via close-like external signal — use the
-    // child pid through is_running polling; easiest: kill the whole fake by name
-    // is flaky — instead use a short-lived child variant below for give-up; here
-    // kill by sending SIGKILL to the child via libc is overkill. Use lifetime:
-    // respawn path is covered by the give-up test; assert watch() arms cleanly.
-    drop(rx);
-    t.close();
+    with_isolated_tunnel_state(|| {
+        let bin = fake_bin("resp", 60.0, false);
+        let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        t.watch(
+            t.url.clone(),
+            move |url| {
+                let _ = tx.send(url);
+            },
+            || {},
+        );
+        // Simulate unexpected death: kill via close-like external signal — use the
+        // child pid through is_running polling; easiest: kill the whole fake by name
+        // is flaky — instead use a short-lived child variant below for give-up; here
+        // kill by sending SIGKILL to the child via libc is overkill. Use lifetime:
+        // respawn path is covered by the give-up test; assert watch() arms cleanly.
+        drop(rx);
+        t.close();
+    });
 }
 
 #[test]
 fn supervision_gives_up_after_max_respawns() {
-    // Child dies ~instantly after printing → every respawn dies too.
-    let bin = fake_bin("dies", 0.05, false);
-    let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
-    let (tx, rx) = std::sync::mpsc::channel::<()>();
-    t.watch(
-        t.url.clone(),
-        |_url| {},
-        move || {
-            let _ = tx.send(());
-        },
-    );
-    rx.recv_timeout(Duration::from_secs(30))
-        .expect("on_dead fires");
-    assert!(t.respawns() >= 1);
-    t.close();
+    with_isolated_tunnel_state(|| {
+        // Child dies ~instantly after printing → every respawn dies too.
+        let bin = fake_bin("dies", 0.05, false);
+        let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        t.watch(
+            t.url.clone(),
+            |_url| {},
+            move || {
+                let _ = tx.send(());
+            },
+        );
+        rx.recv_timeout(Duration::from_secs(30))
+            .expect("on_dead fires");
+        assert!(t.respawns() >= 1);
+        t.close();
+    });
 }
 
 #[test]
 fn elastic_watchdog_marks_twilight_then_rebuilds_after_public_health_recovers() {
-    let bin = fake_bin("elastic", 60.0, false);
-    let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let probe_calls = Arc::clone(&calls);
-    let probe = Arc::new(move |_url: &str| probe_calls.fetch_add(1, Ordering::SeqCst) >= 2);
-    let (state_tx, state_rx) = std::sync::mpsc::channel::<TunnelState>();
-    let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
-    t.watch_elastic_with_probe(
-        t.url.clone(),
-        move |url| {
-            let _ = url_tx.send(url);
-        },
-        move |state| {
-            let _ = state_tx.send(state);
-        },
-        || {},
-        probe,
-        Duration::from_millis(20),
-        Duration::from_secs(2),
-    );
-    let verified = url_rx
-        .recv_timeout(Duration::from_secs(10))
-        .expect("elastic watchdog verifies rebuilt tunnel");
-    assert_eq!(verified, "https://elastic.trycloudflare.com");
-    let states: Vec<TunnelState> = state_rx.try_iter().collect();
-    assert!(states.contains(&TunnelState::Twilight), "{states:?}");
-    assert!(states.contains(&TunnelState::Recovering), "{states:?}");
-    assert!(states.contains(&TunnelState::Ready), "{states:?}");
-    t.close();
+    with_isolated_tunnel_state(|| {
+        let bin = fake_bin("elastic", 60.0, false);
+        let t = open_quick_tunnel_with(9484, Duration::from_secs(10), &bin).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = Arc::clone(&calls);
+        let probe = Arc::new(move |_url: &str| probe_calls.fetch_add(1, Ordering::SeqCst) >= 2);
+        let (state_tx, state_rx) = std::sync::mpsc::channel::<TunnelState>();
+        let (url_tx, url_rx) = std::sync::mpsc::channel::<String>();
+        t.watch_elastic_with_probe(
+            t.url.clone(),
+            move |url| {
+                let _ = url_tx.send(url);
+            },
+            move |state| {
+                let _ = state_tx.send(state);
+            },
+            || {},
+            probe,
+            Duration::from_millis(20),
+            Duration::from_secs(2),
+        );
+        let verified = url_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("elastic watchdog verifies rebuilt tunnel");
+        assert_eq!(verified, "https://elastic.trycloudflare.com");
+        let states: Vec<TunnelState> = state_rx.try_iter().collect();
+        assert!(states.contains(&TunnelState::Twilight), "{states:?}");
+        assert!(states.contains(&TunnelState::Recovering), "{states:?}");
+        assert!(states.contains(&TunnelState::Ready), "{states:?}");
+        t.close();
+    });
 }

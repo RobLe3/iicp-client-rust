@@ -118,15 +118,25 @@ fn should_exit_for_unrecovered_public_fallback(policy: TunnelDeadPolicy, supervi
 }
 
 fn public_fallback_retry_delay_hint(error: &str) -> Option<Duration> {
-    let marker = "paused for ";
-    let after = error.split(marker).nth(1)?;
-    let seconds = after
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse::<u64>()
-        .ok()?;
-    (seconds > 0).then_some(Duration::from_secs(seconds))
+    for marker in [
+        "paused for ",
+        "paced for ",
+        "held by another local IICP node for ",
+    ] {
+        let Some(after) = error.split(marker).nth(1) else {
+            continue;
+        };
+        let seconds = after
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse::<u64>()
+            .ok()?;
+        if seconds > 0 {
+            return Some(Duration::from_secs(seconds));
+        }
+    }
+    None
 }
 
 fn exit_if_supervised_public_fallback_unrecovered(tunnel_error: Option<&str>) {
@@ -2079,6 +2089,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // Held for the serve lifetime; Drop/close() tears the child down.
     let mut tunnel: Option<iicp_client::tunnel::QuickTunnel> = None;
     let mut tunnel_public_fallback_required = false;
+    let mut quick_tunnel_attempted = false;
     let mut last_tunnel_start_error: Option<String> = None;
     #[cfg(feature = "nat")]
     let mut nat_profile_for_fallback: Option<iicp_client::nat_detection::NatProfile> = None;
@@ -2334,6 +2345,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                         "[iicp-node] NAT tier={}: opening Quick Tunnel (rung 5) for an autonomous public endpoint…",
                         profile.tier
                     );
+                    quick_tunnel_attempted = true;
                     match try_tunnel_rung(opts.port, false) {
                         Ok(t) => {
                             apply_tunnel_profile(&mut node, &t.url);
@@ -2378,6 +2390,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // #520 — `--tunnel` forces rung 5 regardless of NAT tier.
     if opts.tunnel == Some(true) && tunnel.is_none() {
         tunnel_public_fallback_required = true;
+        quick_tunnel_attempted = true;
         match try_tunnel_rung(opts.port, true) {
             Ok(t) => {
                 apply_tunnel_profile(&mut node, &t.url);
@@ -2406,17 +2419,23 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             tier0_pinhole.as_ref(),
         ) {
             tunnel_public_fallback_required = true;
-            eprintln!(
-                "[iicp-node] direct endpoint needs public fallback ({reason}) — opening Quick Tunnel automatically…"
-            );
-            match try_tunnel_rung(opts.port, false) {
-                Ok(t) => {
-                    apply_tunnel_profile(&mut node, &t.url);
-                    opts.public_endpoint = t.url.clone();
-                    tunnel = Some(t);
-                }
-                Err(e) => {
-                    last_tunnel_start_error = Some(e);
+            if quick_tunnel_attempted {
+                eprintln!(
+                    "[iicp-node] direct endpoint needs public fallback ({reason}) — Quick Tunnel was already attempted for this startup; falling back to the previous method."
+                );
+            } else {
+                eprintln!(
+                    "[iicp-node] direct endpoint needs public fallback ({reason}) — opening Quick Tunnel automatically…"
+                );
+                match try_tunnel_rung(opts.port, false) {
+                    Ok(t) => {
+                        apply_tunnel_profile(&mut node, &t.url);
+                        opts.public_endpoint = t.url.clone();
+                        tunnel = Some(t);
+                    }
+                    Err(e) => {
+                        last_tunnel_start_error = Some(e);
+                    }
                 }
             }
             if tunnel.is_none() && opts.relay_worker_endpoint.is_empty() {
