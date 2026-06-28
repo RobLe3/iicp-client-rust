@@ -4,7 +4,11 @@
 [![Protocol](https://img.shields.io/badge/IICP-v1.7-indigo.svg)](https://iicp.network/spec)
 [![crates.io](https://img.shields.io/badge/crates.io-iicp--client-orange?logo=rust)](https://crates.io/crates/iicp-client)
 
-Official Rust client library for the [IICP protocol](https://iicp.network) — route AI agent tasks by intent across a self-organising mesh of provider nodes. No central broker. No hardcoded endpoints.
+Use the open AI mesh from your Rust app. Install the client, send an intent,
+and get a routed response from an IICP node.
+
+You do **not** need to run a node to try the client path. Consume first,
+provide later.
 
 ```
 urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
@@ -15,6 +19,83 @@ urn:iicp:intent:llm:chat:v1  →  discover  →  select  →  submit
 ```bash
 cargo add iicp-client
 ```
+
+Or add to `Cargo.toml` directly:
+
+```toml
+[dependencies]
+iicp-client = "0.7.75"
+```
+
+## One-line test
+
+Install the CLI and ask the mesh:
+
+```bash
+cargo install iicp-client
+iicp-node query "Hello, mesh."
+```
+
+What good looks like:
+
+```bash
+iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
+which iicp-node        # points to your Cargo bin directory
+iicp-node --version    # prints iicp-node 0.7.75 or newer
+```
+
+The query command contacts the public directory, discovers a matching live node,
+routes your prompt, and prints the response. No account, API key, or local node
+is required for this consumer path.
+
+## Use from Rust
+
+```rust
+use iicp_client::{ChatMessage, ClientConfig, IicpClient};
+
+#[tokio::main]
+async fn main() -> iicp_client::Result<()> {
+    let client = IicpClient::new(ClientConfig::default())?;
+    let reply = client.chat(
+        vec![ChatMessage { role: "user".into(), content: "Hello, mesh.".into() }],
+        None,
+    ).await?;
+
+    println!("{}", reply.choices[0].message.content);
+    Ok(())
+}
+```
+
+## Do I need to run a node?
+
+No. Running a node is only needed when you want to provide compute or tools to
+the mesh. Start as a client; run a node later when you want to contribute.
+
+## Migrate from existing AI tools
+
+Direct call:
+
+```rust
+// Before: call one vendor endpoint directly.
+// After: ask IICP to discover and route by capability.
+let reply = client.chat(
+    vec![ChatMessage { role: "user".into(), content: "Summarize this document.".into() }],
+    None,
+).await?;
+```
+
+Existing OpenAI-compatible tools:
+
+```bash
+cargo install iicp-client --features proxy
+iicp-node proxy
+export OPENAI_BASE_URL=http://127.0.0.1:9483/v1
+```
+
+Then point LangChain, Cursor, liteLLM or another OpenAI-compatible tool at that
+base URL. Full guide: <https://iicp.network/docs/proxy>
+
+## Provider upgrade note
 
 > **Upgrade note (0.7.75)** — upgrade provider nodes so Quick Tunnel endpoints
 > recover safely after sleep, idle, Cloudflare edge drops, and local DNS
@@ -27,19 +108,6 @@ cargo add iicp-client
 > cooldowns, respects retry hints, and falls back to the previous reachability
 > method while the tunnel budget recovers.
 > Persistent relays should use a named tunnel or `IICP_PUBLIC_ENDPOINT`.
-
-Or add to `Cargo.toml` directly:
-
-```toml
-[dependencies]
-iicp-client = "0.7.75"
-```
-
-To run a provider node from the command line, install the `iicp-node` binary:
-
-```bash
-cargo install iicp-client
-```
 
 ### Keeping provider nodes current
 
@@ -78,7 +146,7 @@ Consumer and provider can run in the same process. For production provider nodes
 
 ---
 
-## Quickstart
+## Library quickstart
 
 `chat()` discovers the best node and submits the task internally (SDK-01) — no
 manual node selection needed.
