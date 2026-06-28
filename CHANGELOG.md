@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.74] — 2026-06-28
+
+### Fixed — supervised Quick Tunnel recovery
+- Persisted accountless Cloudflare Quick Tunnel cooldown state so supervised restarts do not immediately re-trigger a `429` / `1015` storm.
+- Managed tunnel retry now honors Cloudflare `paused for Ns` hints instead of falling back to the shorter generic retry delay.
+- Supervised provider services now exit instead of advertising an unverified direct route when a required public tunnel or relay fallback cannot be established.
+- Public fallback exits sleep through parsed Cloudflare cooldown hints first, reducing launchd/systemd/Docker restart churn.
+
 ## [0.7.73] — 2026-06-27
 
 ### Fixed — Quick Tunnel rate-limit backoff

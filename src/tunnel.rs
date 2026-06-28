@@ -16,11 +16,13 @@
 //! orphans it).
 
 use std::collections::VecDeque;
+use std::fs;
 use std::io::BufRead;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// cloudflared usually prints the URL within ~5 s; 20 s covers slow first runs.
 pub const TUNNEL_START_TIMEOUT: Duration = Duration::from_secs(20);
@@ -97,17 +99,152 @@ fn quick_tunnel_rate_limit_cooldown() -> Duration {
         .unwrap_or(TUNNEL_RATE_LIMIT_COOLDOWN)
 }
 
+fn epoch_seconds_now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or_default()
+}
+
+fn iicp_home() -> PathBuf {
+    std::env::var_os("IICP_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".iicp")))
+        .unwrap_or_else(|| PathBuf::from(".iicp"))
+}
+
+fn quick_tunnel_rate_limit_state_path() -> PathBuf {
+    std::env::var_os("IICP_TUNNEL_RATE_LIMIT_STATE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            iicp_home()
+                .join("state")
+                .join("quick_tunnel_rate_limit.json")
+        })
+}
+
+fn read_persistent_rate_limit_until() -> Option<f64> {
+    let path = quick_tunnel_rate_limit_state_path();
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            eprintln!(
+                "[quick-tunnel] ignoring unreadable cooldown state {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            eprintln!(
+                "[quick-tunnel] ignoring invalid cooldown state {}: {err}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    value
+        .get("quick_tunnel_rate_limited_until")
+        .and_then(|v| v.as_f64())
+        .filter(|until| *until > 0.0)
+}
+
+fn clear_persistent_rate_limit_if_safe() {
+    let path = quick_tunnel_rate_limit_state_path();
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => eprintln!(
+            "[quick-tunnel] could not clear expired cooldown state {}: {err}",
+            path.display()
+        ),
+    }
+}
+
+fn persistent_rate_limit_remaining() -> Option<Duration> {
+    let until = read_persistent_rate_limit_until()?;
+    let remaining = until - epoch_seconds_now();
+    if remaining <= 0.0 {
+        clear_persistent_rate_limit_if_safe();
+        None
+    } else {
+        Some(Duration::from_secs_f64(remaining))
+    }
+}
+
+fn persist_rate_limit_until(until_epoch_seconds: f64, cooldown: Duration) {
+    let path = quick_tunnel_rate_limit_state_path();
+    let payload = serde_json::json!({
+        "quick_tunnel_rate_limited_until": until_epoch_seconds,
+        "cooldown_s": cooldown.as_secs_f64(),
+        "reason": "cloudflare_quick_tunnel_rate_limit",
+    });
+    let result = (|| -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("quick_tunnel_rate_limit.json")
+        ));
+        let bytes = serde_json::to_vec_pretty(&payload).map_err(std::io::Error::other)?;
+        fs::write(&tmp, bytes)?;
+        fs::rename(tmp, &path)?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        eprintln!(
+            "[quick-tunnel] could not persist cooldown state {}: {err}",
+            path.display()
+        );
+    }
+}
+
 fn quick_tunnel_rate_limit_remaining() -> Option<Duration> {
-    let guard = quick_tunnel_rate_limit_store().lock().unwrap();
-    let until = (*guard)?;
-    let remaining = until.saturating_duration_since(Instant::now());
-    (!remaining.is_zero()).then_some(remaining)
+    let process_remaining = {
+        let guard = quick_tunnel_rate_limit_store().lock().unwrap();
+        (*guard).and_then(|until| {
+            let remaining = until.saturating_duration_since(Instant::now());
+            (!remaining.is_zero()).then_some(remaining)
+        })
+    };
+    [process_remaining, persistent_rate_limit_remaining()]
+        .into_iter()
+        .flatten()
+        .max()
 }
 
 fn mark_quick_tunnel_rate_limited() -> Duration {
     let cooldown = quick_tunnel_rate_limit_cooldown();
     *quick_tunnel_rate_limit_store().lock().unwrap() = Some(Instant::now() + cooldown);
+    persist_rate_limit_until(epoch_seconds_now() + cooldown.as_secs_f64(), cooldown);
     cooldown
+}
+
+fn rate_limit_pause_from_error(error: &str) -> Option<Duration> {
+    let marker = "paused for ";
+    let after = error.split(marker).nth(1)?;
+    let seconds = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()?;
+    (seconds > 0).then_some(Duration::from_secs(seconds))
+}
+
+fn extend_retry_for_spawn_error(decision: TunnelDeadDecision, error: &str) -> TunnelDeadDecision {
+    match (decision, rate_limit_pause_from_error(error)) {
+        (TunnelDeadDecision::RetryAfter(delay), Some(rate_limit_delay)) => {
+            TunnelDeadDecision::RetryAfter(delay.max(rate_limit_delay))
+        }
+        (decision, _) => decision,
+    }
 }
 
 fn cloudflared_output_is_rate_limited(lines: &VecDeque<String>) -> bool {
@@ -588,7 +725,7 @@ impl QuickTunnel {
                         Err(e) => {
                             eprintln!("[quick-tunnel] respawn failed: {e}");
                             set_state(&mut state, TunnelState::Dead);
-                            match on_dead() {
+                            match extend_retry_for_spawn_error(on_dead(), &e) {
                                 TunnelDeadDecision::Stop => return,
                                 TunnelDeadDecision::RetryAfter(delay) => {
                                     eprintln!(
@@ -641,7 +778,7 @@ pub fn open_quick_tunnel(local_port: u16, timeout: Duration) -> Result<QuickTunn
 pub fn open_quick_tunnel_with(
     local_port: u16,
     timeout: Duration,
-    binary: &std::path::Path,
+    binary: &Path,
 ) -> Result<QuickTunnel, String> {
     let (child, url) = spawn_and_parse(local_port, timeout, binary)?;
     Ok(QuickTunnel {
@@ -658,7 +795,7 @@ pub fn open_quick_tunnel_with(
 fn spawn_and_parse(
     local_port: u16,
     timeout: Duration,
-    binary: &std::path::Path,
+    binary: &Path,
 ) -> Result<(Child, String), String> {
     if let Some(remaining) = quick_tunnel_rate_limit_remaining() {
         return Err(format!(
@@ -782,6 +919,43 @@ fn spawn_and_parse(
 mod tests {
     use super::*;
 
+    static RATE_LIMIT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_temp_rate_limit_state<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = RATE_LIMIT_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let old_state_file = std::env::var_os("IICP_TUNNEL_RATE_LIMIT_STATE_FILE");
+        let old_cooldown = std::env::var_os("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S");
+        let path = std::env::temp_dir().join(format!(
+            "iicp-quick-tunnel-cooldown-{}.json",
+            uuid::Uuid::new_v4()
+        ));
+        std::env::set_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE", &path);
+        std::env::set_var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S", "60");
+        *quick_tunnel_rate_limit_store().lock().unwrap() = None;
+        clear_persistent_rate_limit_if_safe();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+
+        *quick_tunnel_rate_limit_store().lock().unwrap() = None;
+        clear_persistent_rate_limit_if_safe();
+        match old_state_file {
+            Some(value) => std::env::set_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE", value),
+            None => std::env::remove_var("IICP_TUNNEL_RATE_LIMIT_STATE_FILE"),
+        }
+        match old_cooldown {
+            Some(value) => std::env::set_var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S", value),
+            None => std::env::remove_var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S"),
+        }
+
+        match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
+    }
+
     #[test]
     fn extract_url_matches_trycloudflare_only() {
         assert_eq!(
@@ -819,15 +993,46 @@ mod tests {
 
     #[test]
     fn rate_limit_output_opens_process_local_cooldown() {
-        *quick_tunnel_rate_limit_store().lock().unwrap() = None;
-        let mut lines = VecDeque::new();
-        lines
-            .push_back("ERR Error unmarshaling QuickTunnel response: error code: 1015".to_string());
-        lines.push_back("status_code=\"429 Too Many Requests\"".to_string());
-        assert!(cloudflared_output_is_rate_limited(&lines));
-        let cooldown = mark_quick_tunnel_rate_limited();
-        assert!(cooldown.as_secs() >= 60);
-        assert!(quick_tunnel_rate_limit_remaining().is_some());
-        *quick_tunnel_rate_limit_store().lock().unwrap() = None;
+        with_temp_rate_limit_state(|| {
+            let mut lines = VecDeque::new();
+            lines.push_back(
+                "ERR Error unmarshaling QuickTunnel response: error code: 1015".to_string(),
+            );
+            lines.push_back("status_code=\"429 Too Many Requests\"".to_string());
+            assert!(cloudflared_output_is_rate_limited(&lines));
+            let cooldown = mark_quick_tunnel_rate_limited();
+            assert!(cooldown.as_secs() >= 60);
+            assert!(quick_tunnel_rate_limit_remaining().is_some());
+        });
+    }
+
+    #[test]
+    fn rate_limit_cooldown_survives_process_local_reset() {
+        with_temp_rate_limit_state(|| {
+            let cooldown = mark_quick_tunnel_rate_limited();
+            assert!(cooldown.as_secs() >= 60);
+
+            // Simulate a supervised restart: in-process state is gone, but the
+            // node state directory still carries the Cloudflare cooldown marker.
+            *quick_tunnel_rate_limit_store().lock().unwrap() = None;
+
+            let remaining = quick_tunnel_rate_limit_remaining()
+                .expect("persistent cooldown should survive process-local reset");
+            assert!(remaining.as_secs() >= 1);
+            assert!(remaining <= cooldown);
+        });
+    }
+
+    #[test]
+    fn managed_retry_delay_respects_persistent_rate_limit_pause() {
+        let decision = extend_retry_for_spawn_error(
+            TunnelDeadDecision::RetryAfter(Duration::from_secs(300)),
+            "accountless Quick Tunnel creation paused for 599s after Cloudflare rate limiting",
+        );
+
+        assert_eq!(
+            decision,
+            TunnelDeadDecision::RetryAfter(Duration::from_secs(599))
+        );
     }
 }

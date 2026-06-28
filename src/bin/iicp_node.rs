@@ -110,6 +110,50 @@ fn tunnel_dead_retry_delay(attempt: u32) -> Duration {
     (TUNNEL_DEAD_RETRY_INITIAL * (1u32 << shift)).min(TUNNEL_DEAD_RETRY_MAX)
 }
 
+fn should_exit_for_unrecovered_public_fallback(policy: TunnelDeadPolicy, supervised: bool) -> bool {
+    matches!(
+        tunnel_dead_behavior(policy, supervised),
+        TunnelDeadBehavior::ExitProcess
+    )
+}
+
+fn public_fallback_retry_delay_hint(error: &str) -> Option<Duration> {
+    let marker = "paused for ";
+    let after = error.split(marker).nth(1)?;
+    let seconds = after
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse::<u64>()
+        .ok()?;
+    (seconds > 0).then_some(Duration::from_secs(seconds))
+}
+
+fn exit_if_supervised_public_fallback_unrecovered(tunnel_error: Option<&str>) {
+    if !should_exit_for_unrecovered_public_fallback(
+        tunnel_dead_policy_from_env(),
+        env_bool("IICP_SUPERVISED"),
+    ) {
+        return;
+    }
+    let detail = tunnel_error
+        .map(|e| format!(" Last tunnel error: {e}"))
+        .unwrap_or_default();
+    eprintln!(
+        "[iicp-node] public fallback is still unavailable after tunnel/relay attempts.{detail} \
+         Exiting with code {TUNNEL_DEAD_EXIT_CODE} so the supervisor can retry instead of \
+         advertising an unverified direct route."
+    );
+    if let Some(delay) = tunnel_error.and_then(public_fallback_retry_delay_hint) {
+        eprintln!(
+            "[iicp-node] respecting tunnel cooldown before supervisor retry: sleeping {}s.",
+            delay.as_secs()
+        );
+        std::thread::sleep(delay);
+    }
+    process::exit(TUNNEL_DEAD_EXIT_CODE);
+}
+
 /// Return the first bindable TCP port >= `start` on `host`.
 ///
 /// The official IICP port 9484 is the starting point; when running multiple
@@ -2034,6 +2078,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // #520 rung 5 — Quick Tunnel escalation state (see src/tunnel.rs).
     // Held for the serve lifetime; Drop/close() tears the child down.
     let mut tunnel: Option<iicp_client::tunnel::QuickTunnel> = None;
+    let mut tunnel_public_fallback_required = false;
+    let mut last_tunnel_start_error: Option<String> = None;
     #[cfg(feature = "nat")]
     let mut nat_profile_for_fallback: Option<iicp_client::nat_detection::NatProfile> = None;
 
@@ -2283,15 +2329,21 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         ) {
             match step {
                 "tunnel" => {
+                    tunnel_public_fallback_required = true;
                     eprintln!(
                         "[iicp-node] NAT tier={}: opening Quick Tunnel (rung 5) for an autonomous public endpoint…",
                         profile.tier
                     );
-                    tunnel = try_tunnel_rung(opts.port, false);
-                    if let Some(t) = &tunnel {
-                        apply_tunnel_profile(&mut node, &t.url);
-                        opts.public_endpoint = t.url.clone();
-                        break;
+                    match try_tunnel_rung(opts.port, false) {
+                        Ok(t) => {
+                            apply_tunnel_profile(&mut node, &t.url);
+                            opts.public_endpoint = t.url.clone();
+                            tunnel = Some(t);
+                            break;
+                        }
+                        Err(e) => {
+                            last_tunnel_start_error = Some(e);
+                        }
                     }
                 }
                 "relay" => {
@@ -2325,10 +2377,16 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     // #520 — `--tunnel` forces rung 5 regardless of NAT tier.
     if opts.tunnel == Some(true) && tunnel.is_none() {
-        tunnel = try_tunnel_rung(opts.port, true);
-        if let Some(t) = &tunnel {
-            apply_tunnel_profile(&mut node, &t.url);
-            opts.public_endpoint = t.url.clone();
+        tunnel_public_fallback_required = true;
+        match try_tunnel_rung(opts.port, true) {
+            Ok(t) => {
+                apply_tunnel_profile(&mut node, &t.url);
+                opts.public_endpoint = t.url.clone();
+                tunnel = Some(t);
+            }
+            Err(e) => {
+                last_tunnel_start_error = Some(e);
+            }
         }
     }
     // Maximum-adoption fallback: if direct serving is local/private, IPv6-only
@@ -2347,14 +2405,21 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             nat_profile_for_fallback.as_ref(),
             tier0_pinhole.as_ref(),
         ) {
+            tunnel_public_fallback_required = true;
             eprintln!(
                 "[iicp-node] direct endpoint needs public fallback ({reason}) — opening Quick Tunnel automatically…"
             );
-            tunnel = try_tunnel_rung(opts.port, false);
-            if let Some(t) = &tunnel {
-                apply_tunnel_profile(&mut node, &t.url);
-                opts.public_endpoint = t.url.clone();
-            } else if opts.relay_worker_endpoint.is_empty() {
+            match try_tunnel_rung(opts.port, false) {
+                Ok(t) => {
+                    apply_tunnel_profile(&mut node, &t.url);
+                    opts.public_endpoint = t.url.clone();
+                    tunnel = Some(t);
+                }
+                Err(e) => {
+                    last_tunnel_start_error = Some(e);
+                }
+            }
+            if tunnel.is_none() && opts.relay_worker_endpoint.is_empty() {
                 eprintln!(
                     "[iicp-node] no tunnel available — auto-electing a relay from directory (last resort)…"
                 );
@@ -2370,6 +2435,13 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 }
             }
         }
+    }
+    if tunnel_public_fallback_required
+        && tunnel.is_none()
+        && opts.relay_worker_endpoint.is_empty()
+        && !opts.skip_registration
+    {
+        exit_if_supervised_public_fallback_unrecovered(last_tunnel_start_error.as_deref());
     }
     if let Some(t) = &tunnel {
         // #527/#elastic-tunnel — Quick Tunnel URLs rotate per process. The elastic
@@ -3577,14 +3649,14 @@ async fn main() {
 
 // ── #520 rung 5 helpers ───────────────────────────────────────────────────────
 
-/// Open a Quick Tunnel for rung 5, or None (missing binary / startup failure).
-fn try_tunnel_rung(port: u16, forced: bool) -> Option<iicp_client::tunnel::QuickTunnel> {
+/// Open a Quick Tunnel for rung 5.
+fn try_tunnel_rung(port: u16, forced: bool) -> Result<iicp_client::tunnel::QuickTunnel, String> {
     use iicp_client::tunnel::{
         cloudflared_path, open_quick_tunnel, INSTALL_HINT, TUNNEL_START_TIMEOUT,
     };
     if cloudflared_path().is_none() {
         eprintln!("[iicp-node] {INSTALL_HINT}");
-        return None;
+        return Err(INSTALL_HINT.to_string());
     }
     match open_quick_tunnel(port, TUNNEL_START_TIMEOUT) {
         Ok(t) => {
@@ -3594,11 +3666,11 @@ fn try_tunnel_rung(port: u16, forced: bool) -> Option<iicp_client::tunnel::Quick
                 if forced { " (forced)" } else { "" },
                 t.url
             );
-            Some(t)
+            Ok(t)
         }
         Err(e) => {
             eprintln!("[iicp-node] Quick Tunnel failed to start: {e} — continuing without it");
-            None
+            Err(e)
         }
     }
 }
@@ -3823,6 +3895,41 @@ mod tests {
             tunnel_dead_behavior(TunnelDeadPolicy::LogOnly, true),
             TunnelDeadBehavior::LogOnly
         );
+    }
+
+    #[test]
+    fn supervised_public_fallback_failure_exits_in_auto_or_exit_policy_only() {
+        assert!(should_exit_for_unrecovered_public_fallback(
+            TunnelDeadPolicy::Auto,
+            true
+        ));
+        assert!(should_exit_for_unrecovered_public_fallback(
+            TunnelDeadPolicy::Exit,
+            false
+        ));
+        assert!(!should_exit_for_unrecovered_public_fallback(
+            TunnelDeadPolicy::Auto,
+            false
+        ));
+        assert!(!should_exit_for_unrecovered_public_fallback(
+            TunnelDeadPolicy::Retry,
+            true
+        ));
+        assert!(!should_exit_for_unrecovered_public_fallback(
+            TunnelDeadPolicy::LogOnly,
+            true
+        ));
+    }
+
+    #[test]
+    fn public_fallback_retry_delay_hint_parses_cloudflare_pause() {
+        assert_eq!(
+            public_fallback_retry_delay_hint(
+                "accountless Quick Tunnel creation paused for 599s after Cloudflare rate limiting"
+            ),
+            Some(Duration::from_secs(599))
+        );
+        assert_eq!(public_fallback_retry_delay_hint("different error"), None);
     }
 
     #[test]
