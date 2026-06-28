@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.75] — 2026-06-28
+
+### Fixed — host-wide Quick Tunnel pacing
+- Accountless Cloudflare Quick Tunnel creation now uses host-wide create spacing, a short create lease, and persistent provider-rate-limit cooldown so Dockerized or launchd-managed nodes do not retry-storm while Cloudflare limits recover.
+- When tunnel creation is paced, cooling down, or held by another local node, providers fall back to the next safe reachability path instead of advertising an unverified public route.
+
 ## [0.7.74] — 2026-06-28
 
 ### Fixed — supervised Quick Tunnel recovery
