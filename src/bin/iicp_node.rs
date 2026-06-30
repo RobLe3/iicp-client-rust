@@ -235,7 +235,7 @@ fn print_help() {
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
          \x20 serve                      Register and serve a node\n\
          \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\
-         \x20 credits                    Show this node's earned / spent / balance credits\n\
+         \x20 credits                    Show your operator wallet plus this node's credit ledger\n\
          \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\
          \x20 operator encrypt           Password-encrypt the operator secret at rest ($IICP_OPERATOR_PASSPHRASE)\n\
          \x20 operator decrypt           Remove at-rest encryption of the operator secret\n\
@@ -319,8 +319,8 @@ fn print_query_help() {
 fn print_credits_help() {
     print!(
         "usage: iicp-node credits [options]\n\n\
-         Show this node's earned / spent / balance from the directory's reconcile-checked\n\
-         summary. With no --node/--node-id, a single saved node (or `default`) is used.\n\n\
+         Show your operator wallet when available, plus this node's reconcile-checked\n\
+         ledger. With no --node/--node-id, a single saved node (or `default`) is used.\n\n\
          Options:\n\
          \x20 --node NAME           Load saved node config (~/.iicp/nodes/<NAME>.json)\n\
          \x20 --node-id ID          Node id to query (alternative to --node)\n\
@@ -1021,6 +1021,101 @@ async fn verify_credit_awards(
     Ok((verified_sum, verified, failed))
 }
 
+fn credits_summary_human(body: &serde_json::Value, label: &str) -> String {
+    credits_summary_human_with_wallet(body, label, true).0
+}
+
+fn credits_summary_human_with_wallet(
+    body: &serde_json::Value,
+    label: &str,
+    include_wallet: bool,
+) -> (String, bool) {
+    use std::fmt::Write;
+
+    let num = |k: &str| body.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let earned = num("total_earned");
+    let spent = num("total_spent");
+    let balance = num("balance");
+    let tx = body.get("tx_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let reconciles = body
+        .get("reconciles")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let tpc = body
+        .get("tokens_per_credit")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1000);
+    let mut out = String::new();
+    let mut wallet_printed = false;
+
+    if let Some(wallet) = body.get("operator_wallet").and_then(|v| v.as_object()) {
+        if include_wallet {
+            wallet_printed = true;
+            let fingerprint = wallet
+                .get("operator_fingerprint")
+                .and_then(|v| v.as_str())
+                .map(|f| format!(" · operator {f}"))
+                .unwrap_or_default();
+            let wallet_balance = wallet
+                .get("total_balance")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(balance);
+            let wallet_nodes = wallet
+                .get("node_count")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            let _ = writeln!(out, "IICP operator wallet{fingerprint}");
+            if let Some(total_earned) = wallet.get("total_earned").and_then(|v| v.as_f64()) {
+                let _ = writeln!(out, "  Total earned       {total_earned:>12.3}");
+            }
+            if let Some(total_spent) = wallet.get("total_spent").and_then(|v| v.as_f64()) {
+                let _ = writeln!(out, "  Total spent        {total_spent:>12.3}");
+            }
+            let _ = writeln!(out, "  ─────────────────────────────");
+            let wallet_check = match wallet.get("reconciles").and_then(|v| v.as_bool()) {
+                Some(true) => "✓ reconciles",
+                Some(false) => "✗ DOES NOT RECONCILE",
+                None => "rollup",
+            };
+            let _ = writeln!(
+                out,
+                "  Wallet balance     {wallet_balance:>12.3}   {wallet_check}   (≈ {} tokens)",
+                (wallet_balance * tpc as f64) as i64
+            );
+            let _ = writeln!(
+                out,
+                "  {wallet_nodes} linked node(s) · per-node audit below"
+            );
+            let _ = writeln!(out);
+        }
+        let _ = writeln!(out, "Node ledger — {label}");
+    } else {
+        let _ = writeln!(out, "IICP credits — {label}");
+        let _ = writeln!(
+            out,
+            "  Node-local ledger  bind an operator identity to combine nodes"
+        );
+    }
+    let _ = writeln!(out, "  Earned (income)   {earned:>12.3}");
+    let _ = writeln!(out, "  Spent             {spent:>12.3}");
+    let _ = writeln!(out, "  ─────────────────────────────");
+    let check = if reconciles {
+        "✓ reconciles"
+    } else {
+        "✗ DOES NOT RECONCILE"
+    };
+    let _ = writeln!(
+        out,
+        "  Balance           {balance:>12.3}   {check}   (≈ {} tokens)",
+        (balance * tpc as f64) as i64
+    );
+    let _ = writeln!(
+        out,
+        "  {tx} transactions · `iicp-node credits --json` for raw"
+    );
+    (out, wallet_printed)
+}
+
 /// Shared fetch+display logic for one node's credits summary.
 async fn fetch_and_display_credits(
     directory_url: &str,
@@ -1029,6 +1124,7 @@ async fn fetch_and_display_credits(
     label: &str,
     as_json: bool,
     verify: bool,
+    wallet_shown: Option<&mut bool>,
 ) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
@@ -1099,32 +1195,23 @@ async fn fetch_and_display_credits(
 
     let num = |k: &str| body.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0);
     let earned = num("total_earned");
-    let spent = num("total_spent");
-    let balance = num("balance");
-    let tx = body.get("tx_count").and_then(|v| v.as_u64()).unwrap_or(0);
     let reconciles = body
         .get("reconciles")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let tpc = body
-        .get("tokens_per_credit")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1000);
-
-    println!("IICP credits — {label}");
-    println!("  Earned (income)   {earned:>12.3}");
-    println!("  Spent             {spent:>12.3}");
-    println!("  ─────────────────────────────");
-    let check = if reconciles {
-        "✓ reconciles"
+    if wallet_shown.is_none() {
+        print!("{}", credits_summary_human(&body, label));
     } else {
-        "✗ DOES NOT RECONCILE"
-    };
-    println!(
-        "  Balance           {balance:>12.3}   {check}   (≈ {} tokens)",
-        (balance * tpc as f64) as i64
-    );
-    println!("  {tx} transactions · `iicp-node credits --json` for raw");
+        let include_wallet = wallet_shown.as_ref().map(|shown| !**shown).unwrap_or(true);
+        let (summary, printed_wallet) =
+            credits_summary_human_with_wallet(&body, label, include_wallet);
+        print!("{summary}");
+        if printed_wallet {
+            if let Some(shown) = wallet_shown {
+                *shown = true;
+            }
+        }
+    }
     if !reconciles {
         eprintln!(
             "[iicp-node] WARNING: balance != earned − spent — the ledger does not reconcile; do not trust these figures."
@@ -1160,7 +1247,7 @@ async fn fetch_and_display_credits(
 }
 
 /// `iicp-node credits [--node NAME] [--token T] [--directory-url U] [--json] [--verify]`
-/// — show this node's lifetime earned / spent / balance from the directory's
+/// — show the operator wallet plus this node's lifetime earned / spent / balance from the directory's
 /// reconcile-checked GET /v1/credits/summary (#456). The displayed figures come from the
 /// directory (not the local file), so editing the saved config cannot inflate them; the
 /// `reconciles` flag flags a ledger that doesn't add up. `--verify` cryptographically audits
@@ -1265,6 +1352,7 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                             // One node failing must not hide the others — show every
                             // node, then exit non-zero if any failed (2026-06-11).
                             let mut failed = 0usize;
+                            let mut wallet_shown = false;
                             for (i, (name, nid, tok, node_dir)) in multi.iter().enumerate() {
                                 if i > 0 {
                                     println!();
@@ -1278,6 +1366,7 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                                     name,
                                     as_json,
                                     verify,
+                                    Some(&mut wallet_shown),
                                 )
                                 .await
                                 {
@@ -1340,7 +1429,16 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
     )?;
 
     let label = node_name.as_deref().unwrap_or(&node_id).to_string();
-    fetch_and_display_credits(&directory_url, &node_id, &token, &label, as_json, verify).await
+    fetch_and_display_credits(
+        &directory_url,
+        &node_id,
+        &token,
+        &label,
+        as_json,
+        verify,
+        None,
+    )
+    .await
 }
 
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
@@ -4090,6 +4188,65 @@ mod tests {
             run_credits(&bad_args).await.is_err(),
             "a forged/wrong token must be rejected — local config cannot fabricate credits"
         );
+    }
+
+    #[test]
+    fn credits_human_output_shows_operator_wallet() {
+        let body = serde_json::json!({
+            "node_id": "n1",
+            "total_earned": 2.5,
+            "total_spent": 1.0,
+            "balance": 1.5,
+            "tx_count": 3,
+            "reconciles": true,
+            "unit": "credit",
+            "tokens_per_credit": 1000,
+            "operator_wallet": {
+                "total_balance": 8.5,
+                "total_earned": 10.0,
+                "total_spent": 1.5,
+                "tx_count": 6,
+                "node_count": 2,
+                "reconciles": true,
+                "operator_fingerprint": "abc123"
+            }
+        });
+        let out = credits_summary_human(&body, "n1");
+        assert!(out.contains("IICP operator wallet · operator abc123"));
+        assert!(out.contains("Wallet balance"));
+        assert!(out.contains("Node ledger — n1"));
+    }
+
+    #[test]
+    fn credits_human_output_can_suppress_repeated_operator_wallet() {
+        let body = serde_json::json!({
+            "node_id": "n1",
+            "total_earned": 2.5,
+            "total_spent": 1.0,
+            "balance": 1.5,
+            "tx_count": 3,
+            "reconciles": true,
+            "unit": "credit",
+            "tokens_per_credit": 1000,
+            "operator_wallet": {
+                "total_balance": 8.5,
+                "total_earned": 10.0,
+                "total_spent": 1.5,
+                "tx_count": 6,
+                "node_count": 2,
+                "reconciles": true,
+                "operator_fingerprint": "abc123"
+            }
+        });
+        let (first, first_printed) = credits_summary_human_with_wallet(&body, "aaa", true);
+        let (second, second_printed) = credits_summary_human_with_wallet(&body, "bbb", false);
+        let combined = format!("{first}\n{second}");
+
+        assert!(first_printed);
+        assert!(!second_printed);
+        assert_eq!(combined.matches("IICP operator wallet").count(), 1);
+        assert!(combined.contains("Node ledger — aaa"));
+        assert!(combined.contains("Node ledger — bbb"));
     }
 
     /// #credits-query-param — `iicp-node credits` must pass node_id as a query param
