@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.76] — 2026-06-30
+
+### Changed — operator-wallet credit display
+- `iicp-node credits` now shows the operator wallet summary before per-node ledgers when the directory provides `operator_wallet`, making earned and spendable credits easier to understand across multiple nodes.
+- JSON output preserves per-node ledgers while exposing the pooled wallet fields for tooling and future give-and-get accounting.
+
 ## [0.7.75] — 2026-06-28
 
 ### Fixed — host-wide Quick Tunnel pacing
