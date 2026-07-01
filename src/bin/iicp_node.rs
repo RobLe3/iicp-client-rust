@@ -164,6 +164,15 @@ fn exit_if_supervised_public_fallback_unrecovered(tunnel_error: Option<&str>) {
     process::exit(TUNNEL_DEAD_EXIT_CODE);
 }
 
+/// A relay-capable node is itself the infrastructure other nodes depend on.
+/// If its direct/tunnel public route is unavailable, falling back to another
+/// relay turns it into a worker and removes relay capacity from the mesh.
+/// Supervised relay services should instead fail fast so launchd/systemd can
+/// retry after the Quick Tunnel cooldown.
+fn relay_worker_fallback_allowed(relay_capable: bool) -> bool {
+    !relay_capable
+}
+
 /// Return the first bindable TCP port >= `start` on `host`.
 ///
 /// The official IICP port 9484 is the starting point; when running multiple
@@ -2698,18 +2707,26 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                     }
                 }
                 "relay" => {
-                    eprintln!(
-                        "[iicp-node] NAT tier={}: no tunnel — auto-electing a relay from directory (last resort)…",
-                        profile.tier
-                    );
-                    if let Some((relay_host, relay_port)) =
-                        auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
-                    {
-                        opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
-                        node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                    if relay_worker_fallback_allowed(opts.relay_capable) {
                         eprintln!(
-                            "[iicp-node] auto-elected relay (last resort): {}:{}",
-                            relay_host, relay_port
+                            "[iicp-node] NAT tier={}: no tunnel — auto-electing a relay from directory (last resort)…",
+                            profile.tier
+                        );
+                        if let Some((relay_host, relay_port)) =
+                            auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
+                        {
+                            opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
+                            node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                            eprintln!(
+                                "[iicp-node] auto-elected relay (last resort): {}:{}",
+                                relay_host, relay_port
+                            );
+                            break;
+                        }
+                    } else {
+                        eprintln!(
+                            "[iicp-node] NAT tier={}: no tunnel for relay-capable node — not falling back through another relay; supervisor will retry the public route.",
+                            profile.tier
                         );
                         break;
                     }
@@ -2778,17 +2795,23 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 }
             }
             if tunnel.is_none() && opts.relay_worker_endpoint.is_empty() {
-                eprintln!(
-                    "[iicp-node] no tunnel available — auto-electing a relay from directory (last resort)…"
-                );
-                if let Some((relay_host, relay_port)) =
-                    auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
-                {
-                    opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
-                    node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                if relay_worker_fallback_allowed(opts.relay_capable) {
                     eprintln!(
-                        "[iicp-node] auto-elected relay (last resort): {}:{}",
-                        relay_host, relay_port
+                        "[iicp-node] no tunnel available — auto-electing a relay from directory (last resort)…"
+                    );
+                    if let Some((relay_host, relay_port)) =
+                        auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
+                    {
+                        opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
+                        node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                        eprintln!(
+                            "[iicp-node] auto-elected relay (last resort): {}:{}",
+                            relay_host, relay_port
+                        );
+                    }
+                } else {
+                    eprintln!(
+                        "[iicp-node] no tunnel available for relay-capable node — not falling back through another relay; supervisor will retry the public route."
                     );
                 }
             }
@@ -3229,6 +3252,7 @@ async fn auto_elect_relay(
                     n.get("relay_capable")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
+                        && (n.get("node_id").and_then(|v| v.as_str()) != Some(node_id))
                         && n.get("endpoint")
                             .and_then(|v| v.as_str())
                             .is_some_and(|s| !s.is_empty())
@@ -4272,6 +4296,12 @@ mod tests {
             tunnel_dead_behavior(TunnelDeadPolicy::LogOnly, true),
             TunnelDeadBehavior::LogOnly
         );
+    }
+
+    #[test]
+    fn relay_capable_node_does_not_become_relay_worker_on_public_fallback_failure() {
+        assert!(!relay_worker_fallback_allowed(true));
+        assert!(relay_worker_fallback_allowed(false));
     }
 
     #[test]

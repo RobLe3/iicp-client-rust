@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.77"
+iicp-client = "0.7.78"
 ```
 
 ## One-line test
@@ -41,7 +41,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.77 or newer
+iicp-node --version    # prints iicp-node 0.7.78 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -97,17 +97,18 @@ base URL. Full guide: <https://iicp.network/docs/proxy>
 
 ## Provider upgrade note
 
-> **Upgrade note (0.7.77)** — upgrade provider nodes so Quick Tunnel endpoints
-> recover safely after sleep, idle, Cloudflare edge drops, and local DNS
-> propagation lag on freshly-created `trycloudflare.com` URLs. Tunnel
-> twilight/recovery still heartbeats as unavailable and only re-registers once
-> public `/iicp/health` verifies; supervised services and Docker containers now
-> fail visibly so launchd/systemd/Docker can restart instead of staying stuck.
-> This release also paces accountless Cloudflare Quick Tunnel creation across
-> local nodes, serializes concurrent tunnel starts, persists `429` / `1015`
-> cooldowns, respects retry hints, and falls back to the previous reachability
-> method while the tunnel budget recovers.
-> Persistent relays should use a named tunnel or `IICP_PUBLIC_ENDPOINT`.
+> **Upgrade note (0.7.78)** — upgrade relay-capable and provider nodes so relay
+> services do not disappear during temporary public-tunnel recovery. Relay-capable
+> nodes now keep their role as relay infrastructure: if their own Quick Tunnel is
+> cooling down or unavailable, they do **not** fall back through another relay or
+> accidentally self-elect as a relay worker. Supervised services fail visibly so
+> launchd/systemd/Docker can retry the public route, while ordinary provider nodes
+> can still use relay fallback as the last-resort path.
+>
+> This keeps the 0.7.77 tunnel hardening intact: Quick Tunnel endpoints still
+> recover safely after sleep, idle, Cloudflare edge drops, local DNS propagation
+> lag, and `429` / `1015` cooldowns. Persistent relays should use a named tunnel
+> or `IICP_PUBLIC_ENDPOINT`.
 
 ### Keeping provider nodes current
 
@@ -120,7 +121,7 @@ node so identity and cached node tokens are preserved.
 If a node is older than 0.7.67, perform one manual upgrade/restart first,
 especially for Dockerized Python or TypeScript providers: early updater wiring
 did not reliably cover every normal `serve` path. For Docker, use a restart
-policy such as `--restart unless-stopped` so 0.7.77 can intentionally exit from
+policy such as `--restart unless-stopped` so 0.7.78 can intentionally exit from
 a confirmed tunnel-dead state and let Docker bring it back cleanly.
 
 

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.78] — 2026-07-01
+
+### Fixed — relay-capable public fallback guard
+- Relay-capable nodes no longer fall back through another relay when their own public tunnel is cooling down or unavailable. They preserve relay capacity and, under supervision, fail visibly so launchd/systemd/Docker can retry the public route.
+- Automatic relay election now excludes the node's own `node_id`, avoiding self-election loops during transient Quick Tunnel rate-limit recovery.
+- Ordinary provider nodes can still use relay fallback as the last-resort path; this guard only applies to nodes explicitly advertising relay service.
+
 ## [0.7.77] — 2026-07-01
 
 ### Added — supervised recovery and Docker release validation
