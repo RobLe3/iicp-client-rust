@@ -2240,9 +2240,13 @@ impl IicpNode {
             let hb_liveness_challenge = Arc::clone(&self.liveness_challenge);
             let hb_runtime_hmac_key = Arc::clone(&self.runtime_hmac_key);
             let hb_runtime_available = Arc::clone(&self.runtime_available);
+            let hb_recovery_grace = crate::recovery::env_grace_checks();
+            let hb_recovery_check_every = crate::recovery::env_check_every_heartbeats();
+            let hb_recovery_supervised = crate::recovery::supervised_recovery_enabled();
             tokio::spawn(async move {
                 let mut token = token;
                 let mut seq: u64 = 0;
+                let mut recovery_failures: u32 = 0;
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
                     seq += 1;
@@ -2336,6 +2340,14 @@ impl IicpNode {
                             if let Some(ref log) = hb_log {
                                 log.write("heartbeat_ok", &hb_node_id, &format!("seq={seq}"));
                             }
+                            // A successful heartbeat proves the token path is alive, but it does
+                            // not by itself prove the node is still present in the public registry
+                            // or that the advertised route is usable. This deterministic recovery
+                            // check catches the observed "local process alive + heartbeat_ok, but
+                            // absent from /registry/nodes" failure mode without waiting for an LLM
+                            // or an operator to notice.
+                            let do_recovery_check =
+                                hb_recovery_check_every > 0 && seq % hb_recovery_check_every == 0;
                             if let Ok(data) = resp.json::<Value>().await {
                                 if let Some(ch) = data["challenge"].as_str() {
                                     *hb_liveness_challenge.write().expect("poisoned") =
@@ -2402,6 +2414,127 @@ impl IicpNode {
                                             "seq={seq} endpoint rotation: re-registered → {ep}"
                                         );
                                     }
+                                }
+                            }
+                            if do_recovery_check {
+                                let presence = crate::recovery::registry_node_presence(
+                                    &http,
+                                    &dir,
+                                    &node_id,
+                                    Duration::from_secs(5),
+                                )
+                                .await;
+                                let public_available_now =
+                                    hb_runtime_available.load(Ordering::Relaxed);
+                                if !public_available_now
+                                    || matches!(
+                                        presence,
+                                        crate::recovery::DirectoryPresence::Absent
+                                    )
+                                {
+                                    recovery_failures = recovery_failures.saturating_add(1);
+                                } else if matches!(
+                                    presence,
+                                    crate::recovery::DirectoryPresence::Present
+                                ) {
+                                    recovery_failures = 0;
+                                }
+
+                                let backend_attention = backend_stability
+                                    .as_ref()
+                                    .map(|obs| obs.is_draining())
+                                    .unwrap_or_else(|| {
+                                        hb_backend_stability
+                                            .read()
+                                            .map(|obs| obs.is_draining())
+                                            .unwrap_or(false)
+                                    });
+                                let (recovery_state, recovery_action) = crate::recovery::classify(
+                                    true,
+                                    public_available_now,
+                                    presence,
+                                    recovery_failures,
+                                    hb_recovery_grace,
+                                    backend_attention,
+                                );
+                                if !matches!(
+                                    recovery_state,
+                                    crate::recovery::RecoveryState::Healthy
+                                        | crate::recovery::RecoveryState::Unknown
+                                ) {
+                                    tracing::warn!(
+                                        "seq={seq} recovery check state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace}"
+                                    );
+                                    if let Some(ref log) = hb_log {
+                                        log.write(
+                                            "recovery_check",
+                                            &hb_node_id,
+                                            &format!(
+                                                "seq={seq} state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace}"
+                                            ),
+                                        );
+                                    }
+                                }
+                                match recovery_action {
+                                    crate::recovery::RecoveryAction::Reregister => {
+                                        let override_ep =
+                                            hb_endpoint_override.read().expect("poisoned").clone();
+                                        let mut new_payload = hb_register_payload.clone();
+                                        if let Some(ep) = override_ep.clone() {
+                                            new_payload["endpoint"] = json!(ep);
+                                        }
+                                        new_payload["current_node_token"] = json!(token);
+                                        match reregister(&http, &hb_register_url, &new_payload)
+                                            .await
+                                        {
+                                            Some(t) => {
+                                                if let Some(ep) = new_payload["endpoint"].as_str() {
+                                                    *hb_registered_endpoint
+                                                        .write()
+                                                        .expect("poisoned") = ep.to_string();
+                                                }
+                                                token = t;
+                                                if let Ok(mut g) = hb_token_arc.write() {
+                                                    *g = token.clone();
+                                                }
+                                                recovery_failures = 0;
+                                                if let Some(ref log) = hb_log {
+                                                    log.write(
+                                                        "reregister_ok",
+                                                        &hb_node_id,
+                                                        &format!("seq={seq} recovery_check"),
+                                                    );
+                                                }
+                                                tracing::info!(
+                                                    "seq={seq} recovery check: re-registered public directory entry"
+                                                );
+                                            }
+                                            None => {
+                                                tracing::warn!(
+                                                    "seq={seq} recovery check: re-registration failed"
+                                                );
+                                                if let Some(ref log) = hb_log {
+                                                    log.write(
+                                                        "reregister_fail",
+                                                        &hb_node_id,
+                                                        &format!("seq={seq} recovery_check"),
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                    crate::recovery::RecoveryAction::RestartSelf
+                                        if hb_recovery_supervised =>
+                                    {
+                                        eprintln!(
+                                            "[iicp-node] recovery check recommends restart \
+                                             (state={recovery_state:?}, failures={recovery_failures}/{hb_recovery_grace}); \
+                                             exiting with code {} so the supervisor can rebuild route + registration.",
+                                            crate::recovery::RECOVERY_EXIT_CODE
+                                        );
+                                        std::process::exit(crate::recovery::RECOVERY_EXIT_CODE);
+                                    }
+                                    _ => {}
                                 }
                             }
                         }

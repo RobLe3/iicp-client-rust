@@ -52,6 +52,7 @@ pub mod instance_lock;
 pub mod operator_crypto;
 pub mod peer_manager;
 pub mod pricing;
+pub mod recovery;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_session;
 #[cfg(feature = "iicp-tcp")]

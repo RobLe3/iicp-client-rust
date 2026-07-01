@@ -54,7 +54,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 COPY --from=build /app/target/release/iicp-node /usr/local/bin/iicp-node
 ENV IICP_SUPERVISED=1 \
-    IICP_TUNNEL_DEAD_POLICY=auto
+    IICP_TUNNEL_DEAD_POLICY=auto \
+    IICP_PORT=8020
 EXPOSE 8020
 HEALTHCHECK --interval=10s --timeout=5s --start-period=10s --retries=5 \
   CMD curl -fsS http://localhost:8020/iicp/health || exit 1

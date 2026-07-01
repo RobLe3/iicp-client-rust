@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.76"
+iicp-client = "0.7.77"
 ```
 
 ## One-line test
@@ -41,7 +41,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.76 or newer
+iicp-node --version    # prints iicp-node 0.7.77 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -97,7 +97,7 @@ base URL. Full guide: <https://iicp.network/docs/proxy>
 
 ## Provider upgrade note
 
-> **Upgrade note (0.7.76)** — upgrade provider nodes so Quick Tunnel endpoints
+> **Upgrade note (0.7.77)** — upgrade provider nodes so Quick Tunnel endpoints
 > recover safely after sleep, idle, Cloudflare edge drops, and local DNS
 > propagation lag on freshly-created `trycloudflare.com` URLs. Tunnel
 > twilight/recovery still heartbeats as unavailable and only re-registers once
@@ -120,7 +120,7 @@ node so identity and cached node tokens are preserved.
 If a node is older than 0.7.67, perform one manual upgrade/restart first,
 especially for Dockerized Python or TypeScript providers: early updater wiring
 did not reliably cover every normal `serve` path. For Docker, use a restart
-policy such as `--restart unless-stopped` so 0.7.76 can intentionally exit from
+policy such as `--restart unless-stopped` so 0.7.77 can intentionally exit from
 a confirmed tunnel-dead state and let Docker bring it back cleanly.
 
 

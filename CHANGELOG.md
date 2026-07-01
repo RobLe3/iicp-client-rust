@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.77] — 2026-07-01
+
+### Added — supervised recovery and Docker release validation
+- Added `iicp-node doctor` so operators can check local health, directory presence, and the deterministic recovery action without reading raw logs.
+- Provider heartbeat loops now classify recovery state, re-register when directory evidence disappears, and only exit for supervisor restart after configured grace checks.
+- Docker images default to `IICP_PORT=8020`, matching the exposed port and healthcheck used by low-friction container runs.
+- Release validation now includes the cross-SDK Docker gate for CLI help, no-network update checks, fake-directory registration, `/iicp/health`, `/v1/task`, and heartbeat 401 recovery.
+
 ## [0.7.76] — 2026-06-30
 
 ### Changed — operator-wallet credit display

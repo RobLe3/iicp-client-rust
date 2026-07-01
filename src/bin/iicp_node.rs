@@ -234,6 +234,7 @@ fn print_help() {
          \x20 init                       Interactive wizard — set up operator + first node\n\
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
          \x20 serve                      Register and serve a node\n\
+         \x20 doctor                     Check local health, directory presence, and recovery action\n\
          \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\
          \x20 credits                    Show your operator wallet plus this node's credit ledger\n\
          \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\
@@ -242,6 +243,7 @@ fn print_help() {
          \x20 proxy                      Run the local OpenAI/Ollama/Anthropic compat gateway (loopback)\n\
          \x20 mcp-gateway                Bridge a local MCP server as an IICP provider node\n\
          \x20 service                    Generate/install OS supervisor units for unattended node serving\n\
+         \x20 update                     Check whether a newer iicp-client release is available\n\
          \x20 help                       Print this help\n\n\
          Global flags:\n\
          \x20 --version, -V              Print version and exit\n\
@@ -287,6 +289,10 @@ fn print_help() {
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --json                     Emit the raw summary JSON\n\
          \x20 --verify                   Cryptographically audit awards against the signed log\n\n\
+         doctor optional:\n\
+         \x20 --node NAME                Load saved node config (~/.iicp/nodes/<NAME>.json)\n\
+         \x20 --directory-url URL        Override saved IICP_DIRECTORY_URL\n\
+         \x20 --json                     Emit machine-readable recovery state\n\n\
          proxy optional:\n\
          \x20 --host HOST                IICP_PROXY_HOST (default 127.0.0.1)\n\
          \x20 --port N                   IICP_PROXY_PORT (default 9483)\n\
@@ -300,6 +306,65 @@ fn print_help() {
 /// an "unknown flag" (mirrors the `serve`/parse_args `--help` short-circuit).
 fn wants_help(args: &[String]) -> bool {
     args.iter().any(|a| a == "-h" || a == "--help")
+}
+
+fn print_list_help() {
+    print!(
+        "usage: iicp-node list\n\n\
+         List saved node configs under ~/.iicp/nodes/ without contacting the directory.\n\n\
+         Options:\n\
+         \x20 -h, --help            Print this help (does NOT list saved nodes)\n"
+    );
+}
+
+fn print_update_help() {
+    print!(
+        "usage: iicp-node update\n\n\
+         Check whether a newer published iicp-client release is available. Read-only:\n\
+         this command never installs or restarts anything.\n\n\
+         Exit codes:\n\
+         \x20 0   current, unreachable registry, or help\n\
+         \x20 10  newer release available\n\n\
+         Options:\n\
+         \x20 -h, --help            Print this help (does NOT contact crates.io)\n"
+    );
+}
+
+fn print_serve_help() {
+    print!(
+        "usage: iicp-node serve [options]\n\n\
+         Register and serve an IICP provider node backed by an OpenAI-compatible backend.\n\
+         Use `iicp-node init` first for the lowest-friction saved-node path, then run:\n\
+         \x20 iicp-node serve --node <NAME>\n\n\
+         Required (flag/env/saved node):\n\
+         \x20 --model NAME               IICP_BACKEND_MODEL (e.g. qwen2.5:0.5b)\n\
+         \x20 --node NAME                Load ~/.iicp/nodes/<NAME>.json from `iicp-node init`\n\n\
+         Core options:\n\
+         \x20 --backend-url URL          IICP_BACKEND_URL (default http://localhost:11434)\n\
+         \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp | anthropic\n\
+         \x20 --backend-api-key KEY      IICP_BACKEND_API_KEY — Bearer key for auth'd backends\n\
+         \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
+         \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 --region REGION            IICP_REGION (e.g. eu-central)\n\
+         \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
+         \x20 --max-concurrent N         IICP_MAX_CONCURRENT (default 4)\n\
+         \x20 --node-id ID               IICP_NODE_ID (auto-generated if absent)\n\
+         \x20 --port N                   IICP_PORT (default 9484)\n\
+         \x20 --host HOST                IICP_HOST (default :: — dual-stack IPv4+IPv6)\n\
+         \x20 --skip-registration        IICP_SKIP_REGISTRATION — register-free dev mode\n\
+         \x20 --force                    IICP_FORCE — take over the single-instance lock for this node_id\n\n\
+         Reachability and resilience:\n\
+         \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup (default on)\n\
+         \x20 --no-auto-detect-nat       disable NAT detection\n\
+         \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
+         \x20 --tunnel / --no-tunnel     IICP_TUNNEL — auto Cloudflare Quick Tunnel fallback when direct reachability fails\n\
+         \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
+         \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server\n\
+         \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — relay accept TCP port (default 9485)\n\
+         \x20 --with-proxy               IICP_WITH_PROXY — also run the compat proxy gateway (loopback 9483)\n\
+         \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\
+         \x20 -h, --help                 Print this focused serve help\n"
+    );
 }
 
 fn print_query_help() {
@@ -332,6 +397,19 @@ fn print_credits_help() {
     );
 }
 
+fn print_doctor_help() {
+    print!(
+        "usage: iicp-node doctor [options]\n\n\
+         Check whether a saved provider node is locally healthy, visible in the public\n\
+         directory, and what deterministic recovery action is recommended.\n\n\
+         Options:\n\
+         \x20 --node NAME           Load saved node config (~/.iicp/nodes/<NAME>.json)\n\
+         \x20 --directory-url URL   Override saved IICP_DIRECTORY_URL\n\
+         \x20 --json                Emit machine-readable recovery state\n\
+         \x20 -h, --help            Print this help\n"
+    );
+}
+
 fn print_operator_help() {
     print!(
         "usage: iicp-node operator <subcommand> [options]\n\n\
@@ -345,7 +423,7 @@ fn print_operator_help() {
     );
 }
 
-#[allow(dead_code)] // only called inside #[cfg(feature = "proxy")] blocks
+#[allow(dead_code)] // called by proxy builds and by `proxy --help` in lean builds
 fn print_proxy_help() {
     print!(
         "usage: iicp-node proxy [options]\n\n\
@@ -1561,6 +1639,162 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
     Ok(opts)
 }
 
+fn doctor_loopback_host(host: &str) -> String {
+    match host.trim() {
+        "" | "::" | "0.0.0.0" => "127.0.0.1".to_string(),
+        "::1" => "::1".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn doctor_url(host: &str, port: u16) -> String {
+    let host = doctor_loopback_host(host);
+    if host.contains(':') && !host.starts_with('[') {
+        format!("http://[{host}]:{port}/iicp/health")
+    } else {
+        format!("http://{host}:{port}/iicp/health")
+    }
+}
+
+async fn run_doctor(args: &[String]) -> Result<(), String> {
+    if wants_help(args) {
+        print_doctor_help();
+        return Ok(());
+    }
+    let mut node_name = env::var("IICP_NODE_NAME").unwrap_or_else(|_| "default".to_string());
+    let mut directory_url_override: Option<String> = env::var("IICP_DIRECTORY_URL").ok();
+    let mut as_json = false;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--node" => {
+                i += 1;
+                node_name = args
+                    .get(i)
+                    .ok_or("--node requires NAME".to_string())?
+                    .clone();
+            }
+            "--directory-url" => {
+                i += 1;
+                directory_url_override = Some(
+                    args.get(i)
+                        .ok_or("--directory-url requires URL".to_string())?
+                        .clone(),
+                );
+            }
+            "--json" => as_json = true,
+            other => return Err(format!("unknown doctor option: {other}")),
+        }
+        i += 1;
+    }
+
+    let node = load_node(&node_name)
+        .map_err(|e| format!("load node {node_name}: {e}"))?
+        .ok_or_else(|| format!("node config not found: {node_name}"))?;
+    let directory_url = directory_url_override.unwrap_or_else(|| node.directory_url.clone());
+    let local_health_url = doctor_url(&node.host, node.port);
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .use_rustls_tls()
+        .build()
+        .map_err(|e| format!("build HTTP client: {e}"))?;
+
+    let mut health_json = serde_json::Value::Null;
+    let mut health_error: Option<String> = None;
+    let local_health_ok = match http
+        .get(&local_health_url)
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(value) => {
+                health_json = value;
+                true
+            }
+            Err(e) => {
+                health_error = Some(format!("invalid health JSON: {e}"));
+                false
+            }
+        },
+        Ok(resp) => {
+            health_error = Some(format!("HTTP {}", resp.status()));
+            false
+        }
+        Err(e) => {
+            health_error = Some(e.to_string());
+            false
+        }
+    };
+    let backend_attention = health_json
+        .get("backend_stability")
+        .and_then(|v| v.get("backend_state"))
+        .and_then(|v| v.as_str())
+        .map(|s| s == "draining")
+        .unwrap_or(false);
+    let presence = iicp_client::recovery::registry_node_presence(
+        &http,
+        &directory_url,
+        &node.node_id,
+        Duration::from_secs(5),
+    )
+    .await;
+    let initial_failures = if !local_health_ok
+        || matches!(presence, iicp_client::recovery::DirectoryPresence::Absent)
+    {
+        1
+    } else {
+        0
+    };
+    let (state, action) = iicp_client::recovery::classify(
+        local_health_ok,
+        local_health_ok,
+        presence,
+        initial_failures,
+        iicp_client::recovery::env_grace_checks(),
+        backend_attention,
+    );
+    let prefix = iicp_client::recovery::node_registry_prefix(&node.node_id);
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "node": node.name,
+                "node_id": node.node_id,
+                "prefix": prefix,
+                "directory_url": directory_url,
+                "local_health_url": local_health_url,
+                "local_health_ok": local_health_ok,
+                "local_health_error": health_error,
+                "directory_presence": presence,
+                "recovery_state": state,
+                "recommended_action": action,
+                "health": health_json,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("IICP node doctor — {}", node.name);
+        println!(
+            "  Local health            {} ({local_health_url})",
+            if local_health_ok { "ok" } else { "failed" }
+        );
+        if let Some(err) = &health_error {
+            println!("  Local health detail     {err}");
+        }
+        println!("  Directory prefix        {prefix}");
+        println!("  Directory presence      {presence:?}");
+        println!("  Recovery state          {state:?}");
+        println!("  Recommended action      {action:?}");
+        println!(
+            "  Note                    restart is automatic only when supervised services set IICP_SUPERVISED=1"
+        );
+    }
+    Ok(())
+}
+
 fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
     if opts.backend_url.is_empty() {
         opts.backend_url = saved.backend_url.clone();
@@ -2005,7 +2239,14 @@ async fn run_init(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn run_list() -> Result<(), String> {
+fn run_list(args: &[String]) -> Result<(), String> {
+    if wants_help(args) {
+        print_list_help();
+        return Ok(());
+    }
+    if let Some(arg) = args.first() {
+        return Err(format!("unknown list option: {arg}"));
+    }
     let nodes = list_nodes().map_err(|e| e.to_string())?;
     if nodes.is_empty() {
         println!("No saved node configs. Run `iicp-node init` first.");
@@ -3661,9 +3902,9 @@ async fn main() {
         return;
     }
     if cmd == "list" {
-        if let Err(e) = run_list() {
+        if let Err(e) = run_list(&args[2..]) {
             eprintln!("ERROR: {e}");
-            process::exit(1);
+            process::exit(2);
         }
         return;
     }
@@ -3676,6 +3917,13 @@ async fn main() {
     }
     if cmd == "credits" {
         if let Err(e) = run_credits(&args[2..]).await {
+            eprintln!("ERROR: {e}");
+            process::exit(1);
+        }
+        return;
+    }
+    if cmd == "doctor" {
+        if let Err(e) = run_doctor(&args[2..]).await {
             eprintln!("ERROR: {e}");
             process::exit(1);
         }
@@ -3699,6 +3947,10 @@ async fn main() {
         }
         #[cfg(not(feature = "proxy"))]
         {
+            if wants_help(&args[2..]) {
+                print_proxy_help();
+                return;
+            }
             eprintln!(
                 "iicp-node was built without the proxy gateway. \
                  Reinstall with: cargo install iicp-client --features proxy"
@@ -3721,6 +3973,14 @@ async fn main() {
         return;
     }
     if cmd == "update" {
+        if wants_help(&args[2..]) {
+            print_update_help();
+            return;
+        }
+        if let Some(arg) = args.get(2) {
+            eprintln!("ERROR: unknown update option: {arg}");
+            process::exit(2);
+        }
         // #521 P1 — read-only version check. Exit 10 when a newer release
         // exists (cron/scripts can act), 0 when current/unreachable. No install.
         use iicp_client::updater::{is_outdated, latest_crates_version, UPGRADE_COMMAND};
@@ -3750,7 +4010,7 @@ async fn main() {
     let opts = match parse_args(&args[2..]) {
         Ok(o) => o,
         Err(e) if e == "HELP" => {
-            print_help();
+            print_serve_help();
             process::exit(0);
         }
         Err(e) => {
