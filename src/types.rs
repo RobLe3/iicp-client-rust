@@ -3,20 +3,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Client-side remote-routing profile (#585).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RoutingProfile {
+    #[default]
     Standard,
     Sensitive,
     EuRestricted,
     StrictPolicy,
     DebugOverride,
-}
-
-impl Default for RoutingProfile {
-    fn default() -> Self {
-        Self::Standard
-    }
 }
 
 impl RoutingProfile {
