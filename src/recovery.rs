@@ -8,6 +8,7 @@
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::time::Duration;
 
 pub const RECOVERY_EXIT_CODE: i32 = 76;
@@ -46,6 +47,12 @@ pub enum DirectoryPresence {
     Present,
     Absent,
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RegistryRouteStatus {
+    pub presence: DirectoryPresence,
+    pub route_needs_promotion: bool,
 }
 
 pub fn node_registry_prefix(node_id: &str) -> String {
@@ -152,6 +159,67 @@ pub async fn registry_node_presence(
     }
 }
 
+pub fn route_needs_promotion_from_registry_json(data: &Value) -> bool {
+    let node = data.get("node").unwrap_or(data);
+    let summary = node.get("status_summary").unwrap_or(&Value::Null);
+
+    if summary.get("state").and_then(Value::as_str) == Some("direct_unverified") {
+        return true;
+    }
+
+    let route_evidence = node
+        .get("route_evidence")
+        .and_then(Value::as_str)
+        .or_else(|| summary.get("evidence_source").and_then(Value::as_str));
+    let routing_hint = node
+        .get("routing_hint")
+        .and_then(Value::as_str)
+        .or_else(|| summary.get("routing_hint").and_then(Value::as_str));
+    let browser_usable = node
+        .get("browser_usable")
+        .and_then(Value::as_bool)
+        .or_else(|| summary.get("browser_usable").and_then(Value::as_bool));
+
+    routing_hint == Some("http_ipv6")
+        && route_evidence != Some("directory_observed")
+        && browser_usable != Some(true)
+}
+
+pub async fn registry_route_status(
+    http: &Client,
+    directory_url: &str,
+    node_id: &str,
+    timeout: Duration,
+) -> RegistryRouteStatus {
+    let prefix = node_registry_prefix(node_id);
+    let url = format!(
+        "{}/v1/registry/nodes/{}",
+        directory_url.trim_end_matches('/'),
+        prefix
+    );
+    match http.get(url).timeout(timeout).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let route_needs_promotion = resp
+                .json::<Value>()
+                .await
+                .map(|data| route_needs_promotion_from_registry_json(&data))
+                .unwrap_or(false);
+            RegistryRouteStatus {
+                presence: DirectoryPresence::Present,
+                route_needs_promotion,
+            }
+        }
+        Ok(resp) if resp.status().as_u16() == 404 => RegistryRouteStatus {
+            presence: DirectoryPresence::Absent,
+            route_needs_promotion: false,
+        },
+        Ok(_) | Err(_) => RegistryRouteStatus {
+            presence: DirectoryPresence::Unknown,
+            route_needs_promotion: false,
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -188,6 +256,42 @@ mod tests {
         );
         assert_eq!(
             classify(true, false, DirectoryPresence::Absent, 3, 3, false),
+            (
+                RecoveryState::RestartRecommended,
+                RecoveryAction::RestartSelf
+            )
+        );
+    }
+
+    #[test]
+    fn direct_ipv6_self_attested_registry_status_needs_route_promotion() {
+        let status = serde_json::json!({
+            "routing_hint": "http_ipv6",
+            "route_evidence": "self_attested",
+            "browser_usable": false,
+            "status_summary": {"state": "direct_unverified"}
+        });
+        assert!(route_needs_promotion_from_registry_json(&status));
+
+        let wrapped = serde_json::json!({
+            "node": {
+                "routing_hint": "http_ipv6",
+                "route_evidence": "directory_observed",
+                "browser_usable": false,
+                "status_summary": {"state": "ready"}
+            }
+        });
+        assert!(!route_needs_promotion_from_registry_json(&wrapped));
+    }
+
+    #[test]
+    fn route_promotion_uses_limited_reach_until_restart_grace() {
+        assert_eq!(
+            classify(true, false, DirectoryPresence::Present, 1, 3, false),
+            (RecoveryState::LimitedReach, RecoveryAction::WaitCooldown)
+        );
+        assert_eq!(
+            classify(true, false, DirectoryPresence::Present, 3, 3, false),
             (
                 RecoveryState::RestartRecommended,
                 RecoveryAction::RestartSelf

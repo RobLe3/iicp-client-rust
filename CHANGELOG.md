@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.79] — 2026-07-02
+
+### Fixed — direct IPv6 route promotion recovery
+- Provider heartbeat recovery now treats `http_ipv6` + self-attested + browser-unusable registry evidence as limited reach, so supervised nodes restart and retry Quick Tunnel or relay fallback instead of staying indefinitely in “Direct IPv6 — unverified”.
+- Rust relay workers now re-register their path-scoped relay endpoint after a successful bind, allowing relay fallback to replace the old self-attested direct route.
+
 ## [0.7.78] — 2026-07-01
 
 ### Fixed — relay-capable public fallback guard

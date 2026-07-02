@@ -2417,16 +2417,19 @@ impl IicpNode {
                                 }
                             }
                             if do_recovery_check {
-                                let presence = crate::recovery::registry_node_presence(
+                                let route_status = crate::recovery::registry_route_status(
                                     &http,
                                     &dir,
                                     &node_id,
                                     Duration::from_secs(5),
                                 )
                                 .await;
+                                let presence = route_status.presence;
                                 let public_available_now =
                                     hb_runtime_available.load(Ordering::Relaxed);
+                                let route_needs_promotion = route_status.route_needs_promotion;
                                 if !public_available_now
+                                    || route_needs_promotion
                                     || matches!(
                                         presence,
                                         crate::recovery::DirectoryPresence::Absent
@@ -2451,7 +2454,7 @@ impl IicpNode {
                                     });
                                 let (recovery_state, recovery_action) = crate::recovery::classify(
                                     true,
-                                    public_available_now,
+                                    public_available_now && !route_needs_promotion,
                                     presence,
                                     recovery_failures,
                                     hb_recovery_grace,
@@ -2463,14 +2466,14 @@ impl IicpNode {
                                         | crate::recovery::RecoveryState::Unknown
                                 ) {
                                     tracing::warn!(
-                                        "seq={seq} recovery check state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace}"
+                                        "seq={seq} recovery check state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace} route_needs_promotion={route_needs_promotion}"
                                     );
                                     if let Some(ref log) = hb_log {
                                         log.write(
                                             "recovery_check",
                                             &hb_node_id,
                                             &format!(
-                                                "seq={seq} state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace}"
+                                                "seq={seq} state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace} route_needs_promotion={route_needs_promotion}"
                                             ),
                                         );
                                     }
@@ -2653,6 +2656,13 @@ impl IicpNode {
             let node_id = self.cfg.node_id.clone();
             let intent = self.cfg.intent.clone();
             let models = self.cfg.model.clone().map(|m| vec![m]).unwrap_or_default();
+            let relay_register_payload = self.build_register_payload();
+            let relay_register_url = format!(
+                "{}/v1/register",
+                self.cfg.directory_url.trim_end_matches('/')
+            );
+            let relay_token_arc = Arc::clone(&self.runtime_token);
+            let relay_registered_endpoint = Arc::clone(&self.registered_endpoint);
             let handler_fn: crate::relay_worker_client::RelayHandlerFn =
                 Arc::new(move |task: Value| {
                     let h = Arc::clone(&handler_for_relay);
@@ -2697,24 +2707,48 @@ impl IicpNode {
             // on_bind: re-register with the relay's public endpoint so the node
             // appears ACTIVE in directory + stats (#358).
             let http_client = self.http.clone();
-            let dir_url = self.cfg.directory_url.clone();
-            let on_bind_cb: crate::relay_worker_client::OnBindFn = Arc::new(
-                move |rh: String, rp: u16, _wid: String| {
+            let on_bind_cb: crate::relay_worker_client::OnBindFn =
+                Arc::new(move |rh: String, rp: u16, wid: String| {
                     let http = http_client.clone();
-                    let dir = dir_url.clone();
+                    let url = relay_register_url.clone();
+                    let mut payload = relay_register_payload.clone();
+                    let token_arc = Arc::clone(&relay_token_arc);
+                    let registered_endpoint = Arc::clone(&relay_registered_endpoint);
                     Box::pin(async move {
-                        // A full re-register would require the IicpNode reference here,
-                        // which isn't available. For v0.7.0 we log the bind event.
-                        // The node operator should use the cli bin which has the full
-                        // context to re-register. Full wiring tracked in #341 R2.
-                        tracing::info!(
-                            "Relay worker bound — register endpoint http://{}:{}/v1/relay-for/{} with the directory (#450 path-scoped routing; rp is the relay's HTTP port from RELAY_ACK field 4)",
-                            rh, rp, _wid,
-                        );
-                        let _ = (http, dir); // suppress unused warnings
+                        // Path-scoped endpoint (#450): consumers compose
+                        // "{endpoint}/v1/task", so this route forwards to this
+                        // worker instead of the relay's own backend.
+                        let relay_endpoint = format!("http://{rh}:{rp}/v1/relay-for/{wid}");
+                        payload["endpoint"] = json!(relay_endpoint);
+                        payload["transport_method"] = json!("turn_relay");
+                        payload["transport_metadata"] = json!({
+                            "relay_for": wid,
+                            "relay_host": rh,
+                            "relay_port": rp,
+                        });
+                        let current_token = token_arc.read().expect("poisoned").clone();
+                        if !current_token.is_empty() {
+                            payload["current_node_token"] = json!(current_token);
+                        }
+                        match reregister(&http, &url, &payload).await {
+                            Some(t) => {
+                                if let Some(ep) = payload["endpoint"].as_str() {
+                                    *registered_endpoint.write().expect("poisoned") =
+                                        ep.to_string();
+                                }
+                                if let Ok(mut g) = token_arc.write() {
+                                    *g = t;
+                                }
+                                tracing::info!("Relay worker bound — re-registered relay endpoint");
+                            }
+                            None => {
+                                tracing::warn!(
+                                    "Relay worker bound but directory re-registration failed"
+                                );
+                            }
+                        }
                     })
-                },
-            );
+                });
             tokio::spawn(async move {
                 let rwc = Arc::new(
                     crate::relay_worker_client::RelayWorkerClient::new(
