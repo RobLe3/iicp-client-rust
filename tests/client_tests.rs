@@ -611,7 +611,6 @@ async fn routing_policy_strict_requires_no_payload_retention_manifest() {
     unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
 }
 
-
 #[tokio::test]
 #[allow(clippy::await_holding_lock)]
 async fn routing_policy_strict_requires_signed_policy_manifest() {

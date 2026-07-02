@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.81] — 2026-07-02
+
+### Changed — cross-SDK release parity
+- Parity release aligned with Python 0.7.81 so operators and adopters can keep all official clients on the same published version baseline.
+- No Rust runtime behaviour changed beyond the 0.7.80 remote-routing policy profile baseline.
+
 ## [0.7.80] — 2026-07-02
 
 ### Added — remote-routing policy profiles
