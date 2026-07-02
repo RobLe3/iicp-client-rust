@@ -569,7 +569,9 @@ async fn routing_policy_strict_requires_no_payload_retention_manifest() {
                 },
                 "node_policy_manifest": {
                     "jurisdiction": "DE",
-                    "retention": {"task_payload": "provider_defined"}
+                    "retention": {"task_payload": "provider_defined"},
+                    "evidence": "signed_verified",
+                    "verification": {"status": "signed_valid"}
                 }
             }]})
             .to_string(),
@@ -604,6 +606,77 @@ async fn routing_policy_strict_requires_no_payload_retention_manifest() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("payload_retention_not_none"));
+    _task.assert_async().await;
+
+    unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
+}
+
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn routing_policy_strict_requires_signed_policy_manifest() {
+    use serde_json::json;
+
+    let _guard = env_test_lock();
+    unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
+
+    let mut server = mockito::Server::new_async().await;
+    let endpoint = format!("{}/self-attested", server.url());
+    let _discover = server
+        .mock("GET", mockito::Matcher::Regex("/api/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            json!({"count":1,"nodes":[{
+                "node_id":"n-self-attested",
+                "endpoint":endpoint,
+                "score":1.0,
+                "available":true,
+                "region":"eu",
+                "cx_public_key":{
+                    "algorithm":"X25519",
+                    "encoding":"base64url",
+                    "key":"-LKZgrZEnFMr9ctB3uQDKsME07ZzS4Ce-SapFAePul0",
+                    "key_id":"cx-fixture"
+                },
+                "node_policy_manifest": {
+                    "jurisdiction": "DE",
+                    "retention": {"task_payload": "none"},
+                    "evidence": "self_attested"
+                }
+            }]})
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let _task = server
+        .mock("POST", "/self-attested/v1/task")
+        .with_status(200)
+        .expect(0)
+        .create_async()
+        .await;
+
+    let client = IicpClient::new(ClientConfig {
+        directory_url: format!("{}/api", server.url()),
+        ..Default::default()
+    })
+    .unwrap();
+    let err = client
+        .submit(TaskRequest {
+            task_id: String::new(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            payload: json!({"messages": []}),
+            constraints: None,
+            auth: None,
+            source_node_id: None,
+            routing_policy: Some(RoutingPolicy {
+                profile: RoutingProfile::StrictPolicy,
+                ..Default::default()
+            }),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("policy_manifest_not_signed"));
     _task.assert_async().await;
 
     unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };

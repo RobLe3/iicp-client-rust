@@ -157,6 +157,9 @@ fn node_rejection_reason<'a>(
     if policy.require_policy_manifest && node.node_policy_manifest.is_none() {
         return Some("missing_policy_manifest");
     }
+    if matches!(policy.profile, RoutingProfile::StrictPolicy) && !manifest_signed_verified(node) {
+        return Some("policy_manifest_not_signed");
+    }
     if policy.require_no_payload_retention && !declares_no_payload_retention(node) {
         return Some("payload_retention_not_none");
     }
@@ -164,6 +167,18 @@ fn node_rejection_reason<'a>(
         return Some("known_operator_not_verified");
     }
     None
+}
+
+fn manifest_signed_verified(node: &Node) -> bool {
+    let Some(manifest) = node.node_policy_manifest.as_ref() else {
+        return false;
+    };
+    let verification_status = manifest
+        .get("verification")
+        .and_then(|v| v.get("status"))
+        .and_then(|v| v.as_str());
+    verification_status == Some("signed_valid")
+        || manifest.get("evidence").and_then(|v| v.as_str()) == Some("signed_verified")
 }
 
 fn region_allowed(region: &str, allowed: &[String]) -> bool {
