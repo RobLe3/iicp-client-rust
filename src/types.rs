@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Client configuration (SDK-04: timeout_ms enforced at construction time).
 #[derive(Debug, Clone)]
@@ -107,6 +108,8 @@ pub struct Node {
     pub route_evidence: Option<String>,
     pub routing_hint: Option<String>,
     pub browser_usable: Option<bool>,
+    /// Phase-1 compliance: public, self-attested node policy manifest.
+    pub node_policy_manifest: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +139,8 @@ struct NodeWire {
     pub routing_hint: Option<String>,
     #[serde(default)]
     pub browser_usable: Option<bool>,
+    #[serde(default)]
+    pub node_policy_manifest: Option<Value>,
 }
 
 impl From<NodeWire> for Node {
@@ -159,6 +164,7 @@ impl From<NodeWire> for Node {
             route_evidence: wire.route_evidence,
             routing_hint: wire.routing_hint,
             browser_usable: wire.browser_usable,
+            node_policy_manifest: wire.node_policy_manifest,
         }
     }
 }

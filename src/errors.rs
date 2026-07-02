@@ -20,6 +20,10 @@ pub enum IicpError {
     #[error("SDK-03: invalid intent URN: {0}")]
     InvalidIntent(String),
 
+    /// Intent refused by local client policy before discovery/routing.
+    #[error("[{code}] {message}")]
+    PolicyRefused { code: String, message: String },
+
     /// SDK-04: timeout_ms exceeds the maximum of 120 000 ms.
     #[error("SDK-04: timeout_ms must be ≤ 120000; got {0}")]
     TimeoutTooLarge(u64),

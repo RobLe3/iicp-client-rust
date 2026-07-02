@@ -51,6 +51,7 @@ pub mod identity;
 pub mod instance_lock;
 pub mod operator_crypto;
 pub mod peer_manager;
+pub mod policy;
 pub mod pricing;
 pub mod recovery;
 #[cfg(feature = "iicp-tcp")]
@@ -75,6 +76,10 @@ pub use client::IicpClient;
 pub use errors::{IicpError, Result};
 pub use http::make_traceparent;
 pub use node::{IicpNode, NodeConfig};
+pub use policy::{
+    ensure_intent_allowed, prohibited_intent_reason, ProhibitedIntentRule, POLICY_REFUSAL_CODE,
+    PROHIBITED_INTENT_RULES,
+};
 pub use types::{
     ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage, ClientConfig, CxPublicKey,
     DiscoverOptions, Node, NodeList, TaskAuth, TaskConstraints, TaskRequest, TaskResponse,

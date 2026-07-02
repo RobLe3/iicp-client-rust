@@ -9,6 +9,7 @@ use crate::confidentiality::encrypt_payload;
 use crate::consumer_token::{acquire_consumer_token, ConsumerTokenCache};
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
+use crate::policy::ensure_intent_allowed;
 use crate::types::*;
 
 // Compiled once at first use — avoid per-call allocation (fix: rust#3).
@@ -446,6 +447,7 @@ impl IicpClient {
         if !INTENT_RE.is_match(intent) {
             return Err(IicpError::InvalidIntent(intent.into()));
         }
+        ensure_intent_allowed(intent)?;
         Ok(())
     }
 }

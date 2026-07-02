@@ -101,6 +101,16 @@ async fn sdk03_rejects_invalid_intent() {
 }
 
 #[tokio::test]
+async fn policy_refuses_prohibited_intent_before_discovery() {
+    let client = IicpClient::new(ClientConfig::default()).unwrap();
+    let err = client
+        .discover("urn:iicp:intent:social-scoring:score:v1", None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IicpError::PolicyRefused { code, .. } if code == "IICP-POLICY-001"));
+}
+
+#[tokio::test]
 async fn sdk03_accepts_valid_intent() {
     // Validates pattern only — no network call needed for intent check.
     // A network error here means the intent was accepted (correct).
@@ -138,6 +148,11 @@ async fn discover_accepts_deprecated_public_key_alias_for_cx_key() {
                     "route_evidence": "directory_observed",
                     "routing_hint": "https_direct",
                     "browser_usable": true,
+                    "node_policy_manifest": {
+                        "jurisdiction": "DE",
+                        "training_use": "none",
+                        "evidence": "self_attested"
+                    },
                     "public_key": {
                         "algorithm": "X25519",
                         "encoding": "base64url",
@@ -176,6 +191,14 @@ async fn discover_accepts_deprecated_public_key_alias_for_cx_key() {
     );
     assert_eq!(nodes.nodes[0].routing_hint.as_deref(), Some("https_direct"));
     assert_eq!(nodes.nodes[0].browser_usable, Some(true));
+    assert_eq!(
+        nodes.nodes[0]
+            .node_policy_manifest
+            .as_ref()
+            .and_then(|v| v.get("jurisdiction"))
+            .and_then(|v| v.as_str()),
+        Some("DE")
+    );
 }
 
 #[tokio::test]
