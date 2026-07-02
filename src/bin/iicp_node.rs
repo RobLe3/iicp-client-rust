@@ -291,6 +291,9 @@ fn print_help() {
          \x20 --model NAME               Pin to a specific model on the remote node\n\
          \x20 --max-tokens N             Limit response length\n\
          \x20 --timeout-ms N             Request timeout (default 60000)\n\n\
+         \x20 --routing-profile P        standard | sensitive | eu-restricted | strict-policy | debug-override\n\
+         \x20 --allow-remote-executor    Explicitly allow remote executor prompt visibility for restrictive profiles\n\
+         \x20 --region-allowlist L       Comma-separated allowed node regions before prompt dispatch\n\n\
          credits optional:\n\
          \x20 --node NAME                Load saved node config (~/.iicp/nodes/<NAME>.json)\n\
          \x20 --node-id ID               Node id to query (alternative to --node)\n\
@@ -386,6 +389,9 @@ fn print_query_help() {
          \x20 --model NAME          Pin to a specific model on the remote node\n\
          \x20 --max-tokens N        Limit response length\n\
          \x20 --timeout-ms N        Request timeout (default 60000)\n\
+         \x20 --routing-profile P   standard | sensitive | eu-restricted | strict-policy | debug-override\n\
+         \x20 --allow-remote-executor  Explicitly allow remote executor prompt visibility for restrictive profiles\n\
+         \x20 --region-allowlist L  Comma-separated allowed node regions before prompt dispatch\n\
          \x20 -h, --help            Print this help\n"
     );
 }
@@ -823,6 +829,10 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     let mut model: Option<String> = None;
     let mut max_tokens: Option<u32> = None;
     let mut timeout_ms: u64 = 60_000;
+    let mut routing_profile =
+        env::var("IICP_ROUTING_PROFILE").unwrap_or_else(|_| "standard".to_string());
+    let mut allow_remote_executor = false;
+    let mut region_allowlist = env::var("IICP_REGION_ALLOWLIST").unwrap_or_default();
     // #488: optional node config path — used to populate source_node_id for self-query detection.
     let mut node_cfg: Option<String> = None;
 
@@ -830,6 +840,11 @@ async fn run_query(args: &[String]) -> Result<(), String> {
     while i < args.len() {
         let a = &args[i];
         if a.starts_with('-') {
+            if a == "--allow-remote-executor" {
+                allow_remote_executor = true;
+                i += 1;
+                continue;
+            }
             if i + 1 >= args.len() {
                 return Err(format!("flag {a} needs a value"));
             }
@@ -844,6 +859,8 @@ async fn run_query(args: &[String]) -> Result<(), String> {
                 "--timeout-ms" => {
                     timeout_ms = v.parse().map_err(|e| format!("--timeout-ms: {e}"))?
                 }
+                "--routing-profile" => routing_profile = v,
+                "--region-allowlist" => region_allowlist = v,
                 "--node" => node_cfg = Some(v),
                 _ => return Err(format!("unknown flag: {a}")),
             }
@@ -899,9 +916,32 @@ async fn run_query(args: &[String]) -> Result<(), String> {
         },
         auth: None,
         source_node_id,
+        routing_policy: Some(iicp_client::RoutingPolicy {
+            profile: iicp_client::RoutingProfile::from_cli(&routing_profile),
+            allowed_regions: region_allowlist
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+            allow_remote_executor: if allow_remote_executor {
+                Some(true)
+            } else {
+                None
+            },
+            ..Default::default()
+        }),
     };
 
     eprintln!("[iicp-node] Discovering nodes for {}...", intent);
+    if iicp_client::RoutingProfile::from_cli(&routing_profile)
+        != iicp_client::RoutingProfile::Sensitive
+    {
+        eprintln!(
+            "[iicp-node] privacy: the selected remote executor can read prompts it executes; \
+             use --routing-profile sensitive for fail-closed no-remote dispatch."
+        );
+    }
     let resp = client.submit(request).await.map_err(|e| format!("{e}"))?;
 
     // Spec iicp-dir.md §task response: terminal success status is "success" (was "completed";

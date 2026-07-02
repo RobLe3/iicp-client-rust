@@ -2,6 +2,53 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Client-side remote-routing profile (#585).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingProfile {
+    Standard,
+    Sensitive,
+    EuRestricted,
+    StrictPolicy,
+    DebugOverride,
+}
+
+impl Default for RoutingProfile {
+    fn default() -> Self {
+        Self::Standard
+    }
+}
+
+impl RoutingProfile {
+    pub fn from_cli(value: &str) -> Self {
+        match value.replace('-', "_").to_ascii_lowercase().as_str() {
+            "sensitive" => Self::Sensitive,
+            "eu_restricted" => Self::EuRestricted,
+            "strict_policy" => Self::StrictPolicy,
+            "debug_override" => Self::DebugOverride,
+            _ => Self::Standard,
+        }
+    }
+}
+
+/// Client-side pre-dispatch routing policy (#585).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RoutingPolicy {
+    pub profile: RoutingProfile,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_regions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_encryption: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_policy_manifest: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub require_no_payload_retention: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_remote_executor: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_operator_only: Option<bool>,
+}
+
 /// Client configuration (SDK-04: timeout_ms enforced at construction time).
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -21,6 +68,8 @@ pub struct ClientConfig {
     pub routing_top_k: usize,
     /// Softmax temperature for softmax_top_k.
     pub routing_softmax_tau: f64,
+    /// Phase 6 (#585): default client-side policy applied before remote dispatch.
+    pub routing_policy: RoutingPolicy,
 }
 
 impl Default for ClientConfig {
@@ -54,6 +103,7 @@ impl Default for ClientConfig {
             routing_strategy: strategy,
             routing_top_k: top_k,
             routing_softmax_tau: tau,
+            routing_policy: RoutingPolicy::default(),
         }
     }
 }
@@ -206,6 +256,9 @@ pub struct TaskRequest {
     /// CIPWorkerReceipt, enabling the directory to detect same-operator loops.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_node_id: Option<String>,
+    /// Phase 6 (#585): optional per-request policy. Never serialized to nodes.
+    #[serde(skip)]
+    pub routing_policy: Option<RoutingPolicy>,
 }
 
 /// Constraints block for a task request.
@@ -260,6 +313,7 @@ pub struct ChatOptions {
     pub max_tokens: Option<u32>,
     pub timeout_ms: Option<u64>,
     pub temperature: Option<f64>,
+    pub routing_policy: Option<RoutingPolicy>,
 }
 
 /// OpenAI-compatible chat completion response.

@@ -10,6 +10,10 @@ use crate::consumer_token::{acquire_consumer_token, ConsumerTokenCache};
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
 use crate::policy::ensure_intent_allowed;
+use crate::routing_policy::{
+    filter_nodes_for_routing_policy, resolved_policy, routing_policy_refusal_message,
+    ROUTING_POLICY_REFUSAL_CODE,
+};
 use crate::types::*;
 
 // Compiled once at first use — avoid per-call allocation (fix: rust#3).
@@ -228,9 +232,7 @@ impl IicpClient {
         // selection. A keyless provider must never receive plaintext by default; the
         // temporary escape hatch is intentionally explicit and noisy for controlled
         // transition/debugging only.
-        let allow_plaintext = cx_plaintext_fallback_allowed();
-        let mut skipped_keyless = 0usize;
-        let safe_nodes: Vec<_> = nodes
+        let pre_policy_nodes: Vec<_> = nodes
             .nodes
             .into_iter()
             .filter(|n| {
@@ -245,28 +247,56 @@ impl IicpClient {
                 if !n.available {
                     return false;
                 }
-                if n.cx_public_key.is_none() && !allow_plaintext {
-                    skipped_keyless += 1;
-                    eprintln!(
-                        "[iicp-cx] skipping keyless node {} — refusing plaintext by default \
-                         (set IICP_CX_ALLOW_PLAINTEXT=1 only for transitional debugging).",
-                        node_short_id(&n.node_id)
-                    );
-                    return false;
-                }
                 true
             })
             .collect();
 
-        if safe_nodes.is_empty() && skipped_keyless > 0 {
+        let request_policy = request
+            .routing_policy
+            .as_ref()
+            .unwrap_or(&self.config.routing_policy);
+        let effective_policy = resolved_policy(Some(request_policy));
+        let allow_plaintext =
+            cx_plaintext_fallback_allowed() || !effective_policy.require_encryption;
+        let decision = filter_nodes_for_routing_policy(
+            pre_policy_nodes.clone(),
+            &effective_policy,
+            allow_plaintext,
+        );
+        for n in &pre_policy_nodes {
+            if n.cx_public_key.is_none() && !allow_plaintext {
+                eprintln!(
+                    "[iicp-cx] skipping keyless node {} — refusing plaintext by default \
+                     (set IICP_CX_ALLOW_PLAINTEXT=1 or routing_profile=debug_override only for transitional debugging).",
+                    node_short_id(&n.node_id)
+                );
+            }
+        }
+
+        if decision.eligible.is_empty()
+            && decision.skipped_keyless > 0
+            && decision.rejected_reasons.len() == decision.skipped_keyless
+        {
             return Err(IicpError::Node(format!(
-                "IICP-CX confidentiality required: {skipped_keyless} discovered node(s) advertised no encryption key; refusing plaintext fallback"
+                "IICP-CX confidentiality required: {} discovered node(s) advertised no encryption key; refusing plaintext fallback",
+                decision.skipped_keyless
             )));
+        }
+        if decision.eligible.is_empty() {
+            return Err(IicpError::PolicyRefused {
+                code: ROUTING_POLICY_REFUSAL_CODE.to_string(),
+                message: routing_policy_refusal_message(
+                    &request.intent,
+                    &decision,
+                    &effective_policy,
+                ),
+            });
         }
 
         let candidates: Vec<_> = {
             let mut rng = rand::thread_rng();
             let max_retries = MAX_RETRIES as usize;
+            let safe_nodes = decision.eligible;
             if self.config.routing_strategy == "deterministic" || safe_nodes.len() <= 1 {
                 safe_nodes.into_iter().take(max_retries).collect()
             } else if self.config.routing_strategy == "softmax_top_k" {
@@ -428,6 +458,7 @@ impl IicpClient {
             }),
             auth: None,
             source_node_id: None,
+            routing_policy: opts.routing_policy,
         };
         let task_resp = self.submit(request).await?;
         let node_id = task_resp.metrics.as_ref().and_then(|m| m.node_id.clone());

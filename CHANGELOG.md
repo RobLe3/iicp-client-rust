@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [0.7.80] — 2026-07-02
+
+### Added — remote-routing policy profiles
+- Added client-side routing policies that filter discovered nodes before any prompt is dispatched: `standard`, `sensitive`, `eu_restricted`, `strict_policy`, and `debug_override`.
+- `iicp-node query` now exposes `--routing-profile`, `--region-allowlist`, and `--allow-remote-executor`, and prints a plain privacy reminder that remote executors can read prompts they run.
+
 ## [0.7.79] — 2026-07-02
 
 ### Fixed — direct IPv6 route promotion recovery

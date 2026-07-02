@@ -60,6 +60,7 @@ pub mod relay_session;
 pub mod relay_ticket;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_worker_client;
+pub mod routing_policy;
 pub mod scheduler;
 pub mod token_validator;
 pub mod trust_auditor;
@@ -80,7 +81,12 @@ pub use policy::{
     ensure_intent_allowed, prohibited_intent_reason, ProhibitedIntentRule, POLICY_REFUSAL_CODE,
     PROHIBITED_INTENT_RULES,
 };
+pub use routing_policy::{
+    filter_nodes_for_routing_policy, resolved_policy, routing_policy_refusal_message,
+    ROUTING_POLICY_REFUSAL_CODE,
+};
 pub use types::{
     ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage, ClientConfig, CxPublicKey,
-    DiscoverOptions, Node, NodeList, TaskAuth, TaskConstraints, TaskRequest, TaskResponse,
+    DiscoverOptions, Node, NodeList, RoutingPolicy, RoutingProfile, TaskAuth, TaskConstraints,
+    TaskRequest, TaskResponse,
 };

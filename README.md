@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.79"
+iicp-client = "0.7.80"
 ```
 
 ## One-line test
@@ -41,12 +41,17 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.79 or newer
+iicp-node --version    # prints iicp-node 0.7.80 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
 routes your prompt, and prints the response. No account, API key, or local node
 is required for this consumer path.
+
+Privacy note: the selected remote node can read the prompt it executes. IICP-CX
+keeps key-ready transport/relay paths confidential, but it is not
+executor-blind inference. For sensitive data, use local/browser inference or a
+fail-closed routing profile.
 
 ## Use from Rust
 
@@ -70,6 +75,34 @@ async fn main() -> iicp_client::Result<()> {
 
 No. Running a node is only needed when you want to provide compute or tools to
 the mesh. Start as a client; run a node later when you want to contribute.
+
+## Routing policy profiles
+
+The client applies routing policy **after prompt-free discovery and before the
+prompt is sent**. Defaults stay adoption-friendly but keyless plaintext is still
+refused.
+
+```bash
+iicp-node query "Hello" --routing-profile standard        # default encrypted mesh
+iicp-node query "Secret" --routing-profile sensitive      # fail closed: no remote executor
+iicp-node query "Hello" --routing-profile eu-restricted   # EU/EEA regions only
+iicp-node query "Hello" --routing-profile strict-policy   # requires no-retention manifest
+```
+
+```rust
+use iicp_client::{ChatOptions, RoutingPolicy, RoutingProfile};
+
+let reply = client.chat(
+    vec![ChatMessage { role: "user".into(), content: "Hello".into() }],
+    Some(ChatOptions {
+        routing_policy: Some(RoutingPolicy {
+            profile: RoutingProfile::EuRestricted,
+            ..Default::default()
+        }),
+        ..Default::default()
+    }),
+).await?;
+```
 
 ## Migrate from existing AI tools
 
@@ -97,17 +130,13 @@ base URL. Full guide: <https://iicp.network/docs/proxy>
 
 ## Provider upgrade note
 
-> **Upgrade note (0.7.79)** — upgrade provider nodes so “Direct IPv6 —
-> unverified” becomes a temporary recovery state instead of a stable endpoint
-> mode. Heartbeat recovery now treats self-attested IPv6 routes as limited reach
-> and, under launchd/systemd/Docker supervision, restarts the node so startup can
-> retry Quick Tunnel or relay fallback after cooldown. Rust relay workers also
-> re-register their path-scoped relay endpoint after a successful bind.
+> **Upgrade note (0.7.80)** — clients now support remote-routing policy profiles
+> that can refuse unsafe remote dispatch before any prompt leaves the caller.
+> Use `--routing-profile sensitive` for fail-closed no-remote behavior,
+> `eu-restricted` for EU/EEA node filtering, or `strict-policy` when a
+> no-retention node policy manifest is required.
 >
-> This keeps the 0.7.78 relay-capable guard intact: relays do not self-elect
-> through another relay, and ordinary provider nodes can still use relay fallback
-> as the last-resort path. Persistent relays should use a named tunnel or
-> `IICP_PUBLIC_ENDPOINT`.
+> Existing provider reachability fixes from 0.7.79 remain intact.
 
 ### Keeping provider nodes current
 
@@ -120,7 +149,7 @@ node so identity and cached node tokens are preserved.
 If a node is older than 0.7.67, perform one manual upgrade/restart first,
 especially for Dockerized Python or TypeScript providers: early updater wiring
 did not reliably cover every normal `serve` path. For Docker, use a restart
-policy such as `--restart unless-stopped` so 0.7.79 can intentionally exit from
+policy such as `--restart unless-stopped` so 0.7.80 can intentionally exit from
 a confirmed tunnel-dead state and let Docker bring it back cleanly.
 
 
@@ -210,6 +239,7 @@ let config = ClientConfig {
     timeout_ms    : 30_000,                              // max 120 000 (SDK-04)
     region        : Some("eu-central".into()),           // prefer nodes in region
     node_token    : None,                                // optional auth token
+    ..Default::default()
 };
 ```
 
@@ -218,6 +248,7 @@ let config = ClientConfig {
 | `directory_url` | `"https://iicp.network/api"` | IICP directory endpoint |
 | `timeout_ms` | `30000` | Request timeout — max 120 000 ms |
 | `region` | `None` | Preferred node region |
+| `routing_policy` | `RoutingPolicy::default()` | Pre-dispatch remote-routing gate; use `Sensitive`, `EuRestricted`, `StrictPolicy`, or an explicit debug override for special cases |
 | `node_token` | `None` | Bearer token for authenticated nodes |
 | `routing_epsilon` | `0.05` | ε-greedy exploration probability — with this probability a random node is selected instead of the top-ranked one, promoting discovery of new providers; `0.0` disables; override with `IICP_ROUTING_EPSILON` |
 
