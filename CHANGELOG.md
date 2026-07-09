@@ -14,6 +14,12 @@ in the main repo).
 - Rejected or rotated/revoked manifests fail closed with redacted routing-policy reasons and no task POST to the rejected node.
 - Expanded the packaged `mcp-gateway` dangerous-tool denylist for public-unknown callers and redacted upstream MCP error details to avoid echoing tool-input or secret text.
 
+## [0.7.82] — 2026-07-09
+
+### Fixed — saved credential recovery
+- Successful provider re-registration now persists refreshed `node_token` and `node_hmac_key` back to the saved node identity, so read-only commands such as `iicp-node credits` do not drift behind a healthy running node.
+- `iicp-node doctor` now reports stale saved credentials separately from serving health and explains `backend_cold` as normal idle/warmup rather than an automatic restart condition.
+
 ## [0.7.81] — 2026-07-02
 
 ### Changed — cross-SDK release parity

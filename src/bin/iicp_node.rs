@@ -1789,6 +1789,45 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
         Duration::from_secs(5),
     )
     .await;
+    let mut saved_credential_status = if node.node_token.is_some() {
+        "error".to_string()
+    } else {
+        "missing_token".to_string()
+    };
+    if let Some(saved_token) = node.node_token.as_deref() {
+        let url = format!(
+            "{}/v1/credits/summary?node_id={}",
+            directory_url.trim_end_matches('/'),
+            node.node_id
+        );
+        match http
+            .get(url)
+            .bearer_auth(saved_token)
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().as_u16() == 401 => {
+                saved_credential_status = "stale_or_invalid".to_string();
+            }
+            Ok(resp) if resp.status().is_success() => {
+                saved_credential_status = "ok".to_string();
+            }
+            Ok(_) | Err(_) => {
+                saved_credential_status = "error".to_string();
+            }
+        }
+    }
+    let backend_state = health_json
+        .get("backend_stability")
+        .and_then(|v| v.get("backend_state"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let backend_reason = health_json
+        .get("backend_stability")
+        .and_then(|v| v.get("reason_class"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
     let initial_failures = if !local_health_ok
         || matches!(presence, iicp_client::recovery::DirectoryPresence::Absent)
     {
@@ -1818,6 +1857,7 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
                 "local_health_ok": local_health_ok,
                 "local_health_error": health_error,
                 "directory_presence": presence,
+                "saved_credential_status": saved_credential_status,
                 "recovery_state": state,
                 "recommended_action": action,
                 "health": health_json,
@@ -1835,6 +1875,18 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
         }
         println!("  Directory prefix        {prefix}");
         println!("  Directory presence      {presence:?}");
+        println!("  Saved credential        {saved_credential_status}");
+        if saved_credential_status == "stale_or_invalid" {
+            println!(
+                "  Credential detail       saved node token is stale; serving may be healthy while credits fail"
+            );
+        }
+        println!("  Backend stability       {backend_state} / {backend_reason}");
+        if backend_reason == "backend_cold" {
+            println!(
+                "  Backend detail          idle/cold backend; normally warms on first request, not restart-worthy by itself"
+            );
+        }
         println!("  Recovery state          {state:?}");
         println!("  Recommended action      {action:?}");
         println!(
@@ -2610,6 +2662,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let resolved_log_dir = cfg.log_dir.clone();
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
     let mut node = IicpNode::new(cfg);
+    if !opts.node.is_empty() {
+        node.set_saved_node_name(opts.node.clone());
+    }
     // Phase 2 (#529/#55) — seed the cached node_token so a re-registration (e.g.
     // after a tunnel-URL rotation) proves ownership via current_node_token.
     if let Some(tok) = &saved_node_token {

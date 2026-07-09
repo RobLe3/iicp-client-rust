@@ -1,6 +1,6 @@
 [package]
 name = "iicp-client"
-version = "0.7.81"
+version = "0.7.82"
 edition = "2021"
 rust-version = "1.86"
 description = "Use the open IICP AI mesh from Rust without running a node"

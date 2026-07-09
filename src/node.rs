@@ -105,19 +105,95 @@ async fn probe_health_models_bg(
     None
 }
 
-/// #404 — re-register: POST the register payload and return the fresh `node_token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistrationCredentials {
+    node_token: String,
+    node_hmac_key: Option<String>,
+}
+
+/// #404 — re-register: POST the register payload and return fresh credentials.
 /// Extracted from the heartbeat loop's re-register arm so the self-heal behaviour
 /// is unit-testable (the 30s interval loop itself is not).
-async fn reregister(http: &Client, url: &str, payload: &serde_json::Value) -> Option<String> {
+async fn reregister(
+    http: &Client,
+    url: &str,
+    payload: &serde_json::Value,
+) -> Option<RegistrationCredentials> {
     let resp = http.post(url).json(payload).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
     }
     let data = resp.json::<serde_json::Value>().await.ok()?;
-    data["node_token"]
+    let token = data["node_token"]
         .as_str()
-        .or_else(|| data["token"].as_str())
-        .map(String::from)
+        .or_else(|| data["token"].as_str())?;
+    Some(RegistrationCredentials {
+        node_token: token.to_string(),
+        node_hmac_key: data["node_hmac_key"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
+}
+
+fn update_saved_identity_credentials(
+    identity: &mut crate::identity::NodeIdentity,
+    token: &str,
+    hmac_key: Option<&str>,
+) {
+    identity.node_token = Some(token.to_string());
+    if let Some(key) = hmac_key.filter(|k| !k.is_empty()) {
+        identity.node_hmac_key = Some(key.to_string());
+    }
+}
+
+fn persist_saved_credentials(saved_node_name: Option<&str>, token: &str, hmac_key: Option<&str>) {
+    let Some(name) = saved_node_name.filter(|n| !n.trim().is_empty()) else {
+        return;
+    };
+    if token.is_empty() {
+        return;
+    }
+    match crate::identity::load_node(name) {
+        Ok(Some(mut identity)) => {
+            update_saved_identity_credentials(&mut identity, token, hmac_key);
+            if let Err(err) = crate::identity::save_node(&identity) {
+                tracing::warn!(
+                    "could not persist refreshed node credentials for saved node {name}: {err}"
+                );
+            }
+        }
+        Ok(None) => tracing::warn!(
+            "saved node config {name} not found; cannot persist refreshed node credentials"
+        ),
+        Err(err) => tracing::warn!(
+            "could not load saved node config {name} to persist refreshed credentials: {err}"
+        ),
+    }
+}
+
+fn apply_runtime_credentials(
+    token_slot: &Arc<std::sync::RwLock<String>>,
+    hmac_slot: &Arc<std::sync::RwLock<String>>,
+    saved_node_name: Option<&str>,
+    credentials: RegistrationCredentials,
+) -> String {
+    let token = credentials.node_token;
+    if let Some(hmac) = credentials.node_hmac_key.filter(|s| !s.is_empty()) {
+        if let Ok(mut guard) = hmac_slot.write() {
+            *guard = hmac;
+        }
+    }
+    if let Ok(mut guard) = token_slot.write() {
+        *guard = token.clone();
+    }
+    let hmac_snapshot = hmac_slot.read().map(|g| g.clone()).unwrap_or_default();
+    persist_saved_credentials(
+        saved_node_name,
+        &token,
+        Some(hmac_snapshot.as_str()).filter(|s| !s.is_empty()),
+    );
+    token
 }
 
 /// #409 — classify a backend model name to the IICP intent it serves.
@@ -1366,6 +1442,10 @@ pub struct IicpNode {
     cx_public_key: Option<crate::types::CxPublicKey>,
     cx_private_key: Option<[u8; 32]>,
     backend_stability: Arc<std::sync::RwLock<BackendStabilityObservation>>,
+    /// Saved node identity name loaded by `iicp-node serve --node NAME`.
+    /// When present, refreshed registration credentials are persisted so
+    /// read-only commands such as `credits` do not drift behind the running node.
+    saved_node_name: Option<String>,
 }
 
 impl IicpNode {
@@ -1403,7 +1483,16 @@ impl IicpNode {
             backend_stability: Arc::new(std::sync::RwLock::new(
                 BackendStabilityObservation::default(),
             )),
+            saved_node_name: None,
         }
+    }
+
+    /// Persist refreshed directory credentials into this saved node identity.
+    /// This is intentionally opt-in so library users that construct transient
+    /// nodes do not write local config files.
+    pub fn set_saved_node_name(&mut self, name: impl Into<String>) {
+        let name = name.into();
+        self.saved_node_name = (!name.trim().is_empty()).then_some(name);
     }
 
     /// #527 — the effective register endpoint: the watchdog override (set on a
@@ -1524,12 +1613,17 @@ impl IicpNode {
             "{}/v1/register",
             self.cfg.directory_url.trim_end_matches('/')
         );
-        if let Some(t) = reregister(&self.http, &url, &new_payload).await {
+        if let Some(credentials) = reregister(&self.http, &url, &new_payload).await {
             if models_changed {
                 *self.registered_models.write().expect("poisoned") = live;
             }
             *self.registered_endpoint.write().expect("poisoned") = self.effective_endpoint();
-            *self.runtime_token.write().expect("poisoned") = t;
+            apply_runtime_credentials(
+                &self.runtime_token,
+                &self.runtime_hmac_key,
+                self.saved_node_name.as_deref(),
+                credentials,
+            );
             if endpoint_changed {
                 tracing::info!(
                     "[iicp-node] re-registered after endpoint rotation → {}",
@@ -1834,6 +1928,16 @@ impl IicpNode {
                 }
             }
         }
+        let hmac_snapshot = self
+            .runtime_hmac_key
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        persist_saved_credentials(
+            self.saved_node_name.as_deref(),
+            token,
+            Some(hmac_snapshot.as_str()).filter(|s| !s.is_empty()),
+        );
         // #494 — track the registered model set for drift detection.
         {
             let mut models: Vec<String> = match &self.cfg.model {
@@ -2223,6 +2327,7 @@ impl IicpNode {
             // if the directory drops the node (deregister/TTL-expiry/restart).
             let hb_register_payload = self.build_register_payload();
             let hb_token_arc = Arc::clone(&self.runtime_token);
+            let hb_saved_node_name = self.saved_node_name.clone();
             let hb_register_url = format!("{}/v1/register", dir.trim_end_matches('/'));
             // #494 — model drift detection: capture backend probe config + registered models.
             let hb_backend_url = self.cfg.backend_url.clone();
@@ -2369,15 +2474,17 @@ impl IicpNode {
                                             build_capabilities(&live, &hb_intent, hb_max_tokens);
                                         new_payload["capabilities"] =
                                             serde_json::to_value(&new_caps).unwrap_or(json!([]));
-                                        if let Some(t) =
+                                        if let Some(credentials) =
                                             reregister(&http, &hb_register_url, &new_payload).await
                                         {
                                             *hb_registered_models.write().expect("poisoned") =
                                                 live.clone();
-                                            token = t;
-                                            if let Ok(mut g) = hb_token_arc.write() {
-                                                *g = token.clone();
-                                            }
+                                            token = apply_runtime_credentials(
+                                                &hb_token_arc,
+                                                &hb_runtime_hmac_key,
+                                                hb_saved_node_name.as_deref(),
+                                                credentials,
+                                            );
                                             tracing::info!(
                                                 "seq={seq} model drift: re-registered with {} models",
                                                 live.len()
@@ -2401,15 +2508,17 @@ impl IicpNode {
                                     let mut new_payload = hb_register_payload.clone();
                                     new_payload["endpoint"] = json!(ep);
                                     new_payload["current_node_token"] = json!(token);
-                                    if let Some(t) =
+                                    if let Some(credentials) =
                                         reregister(&http, &hb_register_url, &new_payload).await
                                     {
                                         *hb_registered_endpoint.write().expect("poisoned") =
                                             ep.clone();
-                                        token = t;
-                                        if let Ok(mut g) = hb_token_arc.write() {
-                                            *g = token.clone();
-                                        }
+                                        token = apply_runtime_credentials(
+                                            &hb_token_arc,
+                                            &hb_runtime_hmac_key,
+                                            hb_saved_node_name.as_deref(),
+                                            credentials,
+                                        );
                                         tracing::info!(
                                             "seq={seq} endpoint rotation: re-registered → {ep}"
                                         );
@@ -2490,16 +2599,18 @@ impl IicpNode {
                                         match reregister(&http, &hb_register_url, &new_payload)
                                             .await
                                         {
-                                            Some(t) => {
+                                            Some(credentials) => {
                                                 if let Some(ep) = new_payload["endpoint"].as_str() {
                                                     *hb_registered_endpoint
                                                         .write()
                                                         .expect("poisoned") = ep.to_string();
                                                 }
-                                                token = t;
-                                                if let Ok(mut g) = hb_token_arc.write() {
-                                                    *g = token.clone();
-                                                }
+                                                token = apply_runtime_credentials(
+                                                    &hb_token_arc,
+                                                    &hb_runtime_hmac_key,
+                                                    hb_saved_node_name.as_deref(),
+                                                    credentials,
+                                                );
                                                 recovery_failures = 0;
                                                 if let Some(ref log) = hb_log {
                                                     log.write(
@@ -2552,11 +2663,13 @@ impl IicpNode {
                                 "heartbeat rejected ({code}) — node unknown to directory; re-registering"
                             );
                             match reregister(&http, &hb_register_url, &hb_register_payload).await {
-                                Some(t) => {
-                                    token = t;
-                                    if let Ok(mut g) = hb_token_arc.write() {
-                                        *g = token.clone();
-                                    }
+                                Some(credentials) => {
+                                    token = apply_runtime_credentials(
+                                        &hb_token_arc,
+                                        &hb_runtime_hmac_key,
+                                        hb_saved_node_name.as_deref(),
+                                        credentials,
+                                    );
                                     if let Some(ref log) = hb_log {
                                         log.write(
                                             "reregister_ok",
@@ -2662,6 +2775,8 @@ impl IicpNode {
                 self.cfg.directory_url.trim_end_matches('/')
             );
             let relay_token_arc = Arc::clone(&self.runtime_token);
+            let relay_hmac_arc = Arc::clone(&self.runtime_hmac_key);
+            let relay_saved_node_name = self.saved_node_name.clone();
             let relay_registered_endpoint = Arc::clone(&self.registered_endpoint);
             let handler_fn: crate::relay_worker_client::RelayHandlerFn =
                 Arc::new(move |task: Value| {
@@ -2713,6 +2828,8 @@ impl IicpNode {
                     let url = relay_register_url.clone();
                     let mut payload = relay_register_payload.clone();
                     let token_arc = Arc::clone(&relay_token_arc);
+                    let hmac_arc = Arc::clone(&relay_hmac_arc);
+                    let saved_node_name = relay_saved_node_name.clone();
                     let registered_endpoint = Arc::clone(&relay_registered_endpoint);
                     Box::pin(async move {
                         // Path-scoped endpoint (#450): consumers compose
@@ -2731,14 +2848,17 @@ impl IicpNode {
                             payload["current_node_token"] = json!(current_token);
                         }
                         match reregister(&http, &url, &payload).await {
-                            Some(t) => {
+                            Some(credentials) => {
                                 if let Some(ep) = payload["endpoint"].as_str() {
                                     *registered_endpoint.write().expect("poisoned") =
                                         ep.to_string();
                                 }
-                                if let Ok(mut g) = token_arc.write() {
-                                    *g = t;
-                                }
+                                apply_runtime_credentials(
+                                    &token_arc,
+                                    &hmac_arc,
+                                    saved_node_name.as_deref(),
+                                    credentials,
+                                );
                                 tracing::info!("Relay worker bound — re-registered relay endpoint");
                             }
                             None => {
@@ -2992,7 +3112,7 @@ mod capability_tests {
 
 #[cfg(test)]
 mod reregister_tests {
-    use super::reregister;
+    use super::{reregister, update_saved_identity_credentials};
     use serde_json::json;
 
     // #404 — the re-register seam used by the self-healing heartbeat loop:
@@ -3010,8 +3130,42 @@ mod reregister_tests {
         let payload = json!({"endpoint": "https://x", "region": "r"});
         let url = format!("{}/v1/register", server.url());
         let tok = reregister(&http, &url, &payload).await;
-        assert_eq!(tok, Some("recovered-xyz".to_string()));
+        assert_eq!(
+            tok,
+            Some(super::RegistrationCredentials {
+                node_token: "recovered-xyz".to_string(),
+                node_hmac_key: None,
+            })
+        );
         m.assert_async().await;
+    }
+
+    #[test]
+    fn update_saved_identity_credentials_updates_token_and_hmac() {
+        let mut node = crate::identity::NodeIdentity {
+            node_id: "drift-rs-1".to_string(),
+            operator_id: "op-test".to_string(),
+            name: "drift".to_string(),
+            backend_url: "http://mock-backend".to_string(),
+            model: "phi3:mini".to_string(),
+            intent: "urn:iicp:intent:llm:chat:v1".to_string(),
+            region: "eu-central".to_string(),
+            directory_url: "http://mock-dir".to_string(),
+            max_concurrent: 4,
+            port: 9484,
+            host: "0.0.0.0".to_string(),
+            public_endpoint: "http://node.local:8080".to_string(),
+            auto_detect_nat: false,
+            external_ip_probe_url: String::new(),
+            node_token: Some("old-token".to_string()),
+            node_hmac_key: Some("old-hmac".to_string()),
+            created_at: "2026-07-09T00:00:00Z".to_string(),
+        };
+
+        update_saved_identity_credentials(&mut node, "new-token", Some("new-hmac"));
+
+        assert_eq!(node.node_token.as_deref(), Some("new-token"));
+        assert_eq!(node.node_hmac_key.as_deref(), Some("new-hmac"));
     }
 
     #[tokio::test]
