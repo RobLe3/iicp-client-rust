@@ -112,6 +112,118 @@ async fn policy_refuses_prohibited_intent_before_discovery() {
 }
 
 #[tokio::test]
+async fn policy_refuses_high_risk_intent_before_discovery() {
+    let client = IicpClient::new(ClientConfig::default()).unwrap();
+    let err = client
+        .discover("urn:iicp:intent:credit:decision:v1", None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IicpError::PolicyRefused { .. }));
+}
+
+#[tokio::test]
+async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
+    let mut server = mockito::Server::new_async().await;
+    let endpoint = server.url();
+    let _ticket = server
+        .mock("POST", "/v1/dispatch/ticket")
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "ticket": "secret-ticket-token",
+                "ticket_id_prefix": "abc123def456",
+                "node_id": "node-ticket",
+                "route": {
+                    "node_id": "node-ticket", "endpoint": endpoint, "score": 0.9,
+                    "available": true, "region": "eu",
+                    "cx_public_key": {
+                        "algorithm": "X25519", "encoding": "base64url",
+                        "key": "-LKZgrZEnFMr9ctB3uQDKsME07ZzS4Ce-SapFAePul0",
+                        "key_id": "cx-fixture"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _task = server
+        .mock("POST", "/v1/task")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"task_id":"t-ticket","status":"success","result":{"answer":42},"metrics":null}"#,
+        )
+        .create_async()
+        .await;
+    let client = IicpClient::new(ClientConfig {
+        directory_url: server.url(),
+        route_discovery_mode: "ticketed".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let response = client
+        .submit(TaskRequest {
+            task_id: String::new(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            payload: serde_json::json!({"messages": []}),
+            constraints: None,
+            auth: None,
+            source_node_id: None,
+            routing_policy: None,
+        })
+        .await
+        .unwrap();
+    assert!(response.generated_by_ai);
+    assert_eq!(
+        response.dispatch_ticket_id_prefix.as_deref(),
+        Some("abc123def456")
+    );
+    assert!(!format!("{response:?}").contains("secret-ticket-token"));
+}
+
+#[tokio::test]
+async fn ticket_policy_refusal_does_not_downgrade() {
+    let mut server = mockito::Server::new_async().await;
+    let _ticket = server
+        .mock("POST", "/v1/dispatch/ticket")
+        .with_status(422)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"validation_error","message":"refused"}}"#)
+        .create_async()
+        .await;
+    let discover = server
+        .mock("GET", mockito::Matcher::Regex(r"/v1/discover.*".into()))
+        .with_status(200)
+        .with_body(r#"{"nodes":[],"count":0}"#)
+        .expect(0)
+        .create_async()
+        .await;
+    let client = IicpClient::new(ClientConfig {
+        directory_url: server.url(),
+        route_discovery_mode: "auto".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let err = client
+        .submit(TaskRequest {
+            task_id: String::new(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            payload: serde_json::json!({}),
+            constraints: None,
+            auth: None,
+            source_node_id: None,
+            routing_policy: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, IicpError::Protocol { status: 422, .. }));
+    discover.assert_async().await;
+}
+
+#[tokio::test]
 async fn sdk03_accepts_valid_intent() {
     // Validates pattern only — no network call needed for intent check.
     // A network error here means the intent was accepted (correct).

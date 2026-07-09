@@ -10,6 +10,14 @@ use crate::errors::{IicpError, Result};
 pub const POLICY_REFUSAL_CODE: &str = "IICP-POLICY-001";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentRiskCategory {
+    Prohibited,
+    HighRisk,
+    TransparencyRisk,
+    MinimalOrGeneral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProhibitedIntentRule {
     pub rule_id: &'static str,
     pub label: &'static str,
@@ -79,6 +87,119 @@ pub const PROHIBITED_INTENT_RULES: &[ProhibitedIntentRule] = &[
     },
 ];
 
+pub const HIGH_RISK_INTENT_RULES: &[ProhibitedIntentRule] = &[
+    ProhibitedIntentRule {
+        rule_id: "eu-ai-act-employment-workforce",
+        label: "employment or workforce decision",
+        fragments: &[
+            "employment:hiring",
+            "employment:screen",
+            "employment:rank",
+            "recruitment:decision",
+            "workforce:decision",
+            "worker-management",
+            "worker:performance",
+            "worker:discipline",
+        ],
+    },
+    ProhibitedIntentRule {
+        rule_id: "eu-ai-act-education-admission-grading",
+        label: "education admission or grading decision",
+        fragments: &[
+            "education:admission",
+            "education:grading",
+            "education:grade",
+            "student:admission",
+            "student:assess",
+            "exam-grading",
+        ],
+    },
+    ProhibitedIntentRule {
+        rule_id: "eu-ai-act-credit-essential-services",
+        label: "credit or essential-services decision",
+        fragments: &[
+            "credit-scoring",
+            "credit:score",
+            "credit:decision",
+            "essential-services",
+            "benefits:eligibility",
+            "public-benefit:eligibility",
+        ],
+    },
+    ProhibitedIntentRule {
+        rule_id: "eu-ai-act-law-enforcement-border-justice",
+        label: "law enforcement, border, justice or democratic-process decision",
+        fragments: &[
+            "law-enforcement",
+            "law_enforcement",
+            "migration:decision",
+            "asylum:decision",
+            "border-control",
+            "justice:decision",
+            "democratic-process",
+            "election:decision",
+        ],
+    },
+    ProhibitedIntentRule {
+        rule_id: "eu-ai-act-healthcare-critical-infrastructure",
+        label: "healthcare or critical-infrastructure safety decision",
+        fragments: &[
+            "healthcare:decision",
+            "medical:diagnosis",
+            "medical:triage",
+            "clinical:decision",
+            "critical-infrastructure",
+            "grid:stabilize",
+            "hospital:surge-capacity",
+        ],
+    },
+    ProhibitedIntentRule {
+        rule_id: "eu-ai-act-physical-world-control",
+        label: "physical-world control",
+        fragments: &[
+            "robotics:control",
+            "robotics:fleet",
+            "drone:control",
+            "drone:search",
+            "iot:actuate",
+            "physical-world",
+            "system_control",
+        ],
+    },
+];
+
+const TRANSPARENCY_FRAGMENTS: &[&str] = &[
+    "chatbot",
+    "ai-assistant",
+    "synthetic-media",
+    "deepfake:labelled",
+    "content:generate-public",
+    "creative:generate",
+];
+
+pub fn classify_intent(intent: &str) -> IntentRiskCategory {
+    let normalized = intent.trim().to_ascii_lowercase();
+    if PROHIBITED_INTENT_RULES
+        .iter()
+        .any(|r| r.fragments.iter().any(|f| normalized.contains(f)))
+    {
+        return IntentRiskCategory::Prohibited;
+    }
+    if HIGH_RISK_INTENT_RULES
+        .iter()
+        .any(|r| r.fragments.iter().any(|f| normalized.contains(f)))
+    {
+        return IntentRiskCategory::HighRisk;
+    }
+    if TRANSPARENCY_FRAGMENTS
+        .iter()
+        .any(|f| normalized.contains(f))
+    {
+        return IntentRiskCategory::TransparencyRisk;
+    }
+    IntentRiskCategory::MinimalOrGeneral
+}
+
 pub fn prohibited_intent_reason(intent: &str) -> Option<String> {
     let normalized = intent.trim().to_ascii_lowercase();
     for rule in PROHIBITED_INTENT_RULES {
@@ -94,11 +215,23 @@ pub fn prohibited_intent_reason(intent: &str) -> Option<String> {
 }
 
 pub fn ensure_intent_allowed(intent: &str) -> Result<()> {
-    if let Some(reason) = prohibited_intent_reason(intent) {
+    let category = classify_intent(intent);
+    let normalized = intent.trim().to_ascii_lowercase();
+    let rule = PROHIBITED_INTENT_RULES
+        .iter()
+        .chain(HIGH_RISK_INTENT_RULES.iter())
+        .find(|r| r.fragments.iter().any(|f| normalized.contains(f)));
+    if matches!(
+        category,
+        IntentRiskCategory::Prohibited | IntentRiskCategory::HighRisk
+    ) {
+        let reason = rule
+            .map(|r| format!("{} ({})", r.label, r.rule_id))
+            .unwrap_or_else(|| "restricted intent".into());
         return Err(IicpError::PolicyRefused {
             code: POLICY_REFUSAL_CODE.into(),
             message: format!(
-                "Intent refused by IICP client policy before discovery/routing: {reason}. Use a lawful, documented, human-reviewed compliance path outside the public mesh for restricted/high-risk workflows."
+                "Intent refused by IICP client policy before discovery/routing: {reason} [{category:?}]. Use an explicit private, documented, human-reviewed compliance path outside the public mesh for restricted/high-risk workflows."
             ),
         });
     }

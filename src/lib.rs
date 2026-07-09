@@ -78,8 +78,8 @@ pub use errors::{IicpError, Result};
 pub use http::make_traceparent;
 pub use node::{IicpNode, NodeConfig};
 pub use policy::{
-    ensure_intent_allowed, prohibited_intent_reason, ProhibitedIntentRule, POLICY_REFUSAL_CODE,
-    PROHIBITED_INTENT_RULES,
+    classify_intent, ensure_intent_allowed, prohibited_intent_reason, IntentRiskCategory,
+    ProhibitedIntentRule, HIGH_RISK_INTENT_RULES, POLICY_REFUSAL_CODE, PROHIBITED_INTENT_RULES,
 };
 pub use routing_policy::{
     filter_nodes_for_routing_policy, resolved_policy, routing_policy_refusal_message,

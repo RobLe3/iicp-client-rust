@@ -67,6 +67,8 @@ pub struct ClientConfig {
     pub routing_softmax_tau: f64,
     /// Phase 6 (#585): default client-side policy applied before remote dispatch.
     pub routing_policy: RoutingPolicy,
+    /// Route endpoint migration mode: auto | ticketed | legacy.
+    pub route_discovery_mode: String,
 }
 
 impl Default for ClientConfig {
@@ -101,6 +103,10 @@ impl Default for ClientConfig {
             routing_top_k: top_k,
             routing_softmax_tau: tau,
             routing_policy: RoutingPolicy::default(),
+            route_discovery_mode: std::env::var("IICP_ROUTE_DISCOVERY_MODE")
+                .ok()
+                .filter(|s| matches!(s.as_str(), "auto" | "ticketed" | "legacy"))
+                .unwrap_or_else(|| "auto".into()),
         }
     }
 }
@@ -157,6 +163,7 @@ pub struct Node {
     pub browser_usable: Option<bool>,
     /// Phase-1 compliance: public, self-attested node policy manifest.
     pub node_policy_manifest: Option<Value>,
+    pub dispatch_ticket_id_prefix: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -212,6 +219,7 @@ impl From<NodeWire> for Node {
             routing_hint: wire.routing_hint,
             browser_usable: wire.browser_usable,
             node_policy_manifest: wire.node_policy_manifest,
+            dispatch_ticket_id_prefix: None,
         }
     }
 }
@@ -286,6 +294,10 @@ pub struct TaskResponse {
     /// code the proxy surfaces). Defaults to None for success responses / older nodes.
     #[serde(default)]
     pub error: Option<serde_json::Value>,
+    #[serde(default)]
+    pub generated_by_ai: bool,
+    #[serde(default)]
+    pub dispatch_ticket_id_prefix: Option<String>,
 }
 
 /// Task execution metrics.
@@ -324,6 +336,8 @@ pub struct ChatResponse {
     /// IICP node that served this request — from task metrics.
     #[serde(default)]
     pub node_id: Option<String>,
+    #[serde(default)]
+    pub generated_by_ai: bool,
 }
 
 /// A single choice in a chat response.

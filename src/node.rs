@@ -472,6 +472,7 @@ pub struct TaskResponse {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
+    pub generated_by_ai: bool,
 }
 
 pub type TaskHandlerFn = Arc<
@@ -1373,6 +1374,7 @@ async fn task_endpoint(
                 status: "success".into(),
                 result: Some(value),
                 error: None,
+                generated_by_ai: true,
             })
             .into_response()
         }
@@ -1391,6 +1393,7 @@ async fn task_endpoint(
                     status: "error".into(),
                     result: None,
                     error: Some(json!({ "message": e.to_string() })),
+                    generated_by_ai: false,
                 }),
             )
                 .into_response()

@@ -200,6 +200,14 @@ fn json_response(status: StatusCode, body: Value) -> Response {
     )
 }
 
+fn ai_generated(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        "x-iicp-generated-by-ai",
+        header::HeaderValue::from_static("true"),
+    );
+    response
+}
+
 // ── dispatch ─────────────────────────────────────────────────────────────────
 enum Outcome {
     Ok(TaskResponse),
@@ -300,7 +308,7 @@ fn err_msg(status: StatusCode) -> &'static str {
 async fn openai_chat(State(b): State<Backend>, Json(body): Json<Value>) -> Response {
     let model = model_of(&body);
     match run_task(&b, messages_of(&body), &model, &body).await {
-        Outcome::Ok(resp) => json_response(StatusCode::OK, to_openai(&resp, &model)),
+        Outcome::Ok(resp) => ai_generated(json_response(StatusCode::OK, to_openai(&resp, &model))),
         Outcome::Err(s, code) => json_response(s, openai_err(&code, err_msg(s))),
     }
 }
@@ -314,13 +322,13 @@ async fn ollama_chat(State(b): State<Backend>, Json(body): Json<Value>) -> Respo
         Outcome::Ok(resp) => {
             let payload = to_ollama(&resp, &model);
             if stream {
-                build(
+                ai_generated(build(
                     StatusCode::OK,
                     "application/x-ndjson",
                     format!("{}\n", payload).into_bytes(),
-                )
+                ))
             } else {
-                json_response(StatusCode::OK, payload)
+                ai_generated(json_response(StatusCode::OK, payload))
             }
         }
         Outcome::Err(s, code) => json_response(s, ollama_err(&code, err_msg(s))),
@@ -342,13 +350,13 @@ async fn ollama_generate(State(b): State<Backend>, Json(body): Json<Value>) -> R
         Outcome::Ok(resp) => {
             let payload = to_ollama_generate(&resp, &model);
             if stream {
-                build(
+                ai_generated(build(
                     StatusCode::OK,
                     "application/x-ndjson",
                     format!("{}\n", payload).into_bytes(),
-                )
+                ))
             } else {
-                json_response(StatusCode::OK, payload)
+                ai_generated(json_response(StatusCode::OK, payload))
             }
         }
         Outcome::Err(s, code) => json_response(s, ollama_err(&code, err_msg(s))),
@@ -397,9 +405,9 @@ async fn anthropic_messages(State(b): State<Backend>, Json(body): Json<Value>) -
                     json!({"delta": {"stop_reason": "end_turn"}}),
                 ));
                 sse.push_str(&ev("message_stop", json!({})));
-                build(StatusCode::OK, "text/event-stream", sse.into_bytes())
+                ai_generated(build(StatusCode::OK, "text/event-stream", sse.into_bytes()))
             } else {
-                json_response(StatusCode::OK, msg)
+                ai_generated(json_response(StatusCode::OK, msg))
             }
         }
         Outcome::Err(s, code) => json_response(s, anthropic_err(&code, err_msg(s))),
@@ -576,12 +584,24 @@ mod tests {
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("")
                 .to_string();
+            let generated_by_ai = resp
+                .headers()
+                .get("x-iicp-generated-by-ai")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
             let text = resp.text().await.unwrap();
             handle.abort();
 
             let exp = &case["expect"];
             assert_eq!(status, exp["status"].as_u64().unwrap(), "status for {name}");
             assert_eq!(server, "iicp-proxy", "Server header for {name}");
+            if status == 200 && req["method"] == "POST" {
+                assert_eq!(
+                    generated_by_ai.as_deref(),
+                    Some("true"),
+                    "AI header for {name}"
+                );
+            }
             if let Some(ct) = exp.get("content_type").and_then(|v| v.as_str()) {
                 assert!(ctype.starts_with(ct), "content-type {ctype} for {name}");
             }

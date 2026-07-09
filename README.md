@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.82"
+iicp-client = "0.7.83"
 ```
 
 ## One-line test
@@ -41,7 +41,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.82 or newer
+iicp-node --version    # prints iicp-node 0.7.83 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,

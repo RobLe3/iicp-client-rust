@@ -23,6 +23,11 @@ static INTENT_RE: LazyLock<Regex> =
 const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_RETRIES: u32 = 3;
 
+enum TicketRouteError {
+    LegacyRequired,
+    Iicp(IicpError),
+}
+
 /// SSRF guard: return true only if url is safe to use as a node endpoint (#388).
 fn is_ssrf_safe(url: &str) -> bool {
     let lower = url.to_lowercase();
@@ -172,6 +177,14 @@ impl IicpClient {
         if config.timeout_ms > MAX_TIMEOUT_MS {
             return Err(IicpError::TimeoutTooLarge(config.timeout_ms));
         }
+        if !matches!(
+            config.route_discovery_mode.as_str(),
+            "auto" | "ticketed" | "legacy"
+        ) {
+            return Err(IicpError::Node(
+                "route_discovery_mode must be auto, ticketed, or legacy".into(),
+            ));
+        }
         let http = HttpClient::new(config.timeout_ms, config.node_token.clone())?;
         Ok(Self {
             config,
@@ -217,6 +230,85 @@ impl IicpClient {
         Ok(list)
     }
 
+    async fn ticketed_candidates(
+        &self,
+        intent: &str,
+        opts: &DiscoverOptions,
+        traceparent: &str,
+    ) -> std::result::Result<Vec<Node>, TicketRouteError> {
+        let base = self.config.directory_url.trim_end_matches('/');
+        let url = format!("{base}/v1/dispatch/ticket");
+        let mut request = serde_json::json!({
+            "intent": intent,
+            "limit": opts.limit.unwrap_or(10).min(50),
+        });
+        if let Some(region) = opts.region.as_ref().or(self.config.region.as_ref()) {
+            request["region"] = serde_json::Value::String(region.clone());
+        }
+        if let Some(model) = &opts.model {
+            request["model"] = serde_json::Value::String(model.clone());
+        }
+        if let Some(reputation) = opts.min_reputation {
+            request["min_reputation"] = serde_json::json!(reputation);
+        }
+
+        let mut excluded: Vec<String> = Vec::new();
+        let mut candidates = Vec::new();
+        for _ in 0..MAX_RETRIES {
+            request["exclude_node_id_prefixes"] = serde_json::json!(excluded);
+            let response = self
+                .http
+                .inner()
+                .post(&url)
+                .header("traceparent", traceparent)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|e| TicketRouteError::Iicp(IicpError::Http(e)))?;
+            let status = response.status().as_u16();
+            if matches!(status, 405 | 501) {
+                return Err(TicketRouteError::LegacyRequired);
+            }
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .map_err(|e| TicketRouteError::Iicp(IicpError::Http(e)))?;
+            let error_code = body["error"]["code"].as_str();
+
+            if status == 201 {
+                let mut route = body["route"].clone();
+                if let Some(obj) = route.as_object_mut() {
+                    obj.insert("node_id".into(), body["node_id"].clone());
+                }
+                let mut node: Node = serde_json::from_value(route)
+                    .map_err(|e| TicketRouteError::Iicp(IicpError::Serde(e)))?;
+                node.dispatch_ticket_id_prefix =
+                    body["ticket_id_prefix"].as_str().map(str::to_owned);
+                excluded.push(node_short_id(&node.node_id).to_string());
+                candidates.push(node);
+                continue;
+            }
+            if status == 404 && error_code == Some("no_route_available") {
+                break;
+            }
+            if status == 404 {
+                return Err(TicketRouteError::LegacyRequired);
+            }
+            if status == 503 && error_code == Some("not_configured") {
+                return Err(TicketRouteError::LegacyRequired);
+            }
+            return Err(TicketRouteError::Iicp(IicpError::Protocol {
+                code: format!("IICP-DISPATCH-TICKET-{status}"),
+                message: format!(
+                    "Ticketed dispatch refused ({})",
+                    error_code.unwrap_or("unknown")
+                ),
+                status,
+            }));
+        }
+        Ok(candidates)
+    }
+
     /// Discover → select best node → submit task (SDK-01/02).
     /// Retries up to MAX_RETRIES on transient errors (SDK-05).
     /// Generates one W3C traceparent shared across discover + POST (SDK-06).
@@ -227,7 +319,32 @@ impl IicpClient {
         }
 
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
-        let nodes = self.discover(&request.intent, None, Some(&tp)).await?;
+        let nodes = if self.config.route_discovery_mode == "legacy" {
+            self.discover(&request.intent, None, Some(&tp)).await?
+        } else {
+            match self
+                .ticketed_candidates(&request.intent, &DiscoverOptions::default(), &tp)
+                .await
+            {
+                Ok(nodes) => NodeList {
+                    count: nodes.len() as u32,
+                    nodes,
+                },
+                Err(TicketRouteError::LegacyRequired)
+                    if self.config.route_discovery_mode == "auto" =>
+                {
+                    self.discover(&request.intent, None, Some(&tp)).await?
+                }
+                Err(TicketRouteError::LegacyRequired) => {
+                    return Err(IicpError::Protocol {
+                        code: "IICP-DISPATCH-TICKET-UNAVAILABLE".into(),
+                        message: "Directory does not support ticketed dispatch".into(),
+                        status: 501,
+                    });
+                }
+                Err(TicketRouteError::Iicp(err)) => return Err(err),
+            }
+        };
         // Filter to safe, available and confidentiality-capable nodes before candidate
         // selection. A keyless provider must never receive plaintext by default; the
         // temporary escape hatch is intentionally explicit and noisy for controlled
@@ -398,7 +515,7 @@ impl IicpClient {
             for attempt in 0..MAX_RETRIES {
                 match self
                     .http
-                    .post_json_ct(
+                    .post_json_ct::<_, TaskResponse>(
                         &format!("{}/v1/task", node.endpoint),
                         &body,
                         None,
@@ -407,7 +524,11 @@ impl IicpClient {
                     )
                     .await
                 {
-                    Ok(resp) => return Ok(resp),
+                    Ok(mut resp) => {
+                        resp.generated_by_ai = true;
+                        resp.dispatch_ticket_id_prefix = node.dispatch_ticket_id_prefix.clone();
+                        return Ok(resp);
+                    }
                     Err(e) => {
                         last_err = Some(e);
                         let err = last_err.as_ref().unwrap();
@@ -471,6 +592,7 @@ impl IicpClient {
         let mut resp: ChatResponse = serde_json::from_value(result)?;
         resp.task_id = task_id;
         resp.node_id = node_id;
+        resp.generated_by_ai = true;
         Ok(resp)
     }
 
