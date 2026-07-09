@@ -3603,9 +3603,14 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         // (red-team pass 3): shells/interpreters/exec primitives. The required
         // --tools allowlist + allow_tool_execution opt-in are the primary controls.
         [
+            // shells / interpreters / process execution
             "bash", "sh", "zsh", "fish", "shell", "powershell", "pwsh", "cmd",
             "exec", "execute", "run_command", "run", "system", "eval",
             "python", "python3", "node", "ruby", "perl", "subprocess", "popen", "spawn",
+            // #601 tool-risk classes that must not be public-unknown by default
+            "write_file", "file_write", "filesystem_write", "delete_file", "remove_file",
+            "browser_control", "computer_use", "credential_access", "read_secret", "secrets",
+            "system_control", "service_control", "physical_world", "regulated_decision",
         ]
         .iter()
         .copied()
@@ -3701,7 +3706,7 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         .collect();
 
     if active_tools.is_empty() {
-        eprintln!("ERROR: --tools is required. Provide a comma-separated list of MCP tool names.\n  Example: iicp-node mcp-gateway --tools read_file,list_dir --mcp-url http://localhost:8001");
+        eprintln!("ERROR: --tools is required. Provide a comma-separated list of MCP tool names.\n  Example: iicp-node mcp-gateway --tools summarize_text,lookup_status --mcp-url http://localhost:8001");
         std::process::exit(2);
     }
 
@@ -3862,11 +3867,30 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                 Json(json!({"error": "Cannot determine tool name"})),
             );
         }
-        let dangerous: std::collections::HashSet<&str> =
-            ["bash", "shell", "exec", "run_command", "eval"]
-                .iter()
-                .copied()
-                .collect();
+        let dangerous: std::collections::HashSet<&str> = [
+            "bash",
+            "shell",
+            "exec",
+            "run_command",
+            "eval",
+            "write_file",
+            "file_write",
+            "filesystem_write",
+            "delete_file",
+            "remove_file",
+            "browser_control",
+            "computer_use",
+            "credential_access",
+            "read_secret",
+            "secrets",
+            "system_control",
+            "service_control",
+            "physical_world",
+            "regulated_decision",
+        ]
+        .iter()
+        .copied()
+        .collect();
         if dangerous.contains(tool_name.to_lowercase().as_str()) {
             return (
                 StatusCode::FORBIDDEN,
@@ -3909,14 +3933,10 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                     Json(json!({"error":"invalid MCP response"})),
                 ),
                 Ok(data) => {
-                    if let Some(err) = data.get("error") {
-                        let msg = err
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("MCP error");
+                    if data.get("error").is_some() {
                         return (
                             StatusCode::UNPROCESSABLE_ENTITY,
-                            Json(json!({"error": msg})),
+                            Json(json!({"error": "MCP tool returned an error"})),
                         );
                     }
                     let result = data.get("result").cloned().unwrap_or(Value::Null);

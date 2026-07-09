@@ -71,12 +71,27 @@ fn test_tool_to_intent_produces_correct_urn() {
 
 #[test]
 fn test_dangerous_tools_are_filtered() {
-    let dangerous: std::collections::HashSet<&str> =
-        ["bash", "shell", "exec", "run_command", "eval"]
-            .iter()
-            .copied()
-            .collect();
-    let tools = vec!["read_file", "bash", "list_dir", "exec"];
+    let dangerous: std::collections::HashSet<&str> = [
+        "bash",
+        "shell",
+        "exec",
+        "run_command",
+        "eval",
+        "write_file",
+        "browser_control",
+        "credential_access",
+        "system_control",
+    ]
+    .iter()
+    .copied()
+    .collect();
+    let tools = vec![
+        "read_file",
+        "write_file",
+        "browser_control",
+        "list_dir",
+        "exec",
+    ];
     let active: Vec<&str> = tools
         .into_iter()
         .filter(|t| !dangerous.contains(*t))

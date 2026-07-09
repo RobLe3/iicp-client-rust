@@ -104,6 +104,24 @@ let reply = client.chat(
 ).await?;
 ```
 
+For stricter deployments, require a minimum policy-manifest identity level
+before any prompt leaves the client. This keeps the default open mesh behavior
+unchanged, but lets controllers fail closed on self-attested or rotated/revoked
+providers.
+
+```rust
+let reply = client.chat(
+    vec![ChatMessage { role: "user".into(), content: "Hello".into() }],
+    Some(ChatOptions {
+        routing_policy: Some(RoutingPolicy {
+            required_manifest_identity_level: Some("operator_bound".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }),
+).await?;
+```
+
 ## Migrate from existing AI tools
 
 Direct call:

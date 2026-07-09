@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [Unreleased]
+
+### Added — policy-manifest identity routing
+- Added `required_manifest_identity_level` to routing policies so strict callers can require `signed_valid`, `operator_bound`, or `known_operator` node policy manifests before any prompt is dispatched.
+- Rejected or rotated/revoked manifests fail closed with redacted routing-policy reasons and no task POST to the rejected node.
+- Expanded the packaged `mcp-gateway` dangerous-tool denylist for public-unknown callers and redacted upstream MCP error details to avoid echoing tool-input or secret text.
+
 ## [0.7.81] — 2026-07-02
 
 ### Changed — cross-SDK release parity

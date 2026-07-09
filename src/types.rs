@@ -42,6 +42,8 @@ pub struct RoutingPolicy {
     pub allow_remote_executor: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub known_operator_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_manifest_identity_level: Option<String>,
 }
 
 /// Client configuration (SDK-04: timeout_ms enforced at construction time).

@@ -14,6 +14,7 @@ pub struct EffectiveRoutingPolicy {
     pub require_no_payload_retention: bool,
     pub allow_remote_executor: bool,
     pub known_operator_only: bool,
+    pub required_manifest_identity_level: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +37,7 @@ pub fn resolved_policy(policy: Option<&RoutingPolicy>) -> EffectiveRoutingPolicy
             require_no_payload_retention: false,
             allow_remote_executor: true,
             known_operator_only: false,
+            required_manifest_identity_level: None,
         },
         RoutingProfile::Sensitive => EffectiveRoutingPolicy {
             profile,
@@ -45,6 +47,7 @@ pub fn resolved_policy(policy: Option<&RoutingPolicy>) -> EffectiveRoutingPolicy
             require_no_payload_retention: false,
             allow_remote_executor: false,
             known_operator_only: false,
+            required_manifest_identity_level: None,
         },
         RoutingProfile::EuRestricted => EffectiveRoutingPolicy {
             profile,
@@ -54,6 +57,7 @@ pub fn resolved_policy(policy: Option<&RoutingPolicy>) -> EffectiveRoutingPolicy
             require_no_payload_retention: false,
             allow_remote_executor: true,
             known_operator_only: false,
+            required_manifest_identity_level: None,
         },
         RoutingProfile::StrictPolicy => EffectiveRoutingPolicy {
             profile,
@@ -63,6 +67,7 @@ pub fn resolved_policy(policy: Option<&RoutingPolicy>) -> EffectiveRoutingPolicy
             require_no_payload_retention: true,
             allow_remote_executor: true,
             known_operator_only: false,
+            required_manifest_identity_level: None,
         },
         RoutingProfile::DebugOverride => EffectiveRoutingPolicy {
             profile,
@@ -72,6 +77,7 @@ pub fn resolved_policy(policy: Option<&RoutingPolicy>) -> EffectiveRoutingPolicy
             require_no_payload_retention: false,
             allow_remote_executor: true,
             known_operator_only: false,
+            required_manifest_identity_level: None,
         },
     };
 
@@ -93,6 +99,9 @@ pub fn resolved_policy(policy: Option<&RoutingPolicy>) -> EffectiveRoutingPolicy
         }
         if let Some(v) = p.known_operator_only {
             effective.known_operator_only = v;
+        }
+        if p.required_manifest_identity_level.is_some() {
+            effective.required_manifest_identity_level = p.required_manifest_identity_level.clone();
         }
     }
 
@@ -163,8 +172,12 @@ fn node_rejection_reason<'a>(
     if policy.require_no_payload_retention && !declares_no_payload_retention(node) {
         return Some("payload_retention_not_none");
     }
-    if policy.known_operator_only {
-        return Some("known_operator_not_verified");
+    let required_level = policy
+        .required_manifest_identity_level
+        .as_deref()
+        .or_else(|| policy.known_operator_only.then_some("known_operator"));
+    if let Some(required_level) = required_level {
+        return manifest_identity_rejection_reason(node, required_level);
     }
     None
 }
@@ -179,6 +192,39 @@ fn manifest_signed_verified(node: &Node) -> bool {
         .and_then(|v| v.as_str());
     verification_status == Some("signed_valid")
         || manifest.get("evidence").and_then(|v| v.as_str()) == Some("signed_verified")
+}
+
+fn manifest_identity_rank(level: &str) -> i32 {
+    match level {
+        "self_attested" => 0,
+        "signed_valid" => 1,
+        "operator_bound" => 2,
+        "known_operator" => 3,
+        "rotated" | "revoked" => -1,
+        _ => -1,
+    }
+}
+
+fn manifest_identity_rejection_reason(node: &Node, required_level: &str) -> Option<&'static str> {
+    let required = match required_level {
+        "signed_valid" | "operator_bound" | "known_operator" => required_level,
+        _ => "known_operator",
+    };
+    let level = node
+        .node_policy_manifest
+        .as_ref()
+        .and_then(|m| m.get("manifest_identity_level"))
+        .and_then(|v| v.as_str());
+    let Some(level) = level else {
+        return Some("missing_manifest_identity");
+    };
+    if level == "revoked" || level == "rotated" {
+        return Some("policy_manifest_revoked_or_rotated");
+    }
+    if manifest_identity_rank(level) < manifest_identity_rank(required) {
+        return Some("manifest_identity_level_too_low");
+    }
+    None
 }
 
 fn region_allowed(region: &str, allowed: &[String]) -> bool {
