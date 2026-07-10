@@ -9,6 +9,13 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.86] — 2026-07-10
+
+### Added — operator-signed node policy publishing
+- `iicp-node serve --policy-manifest FILE` signs a local public policy document with the existing operator identity and advertises it on every registration and recovery re-registration.
+- Canonical JSON and Ed25519 output share a fixed known-answer vector with the Python, TypeScript, and directory verifier tests.
+- Relay operator guidance now documents the available strict directory-signed bind-ticket cutover instead of describing bind authentication as pending.
+
 ## [0.7.85] — 2026-07-10
 
 ### Security — one-use relay bind tickets

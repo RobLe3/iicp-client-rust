@@ -235,6 +235,8 @@ struct ServeOpts {
     backend_api_key: String,
     /// ADR-050 2-C — also run the compat proxy gateway (loopback 9483) in this process.
     with_proxy: bool,
+    /// #588 — local JSON policy document signed with the operator identity at startup.
+    policy_manifest: String,
 }
 
 fn print_help() {
@@ -282,10 +284,11 @@ fn print_help() {
          \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
          \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: use a tunnel when direct IPv4/IPv6/pinhole reachability is unavailable or unverified, then relay; --no-tunnel disables tunnel fallback. Dead policy: IICP_TUNNEL_DEAD_POLICY=auto|retry|exit|log-only; generated services set IICP_SUPERVISED=1\n\
          \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485).\n\
-         \x20                            Note: relay bind authentication is pending (#510) — only run a relay\n\
-         \x20                            accept port on networks you trust until the signed-bind mechanism ships.\n\
+         \x20                            Public relays should set IICP_RELAY_REQUIRE_BIND_TICKET=1 and\n\
+         \x20                            IICP_RELAY_BIND_TICKET_PUBLIC_KEY for directory-signed one-use binds.\n\
          \x20 --with-proxy               IICP_WITH_PROXY — also run the compat proxy gateway (loopback 9483)\n\
          \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\n\
+         \x20 --policy-manifest FILE     IICP_POLICY_MANIFEST_FILE — sign and advertise a public node-policy JSON document\n\n\
          query optional:\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
@@ -1609,6 +1612,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         force: env_bool("IICP_FORCE"),
         backend_api_key: env_or("IICP_BACKEND_API_KEY", Some("")).unwrap(),
         with_proxy: env_bool("IICP_WITH_PROXY"),
+        policy_manifest: env_or("IICP_POLICY_MANIFEST_FILE", None).unwrap_or_default(),
     };
 
     let mut i = 0;
@@ -1680,6 +1684,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                             v.parse().map_err(|e| format!("--relay-accept-port: {e}"))?
                     }
                     "--log-dir" => opts.log_dir = Some(v),
+                    "--policy-manifest" => opts.policy_manifest = v,
                     _ => return Err(format!("unknown flag: {arg}")),
                 }
                 i += 2;
@@ -2603,7 +2608,24 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             } else {
                 Some(op.operator_integrity_hash.clone())
             };
+            if !opts.policy_manifest.is_empty() {
+                cfg.policy_manifest = Some(
+                    iicp_client::policy_manifest::load_and_sign_policy_manifest(
+                        &opts.policy_manifest,
+                        &op.operator_id,
+                        &sk,
+                        None,
+                    )
+                    .map_err(|e| format!("--policy-manifest: {e}"))?,
+                );
+            }
         }
+    }
+    if !opts.policy_manifest.is_empty() && cfg.policy_manifest.is_none() {
+        return Err(
+            "--policy-manifest requires a key-backed operator identity; run `iicp-node init` first"
+                .into(),
+        );
     }
     // Resolve log directory: CLI flag > IICP_LOG_DIR > ~/.iicp/logs/
     cfg.log_dir = Some({

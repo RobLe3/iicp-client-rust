@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.85"
+iicp-client = "0.7.86"
 ```
 
 ## One-line test
@@ -41,7 +41,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.85 or newer
+iicp-node --version    # prints iicp-node 0.7.86 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -459,7 +459,10 @@ let node = IicpNode::new(NodeConfig {
 });
 ```
 
-> **Security note**: relay bind authentication is pending ([#510](https://github.com/RobLe3/iicp.network/issues/510)) — only run a relay accept port on networks you trust until the signed-bind mechanism ships.
+Relay workers request short-lived directory-signed bind tickets when they have a saved node
+token. Relay operators can enforce them with `IICP_RELAY_REQUIRE_BIND_TICKET=1` and the
+directory's Ed25519 verification key in `IICP_RELAY_BIND_TICKET_PUBLIC_KEY`. Keep strict mode
+enabled on public relays; unsigned compatibility mode is intended only for staged migration.
 
 ### Opt-out / override
 
@@ -474,6 +477,22 @@ IICP_AUTO_UPDATE=1                       # hourly provider self-update; set 0 to
 IICP_AUTO_UPDATE_INTERVAL_S=3600         # update cadence in seconds; minimum 300
 IICP_RELAY_WORKER_ENDPOINT=host:9485    # specific relay instead of auto-elect
 ```
+
+### Publish a signed node policy
+
+Operators can describe public handling rules in a local JSON file and have the client sign it
+with their existing operator identity before registration:
+
+```bash
+iicp-node serve --node my-node --policy-manifest ~/.iicp/node-policy.json
+# or: IICP_POLICY_MANIFEST_FILE=~/.iicp/node-policy.json
+```
+
+The source file stays local. The registration contains the public policy document, its public
+operator key, timestamps, and detached Ed25519 signature—never the operator secret. The same
+signed document is reused during recovery re-registration, so policy does not disappear when
+a tunnel rotates. A signed declaration is tamper-evident operator evidence, not a legal or
+privacy certification.
 
 ---
 

@@ -366,6 +366,10 @@ pub struct NodeConfig {
     pub operator_display_name: Option<String>,
     pub operator_created_at: Option<String>,
     pub operator_integrity_hash: Option<String>,
+    /// Signed public node-policy manifest advertised to the directory (#588).
+    /// The SDK signs a local JSON document with the operator key before this
+    /// value is attached; re-registration reuses the same signed value.
+    pub policy_manifest: Option<serde_json::Value>,
     /// #494 — backend base URL for live model health probing during heartbeat.
     /// When set, heartbeat probes /api/tags (Ollama) or /v1/models (OpenAI-compat)
     /// and includes `health_models` in the payload so the directory can filter
@@ -420,6 +424,7 @@ impl NodeConfig {
             operator_display_name: None,
             operator_created_at: None,
             operator_integrity_hash: None,
+            policy_manifest: None,
             backend_url: None,
             backend_api_key: None,
         }
@@ -1898,6 +1903,9 @@ impl IicpNode {
             if let Some(ih) = &self.cfg.operator_integrity_hash {
                 payload["operator_integrity_hash"] = json!(ih);
             }
+        }
+        if let Some(manifest) = &self.cfg.policy_manifest {
+            payload["policy_manifest"] = manifest.clone();
         }
         payload
     }
