@@ -805,20 +805,20 @@ async fn relay_bind_endpoint(
         .relay_bind_ticket_public_key_hex
         .as_deref()
         .unwrap_or("");
+    let mut ticket_claims = None;
     if !bind_ticket.is_empty() && !ticket_public_key.is_empty() {
         let now_s = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
-        if crate::relay_ticket::verify_relay_bind_ticket(
+        ticket_claims = crate::relay_ticket::verify_relay_bind_ticket(
             bind_ticket,
             ticket_public_key,
             worker_id,
             &state.node_id,
             now_s,
-        )
-        .is_none()
-        {
+        );
+        if ticket_claims.is_none() {
             return relay_cors(
                 (
                     StatusCode::UNAUTHORIZED,
@@ -856,6 +856,18 @@ async fn relay_bind_endpoint(
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error":{"code":"IICP-E039","message":"relay at session capacity — try another relay"}})),
         ).into_response());
+    }
+    if let Some(claims) = &ticket_claims {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if !crate::relay_ticket::consume_relay_bind_ticket(claims, now_s) {
+            return relay_cors((
+                StatusCode::CONFLICT,
+                Json(json!({"error":{"code":"IICP-E040","message":"relay bind ticket replayed"}})),
+            ).into_response());
+        }
     }
     let intent = payload
         .get("intent")

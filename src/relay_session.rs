@@ -16,7 +16,9 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::relay_ticket::verify_relay_bind_ticket;
+use crate::relay_ticket::{
+    consume_relay_bind_ticket, verify_relay_bind_ticket, RelayBindTicketClaims,
+};
 
 const IICP_MAGIC: &[u8] = b"IICP";
 const FRAMING_VERSION: u8 = 0x01;
@@ -562,15 +564,16 @@ async fn handle_relay_connection(
         return Err("RELAY_BIND missing worker_id".into());
     }
 
+    let mut ticket_claims: Option<RelayBindTicketClaims> = None;
     if !bind_ticket.is_empty() {
         if let Some(pub_hex) = &bind_ticket_public_key_hex {
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            if verify_relay_bind_ticket(&bind_ticket, pub_hex, &worker_id, &relay_node_id, now)
-                .is_none()
-            {
+            ticket_claims =
+                verify_relay_bind_ticket(&bind_ticket, pub_hex, &worker_id, &relay_node_id, now);
+            if ticket_claims.is_none() {
                 let nack = cbor_encode_int_map(&[
                     (1, CborVal::Text("error".into())),
                     (2, CborVal::Text(worker_id.clone())),
@@ -644,6 +647,25 @@ async fn handle_relay_connection(
             .await
             .map_err(|e| e.to_string())?;
         return Ok(());
+    }
+
+    if let Some(claims) = &ticket_claims {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        if !consume_relay_bind_ticket(claims, now) {
+            let nack = cbor_encode_int_map(&[
+                (1, CborVal::Text("error".into())),
+                (2, CborVal::Text(worker_id.clone())),
+                (3, CborVal::Text("relay bind ticket replayed".into())),
+            ]);
+            writer
+                .write_all(&make_frame(MT_RELAY_ACK, &nack))
+                .await
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
     }
 
     // Spawn writer task — receives frames from an unbounded channel and writes to socket.
@@ -837,7 +859,7 @@ mod tests {
         use ed25519_dalek::{Signer, SigningKey};
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let payload = serde_json::json!({
-            "v": 1, "typ": "relay-bind-ticket", "iss": "test",
+            "v": 1, "typ": "relay-bind-ticket", "jti": "02020202020202020202020202020202", "iss": "test",
             "sub": worker_id, "aud": relay_id, "iat": 1, "exp": 9999999999i64
         })
         .to_string();

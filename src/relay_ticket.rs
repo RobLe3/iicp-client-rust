@@ -4,6 +4,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 const DOMAIN: &[u8] = b"iicp:relay-bind-ticket:v1\n";
 
@@ -11,11 +13,27 @@ const DOMAIN: &[u8] = b"iicp:relay-bind-ticket:v1\n";
 pub struct RelayBindTicketClaims {
     pub v: u8,
     pub typ: String,
+    pub jti: String,
     pub iss: String,
     pub sub: String,
     pub aud: String,
     pub iat: i64,
     pub exp: i64,
+}
+
+static RELAY_BIND_REPLAY_CACHE: OnceLock<Mutex<HashMap<String, i64>>> = OnceLock::new();
+
+pub fn consume_relay_bind_ticket(claims: &RelayBindTicketClaims, now_s: i64) -> bool {
+    let cache = RELAY_BIND_REPLAY_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut seen = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    seen.retain(|_, exp| *exp > now_s);
+    if seen.contains_key(&claims.jti) {
+        return false;
+    }
+    seen.insert(claims.jti.clone(), claims.exp);
+    true
 }
 
 pub fn verify_relay_bind_ticket(
@@ -38,7 +56,15 @@ pub fn verify_relay_bind_ticket(
     key.verify(&msg, &sig).ok()?;
     let payload_json = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
     let claims: RelayBindTicketClaims = serde_json::from_slice(&payload_json).ok()?;
-    if claims.typ != "relay-bind-ticket" || claims.sub != worker_id || claims.exp <= now_s {
+    if claims.typ != "relay-bind-ticket"
+        || claims.jti.len() != 32
+        || !claims
+            .jti
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        || claims.sub != worker_id
+        || claims.exp <= now_s
+    {
         return None;
     }
     if claims.aud != "*" && claims.aud != relay_audience {
@@ -82,7 +108,7 @@ mod tests {
     fn signed_ticket(worker_id: &str, relay_id: &str) -> (String, String) {
         let sk = SigningKey::from_bytes(&[7u8; 32]);
         let payload = serde_json::json!({
-            "v": 1, "typ": "relay-bind-ticket", "iss": "test",
+            "v": 1, "typ": "relay-bind-ticket", "jti": "01010101010101010101010101010101", "iss": "test",
             "sub": worker_id, "aud": relay_id, "iat": 1, "exp": 999999
         })
         .to_string();
@@ -105,5 +131,15 @@ mod tests {
         assert!(
             verify_relay_bind_ticket(&token, &pub_hex, "worker-1", "relay-1", 1_000_000).is_none()
         );
+    }
+
+    #[test]
+    fn consumes_ticket_once_until_expiry() {
+        let (token, pub_hex) = signed_ticket("worker-1", "relay-1");
+        let claims = verify_relay_bind_ticket(&token, &pub_hex, "worker-1", "relay-1", 100)
+            .expect("valid ticket");
+        assert!(consume_relay_bind_ticket(&claims, 100));
+        assert!(!consume_relay_bind_ticket(&claims, 101));
+        assert!(consume_relay_bind_ticket(&claims, 1_000_000));
     }
 }

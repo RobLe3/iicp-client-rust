@@ -12,6 +12,7 @@
 //! - CORS headers + OPTIONS preflight (web pages are first-class callers)
 #![cfg(feature = "iicp-tcp")]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -66,9 +67,11 @@ async fn spawn_relay_with_config(cfg: NodeConfig) -> u16 {
 }
 
 fn signed_ticket(worker_id: &str, relay_id: &str) -> (String, String) {
+    static NEXT_JTI: AtomicU64 = AtomicU64::new(1);
     let sk = SigningKey::from_bytes(&[9u8; 32]);
     let payload = serde_json::json!({
-        "v": 1, "typ": "relay-bind-ticket", "iss": "test", "sub": worker_id, "aud": relay_id,
+        "v": 1, "typ": "relay-bind-ticket", "jti": format!("{:032x}", NEXT_JTI.fetch_add(1, Ordering::Relaxed)),
+        "iss": "test", "sub": worker_id, "aud": relay_id,
         "iat": 1, "exp": 9_999_999_999_i64,
     })
     .to_string();
@@ -201,6 +204,28 @@ async fn strict_bind_ticket_mode_accepts_valid_http_poll_ticket_and_rejects_wron
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
+    let accepted: Value = ok.json().await.unwrap();
+    let session_token = accepted["session_token"].as_str().unwrap();
+    let unbind = client
+        .post(format!("http://127.0.0.1:{port}/v1/relay/unbind"))
+        .bearer_auth(session_token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unbind.status(), 204);
+    let replay = client
+        .post(format!("http://127.0.0.1:{port}/v1/relay/bind"))
+        .json(&json!({"worker_id": "w-http-ticket", "intent": INTENT, "models": [], "bind_ticket": good_ticket}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(replay.status(), 409);
+    let replay_body: Value = replay.json().await.unwrap();
+    assert!(replay_body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("replayed"));
 
     let wrong = client
         .post(format!("http://127.0.0.1:{port}/v1/relay/bind"))

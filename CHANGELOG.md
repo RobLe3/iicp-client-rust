@@ -9,6 +9,10 @@ in the main repo).
 
 ## [Unreleased]
 
+### Security — one-use relay bind tickets
+- Directory-signed relay bind tickets now require a signed 128-bit `jti`; relay accept paths atomically consume it and reject replay after disconnect until ticket expiry.
+- Replay protection covers native RELAY_BIND and browser-compatible HTTP-poll binds without changing the opt-in strict-bind cutover.
+
 ## [0.7.84] — 2026-07-10
 
 ### Added — MCP safety controls and operator self-service signing
