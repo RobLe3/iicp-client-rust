@@ -4,24 +4,130 @@
 use serde_json::{json, Value};
 
 const RISK_KEYWORDS: &[(&str, &[&str])] = &[
-    ("shell_exec", &["bash", "shell", "exec", "run_command", "command", "eval", "python_exec"]),
-    ("data_read", &["read_document", "query_database", "list_resource", "dataset_read", "record_lookup"]),
-    ("file_read", &["read_file", "list_dir", "cat", "open_file", "file_read", "list_files"]),
-    ("file_write", &["write_file", "delete_file", "remove_file", "edit_file", "save_file", "mkdir", "rmdir"]),
-    ("network_fetch", &["fetch", "crawl", "http", "web_request", "search_web", "url"]),
-    ("browser_control", &["browser", "computer_use", "click", "type", "screenshot", "navigate"]),
-    ("credential_access", &["secret", "credential", "token", "ssh_key", "wallet", "password"]),
-    ("system_control", &["systemctl", "launchctl", "service_restart", "install_package", "firewall", "reboot", "shutdown"]),
-    ("physical_world", &["robot", "drone", "actuator", "iot_control", "medical_device", "industrial_control"]),
-    ("regulated_decision", &["credit_score", "hire", "employment", "benefit_eligibility", "diagnose", "triage_patient"]),
+    (
+        "shell_exec",
+        &[
+            "bash",
+            "shell",
+            "exec",
+            "run_command",
+            "command",
+            "eval",
+            "python_exec",
+        ],
+    ),
+    (
+        "data_read",
+        &[
+            "read_document",
+            "query_database",
+            "list_resource",
+            "dataset_read",
+            "record_lookup",
+        ],
+    ),
+    (
+        "file_read",
+        &[
+            "read_file",
+            "list_dir",
+            "cat",
+            "open_file",
+            "file_read",
+            "list_files",
+        ],
+    ),
+    (
+        "file_write",
+        &[
+            "write_file",
+            "delete_file",
+            "remove_file",
+            "edit_file",
+            "save_file",
+            "mkdir",
+            "rmdir",
+        ],
+    ),
+    (
+        "network_fetch",
+        &["fetch", "crawl", "http", "web_request", "search_web", "url"],
+    ),
+    (
+        "browser_control",
+        &[
+            "browser",
+            "computer_use",
+            "click",
+            "type",
+            "screenshot",
+            "navigate",
+        ],
+    ),
+    (
+        "credential_access",
+        &[
+            "secret",
+            "credential",
+            "token",
+            "ssh_key",
+            "wallet",
+            "password",
+        ],
+    ),
+    (
+        "system_control",
+        &[
+            "systemctl",
+            "launchctl",
+            "service_restart",
+            "install_package",
+            "firewall",
+            "reboot",
+            "shutdown",
+        ],
+    ),
+    (
+        "physical_world",
+        &[
+            "robot",
+            "drone",
+            "actuator",
+            "iot_control",
+            "medical_device",
+            "industrial_control",
+        ],
+    ),
+    (
+        "regulated_decision",
+        &[
+            "credit_score",
+            "hire",
+            "employment",
+            "benefit_eligibility",
+            "diagnose",
+            "triage_patient",
+        ],
+    ),
 ];
 
 pub fn tool_risk_label(tool_name: &str) -> &'static str {
-    let safe: String = tool_name.to_lowercase().chars()
-        .map(|c| if c.is_ascii_alphanumeric() || "_:-".contains(c) { c } else { '_' })
+    let safe: String = tool_name
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "_:-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     for (label, needles) in RISK_KEYWORDS {
-        if needles.iter().any(|needle| safe == *needle || safe.contains(needle)) {
+        if needles
+            .iter()
+            .any(|needle| safe == *needle || safe.contains(needle))
+        {
             return label;
         }
     }
@@ -40,7 +146,10 @@ impl McpToolPolicy {
     pub fn dangerous_ready(&self) -> bool {
         self.allow_dangerous_tools
             && !self.authz_policy.trim().is_empty()
-            && matches!(self.sandbox_profile.trim().to_lowercase().as_str(), "1" | "true" | "strict" | "container" | "sandbox")
+            && matches!(
+                self.sandbox_profile.trim().to_lowercase().as_str(),
+                "1" | "true" | "strict" | "container" | "sandbox"
+            )
             && self.audit_redaction
     }
 
@@ -49,9 +158,17 @@ impl McpToolPolicy {
     }
 
     pub fn receipt(&self, tool_name: &str, decision: &str, argument_count: usize) -> Value {
-        let safe_name: String = tool_name.chars()
-            .map(|c| if c.is_ascii_alphanumeric() || "_:-".contains(c) { c } else { '_' })
-            .take(96).collect();
+        let safe_name: String = tool_name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || "_:-".contains(c) {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(96)
+            .collect();
         json!({
             "tool_name": safe_name,
             "tool_risk": tool_risk_label(tool_name),
@@ -71,7 +188,12 @@ mod tests {
 
     #[test]
     fn dangerous_policy_requires_every_control() {
-        let mut p = McpToolPolicy { allow_dangerous_tools: true, authz_policy: "operator-key".into(), sandbox_profile: "container".into(), audit_redaction: false };
+        let mut p = McpToolPolicy {
+            allow_dangerous_tools: true,
+            authz_policy: "operator-key".into(),
+            sandbox_profile: "container".into(),
+            audit_redaction: false,
+        };
         assert!(!p.allows("write_file"));
         p.audit_redaction = true;
         assert!(p.allows("write_file"));

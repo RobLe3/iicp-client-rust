@@ -3741,11 +3741,13 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             "--allow-dangerous-tools" => tool_policy.allow_dangerous_tools = true,
             "--authz-policy" => {
                 i += 1;
-                tool_policy.authz_policy = args.get(i).cloned().ok_or("--authz-policy needs a value")?;
+                tool_policy.authz_policy =
+                    args.get(i).cloned().ok_or("--authz-policy needs a value")?;
             }
             "--sandbox" => {
                 i += 1;
-                tool_policy.sandbox_profile = args.get(i).cloned().ok_or("--sandbox needs a value")?;
+                tool_policy.sandbox_profile =
+                    args.get(i).cloned().ok_or("--sandbox needs a value")?;
             }
             "--audit-redaction" => tool_policy.audit_redaction = true,
             other => return Err(format!("unknown mcp-gateway flag: {other}")),
@@ -3797,11 +3799,13 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
     let capabilities: Vec<Value> = active_tools
         .iter()
         .zip(intents.iter())
-        .map(|(tool, intent)| json!({
-            "intent": intent,
-            "models": [format!("mcp:{tool}")],
-            "max_tokens": 65536,
-        }))
+        .map(|(tool, intent)| {
+            json!({
+                "intent": intent,
+                "models": [format!("mcp:{tool}")],
+                "max_tokens": 65536,
+            })
+        })
         .collect();
 
     // Register
@@ -3905,18 +3909,16 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        Json(
-            json!({
-                "status": "ok", "node_id": s.node_id, "active_tools": s.active_tools,
-                "mcp_server": s.mcp_url, "timestamp": ts,
-                "mcp_policy": {
-                    "dangerous_tools_enabled": s.tool_policy.dangerous_ready(),
-                    "authz_policy": if s.tool_policy.authz_policy.is_empty() { Value::Null } else { json!(s.tool_policy.authz_policy) },
-                    "sandbox_profile": if s.tool_policy.sandbox_profile.is_empty() { Value::Null } else { json!(s.tool_policy.sandbox_profile) },
-                    "audit_redacted": s.tool_policy.audit_redaction,
-                }
-            }),
-        )
+        Json(json!({
+            "status": "ok", "node_id": s.node_id, "active_tools": s.active_tools,
+            "mcp_server": s.mcp_url, "timestamp": ts,
+            "mcp_policy": {
+                "dangerous_tools_enabled": s.tool_policy.dangerous_ready(),
+                "authz_policy": if s.tool_policy.authz_policy.is_empty() { Value::Null } else { json!(s.tool_policy.authz_policy) },
+                "sandbox_profile": if s.tool_policy.sandbox_profile.is_empty() { Value::Null } else { json!(s.tool_policy.sandbox_profile) },
+                "audit_redacted": s.tool_policy.audit_redaction,
+            }
+        }))
     }
 
     async fn task_handler(

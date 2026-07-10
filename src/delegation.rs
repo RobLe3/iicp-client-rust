@@ -217,11 +217,23 @@ mod tests {
     #[test]
     fn operator_self_service_bytes_match_cross_language_kat() {
         let fields = BTreeMap::from([
-            ("operator_pub".to_string(), Value::String("T3BQdWI=".to_string())),
-            ("nonce".to_string(), Value::String("nonce-1234567890".to_string())),
+            (
+                "operator_pub".to_string(),
+                Value::String("T3BQdWI=".to_string()),
+            ),
+            (
+                "nonce".to_string(),
+                Value::String("nonce-1234567890".to_string()),
+            ),
             ("ts".to_string(), Value::from(1_893_456_000_i64)),
-            ("terms_version".to_string(), Value::String("2026-07".to_string())),
-            ("dpa_version".to_string(), Value::String("2026-07".to_string())),
+            (
+                "terms_version".to_string(),
+                Value::String("2026-07".to_string()),
+            ),
+            (
+                "dpa_version".to_string(),
+                Value::String("2026-07".to_string()),
+            ),
         ]);
         assert_eq!(
             String::from_utf8(canonical_operator_self_service_bytes("accept", &fields)).unwrap(),
