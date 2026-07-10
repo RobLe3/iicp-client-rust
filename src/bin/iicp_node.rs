@@ -31,6 +31,7 @@ use iicp_client::identity::{
     config_dir, generate_node, list_nodes, load_node, load_operator, save_node, save_operator,
     NodeIdentity, OperatorIdentity,
 };
+use iicp_client::mcp_policy::McpToolPolicy;
 use iicp_client::node::{IicpNode, NodeConfig};
 use iicp_client::{ClientConfig, IicpClient, TaskRequest};
 
@@ -3648,28 +3649,14 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
              \x20 --directory-url URL  IICP_DIRECTORY_URL (default https://iicp.network/api/v1)\n\
              \x20 --region REGION      IICP_REGION (default local)\n\
              \x20 --port N             IICP_PORT (default 9484)\n\
-             \x20 --host HOST          IICP_HOST (default ::)\n"
+             \x20 --host HOST          IICP_HOST (default ::)\n\
+             \x20 --allow-dangerous-tools  IICP_MCP_ALLOW_DANGEROUS_TOOLS (requires all controls below)\n\
+             \x20 --authz-policy ID    IICP_MCP_AUTHZ_POLICY\n\
+             \x20 --sandbox PROFILE    IICP_MCP_SANDBOX (strict/container/sandbox)\n\
+             \x20 --audit-redaction    IICP_MCP_AUDIT_REDACTION\n"
         );
         return Ok(());
     }
-
-    let dangerous: std::collections::HashSet<&str> =
-        // Backstop denylist on top of the operator's explicit --tools allowlist
-        // (red-team pass 3): shells/interpreters/exec primitives. The required
-        // --tools allowlist + allow_tool_execution opt-in are the primary controls.
-        [
-            // shells / interpreters / process execution
-            "bash", "sh", "zsh", "fish", "shell", "powershell", "pwsh", "cmd",
-            "exec", "execute", "run_command", "run", "system", "eval",
-            "python", "python3", "node", "ruby", "perl", "subprocess", "popen", "spawn",
-            // #601 tool-risk classes that must not be public-unknown by default
-            "write_file", "file_write", "filesystem_write", "delete_file", "remove_file",
-            "browser_control", "computer_use", "credential_access", "read_secret", "secrets",
-            "system_control", "service_control", "physical_world", "regulated_decision",
-        ]
-        .iter()
-        .copied()
-            .collect();
 
     fn tool_to_intent(name: &str) -> String {
         let safe: String = name
@@ -3700,6 +3687,12 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         .unwrap_or(9484);
     let mut host = env::var("IICP_HOST").unwrap_or_else(|_| "::".to_string());
     let node_token_env = env::var("IICP_NODE_TOKEN").unwrap_or_default();
+    let mut tool_policy = McpToolPolicy {
+        allow_dangerous_tools: env_bool("IICP_MCP_ALLOW_DANGEROUS_TOOLS"),
+        authz_policy: env::var("IICP_MCP_AUTHZ_POLICY").unwrap_or_default(),
+        sandbox_profile: env::var("IICP_MCP_SANDBOX").unwrap_or_default(),
+        audit_redaction: env_bool("IICP_MCP_AUDIT_REDACTION"),
+    };
 
     let mut i = 0;
     while i < args.len() {
@@ -3745,6 +3738,16 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                 i += 1;
                 host = args.get(i).cloned().ok_or("--host needs a value")?;
             }
+            "--allow-dangerous-tools" => tool_policy.allow_dangerous_tools = true,
+            "--authz-policy" => {
+                i += 1;
+                tool_policy.authz_policy = args.get(i).cloned().ok_or("--authz-policy needs a value")?;
+            }
+            "--sandbox" => {
+                i += 1;
+                tool_policy.sandbox_profile = args.get(i).cloned().ok_or("--sandbox needs a value")?;
+            }
+            "--audit-redaction" => tool_policy.audit_redaction = true,
             other => return Err(format!("unknown mcp-gateway flag: {other}")),
         }
         i += 1;
@@ -3756,12 +3759,29 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         .filter(|s| !s.is_empty())
         .collect();
     let active_tools: Vec<String> = parsed_tools
-        .into_iter()
-        .filter(|t| !dangerous.contains(t.to_lowercase().as_str()))
+        .iter()
+        .filter(|t| tool_policy.allows(t))
+        .cloned()
         .collect();
+    let denied_tools: Vec<String> = parsed_tools
+        .iter()
+        .filter(|t| !tool_policy.allows(t))
+        .cloned()
+        .collect();
+    if !denied_tools.is_empty() {
+        eprintln!(
+            "WARNING: denied high-risk MCP tools until all authz, sandbox and redacted-audit controls are configured: {}",
+            denied_tools.join(", ")
+        );
+    }
 
     if active_tools.is_empty() {
-        eprintln!("ERROR: --tools is required. Provide a comma-separated list of MCP tool names.\n  Example: iicp-node mcp-gateway --tools summarize_text,lookup_status --mcp-url http://localhost:8001");
+        let reason = if raw_tools.is_empty() {
+            "--tools is required"
+        } else {
+            "all requested tools were denied by the MCP safety policy"
+        };
+        eprintln!("ERROR: {reason}. Provide safe tool names, or configure every dangerous-tool control.\n  Example: iicp-node mcp-gateway --tools summarize_text,lookup_status --mcp-url http://localhost:8001");
         std::process::exit(2);
     }
 
@@ -3774,6 +3794,15 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
     let directory_url = directory_url.trim_end_matches('/').to_string();
     let mcp_url = mcp_url.trim_end_matches('/').to_string();
     let intents: Vec<String> = active_tools.iter().map(|t| tool_to_intent(t)).collect();
+    let capabilities: Vec<Value> = active_tools
+        .iter()
+        .zip(intents.iter())
+        .map(|(tool, intent)| json!({
+            "intent": intent,
+            "models": [format!("mcp:{tool}")],
+            "max_tokens": 65536,
+        }))
+        .collect();
 
     // Register
     let http_client = reqwest::Client::builder()
@@ -3786,9 +3815,17 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             "node_id": node_id,
             "region": region,
             "endpoint": public_endpoint,
-            "intents": intents,
-            "mcp_tools": active_tools,
-            "protocol_version": "1.0",
+            "capabilities": capabilities,
+            "limits": {"max_concurrent": 1, "tokens_per_min": 65536},
+            "backend": "custom",
+            "policy": {
+                "allow_remote_inference": false,
+                "allow_tool_execution": true,
+                "allow_file_access": active_tools.iter().any(|tool| matches!(
+                    iicp_client::mcp_policy::tool_risk_label(tool),
+                    "file_read" | "file_write"
+                )),
+            },
         });
         let mut req = http_client
             .post(format!("{directory_url}/register"))
@@ -3850,6 +3887,7 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         node_token: Arc<Mutex<String>>,
         mcp_client: reqwest::Client,
         mcp_rpc_id: Arc<Mutex<u64>>,
+        tool_policy: McpToolPolicy,
     }
 
     let state = GwState {
@@ -3859,6 +3897,7 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         node_token: hb_token,
         mcp_client: http_client.clone(),
         mcp_rpc_id: Arc::new(Mutex::new(0)),
+        tool_policy: tool_policy.clone(),
     };
 
     async fn health_handler(State(s): State<GwState>) -> Json<Value> {
@@ -3867,7 +3906,16 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             .unwrap_or_default()
             .as_secs();
         Json(
-            json!({"status": "ok", "node_id": s.node_id, "active_tools": s.active_tools, "mcp_server": s.mcp_url, "timestamp": ts}),
+            json!({
+                "status": "ok", "node_id": s.node_id, "active_tools": s.active_tools,
+                "mcp_server": s.mcp_url, "timestamp": ts,
+                "mcp_policy": {
+                    "dangerous_tools_enabled": s.tool_policy.dangerous_ready(),
+                    "authz_policy": if s.tool_policy.authz_policy.is_empty() { Value::Null } else { json!(s.tool_policy.authz_policy) },
+                    "sandbox_profile": if s.tool_policy.sandbox_profile.is_empty() { Value::Null } else { json!(s.tool_policy.sandbox_profile) },
+                    "audit_redacted": s.tool_policy.audit_redaction,
+                }
+            }),
         )
     }
 
@@ -3922,34 +3970,15 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                 Json(json!({"error": "Cannot determine tool name"})),
             );
         }
-        let dangerous: std::collections::HashSet<&str> = [
-            "bash",
-            "shell",
-            "exec",
-            "run_command",
-            "eval",
-            "write_file",
-            "file_write",
-            "filesystem_write",
-            "delete_file",
-            "remove_file",
-            "browser_control",
-            "computer_use",
-            "credential_access",
-            "read_secret",
-            "secrets",
-            "system_control",
-            "service_control",
-            "physical_world",
-            "regulated_decision",
-        ]
-        .iter()
-        .copied()
-        .collect();
-        if dangerous.contains(tool_name.to_lowercase().as_str()) {
+        let arguments = payload.get("arguments").cloned().unwrap_or(json!({}));
+        let argument_count = arguments.as_object().map(|v| v.len()).unwrap_or(0);
+        if !s.tool_policy.allows(&tool_name) {
             return (
                 StatusCode::FORBIDDEN,
-                Json(json!({"error": "Tool not permitted"})),
+                Json(json!({
+                    "error": "Tool not permitted by MCP risk policy",
+                    "policy_receipt": s.tool_policy.receipt(&tool_name, "denied", argument_count),
+                })),
             );
         }
         if !s.active_tools.is_empty() && !s.active_tools.contains(&tool_name) {
@@ -3963,7 +3992,6 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             .and_then(|v| v.as_str())
             .unwrap_or(&uuid::Uuid::new_v4().to_string())
             .to_string();
-        let arguments = payload.get("arguments").cloned().unwrap_or(json!({}));
         let rpc_id = {
             let mut g = s.mcp_rpc_id.lock().unwrap();
             *g += 1;
@@ -3997,7 +4025,10 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                     let result = data.get("result").cloned().unwrap_or(Value::Null);
                     (
                         StatusCode::OK,
-                        Json(json!({"task_id": task_id, "status": "completed", "result": result})),
+                        Json(json!({
+                            "task_id": task_id, "status": "completed", "result": result,
+                            "policy_receipt": s.tool_policy.receipt(&tool_name, "allowed", argument_count),
+                        })),
                     )
                 }
             },

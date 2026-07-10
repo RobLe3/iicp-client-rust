@@ -9,6 +9,14 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.84] — 2026-07-10
+
+### Added — MCP safety controls and operator self-service signing
+- The packaged MCP gateway now denies all named non-benign risk classes unless explicit operator opt-in, caller authorization policy, an accepted sandbox profile, and redacted audit are configured together.
+- Gateway registration now uses the current directory `capabilities`/`limits` contract and advertises only tools that passed the local risk gate.
+- Added a canonical operator-key signing helper for challenge-based acceptance and DSR self-service requests.
+- Added a packaged canonical MCP risk taxonomy and redacted policy receipts that exclude tool arguments.
+
 ## [0.7.83] — 2026-07-09
 
 ### Added — policy-manifest identity routing

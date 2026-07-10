@@ -13,6 +13,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// A delegation token (matches the PHP/TS wire shape): `node_id`, `operator_pub` (base64 of the
 /// 32-byte Ed25519 pubkey), `not_after` (unix seconds), `sig` (base64 of the 64-byte signature).
@@ -72,6 +74,32 @@ pub fn sign_rename(
 ) -> String {
     let sig = key.sign(&canonical_rename_bytes(display_name, operator_pub_b64, ts));
     STANDARD.encode(sig.to_bytes())
+}
+
+/// Canonical #599/#609 operator acceptance/DSR challenge bytes. The caller supplies
+/// all action-specific fields except `sig`; top-level keys are serialized in lexical order.
+pub fn canonical_operator_self_service_bytes(
+    action: &str,
+    fields: &BTreeMap<String, Value>,
+) -> Vec<u8> {
+    let mut payload = fields.clone();
+    payload.remove("sig");
+    payload.insert("action".to_string(), Value::String(action.to_string()));
+    let mut out = b"iicp:operator:self-service:v1\n".to_vec();
+    out.extend(serde_json::to_vec(&payload).expect("canonical operator self-service json"));
+    out
+}
+
+/// Sign an operator acceptance or DSR request without exposing the private key.
+pub fn sign_operator_self_service(
+    key: &SigningKey,
+    action: &str,
+    fields: &BTreeMap<String, Value>,
+) -> String {
+    STANDARD.encode(
+        key.sign(&canonical_operator_self_service_bytes(action, fields))
+            .to_bytes(),
+    )
 }
 
 /// Base64 (standard, padded) of the operator's raw 32-byte Ed25519 public key — the form the
@@ -184,6 +212,21 @@ mod tests {
                 &sig,
             )
             .expect("operator pubkey verifies its own rename signature");
+    }
+
+    #[test]
+    fn operator_self_service_bytes_match_cross_language_kat() {
+        let fields = BTreeMap::from([
+            ("operator_pub".to_string(), Value::String("T3BQdWI=".to_string())),
+            ("nonce".to_string(), Value::String("nonce-1234567890".to_string())),
+            ("ts".to_string(), Value::from(1_893_456_000_i64)),
+            ("terms_version".to_string(), Value::String("2026-07".to_string())),
+            ("dpa_version".to_string(), Value::String("2026-07".to_string())),
+        ]);
+        assert_eq!(
+            String::from_utf8(canonical_operator_self_service_bytes("accept", &fields)).unwrap(),
+            "iicp:operator:self-service:v1\n{\"action\":\"accept\",\"dpa_version\":\"2026-07\",\"nonce\":\"nonce-1234567890\",\"operator_pub\":\"T3BQdWI=\",\"terms_version\":\"2026-07\",\"ts\":1893456000}"
+        );
     }
 
     #[test]

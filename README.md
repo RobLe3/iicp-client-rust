@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.83"
+iicp-client = "0.7.84"
 ```
 
 ## One-line test
@@ -41,7 +41,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.83 or newer
+iicp-node --version    # prints iicp-node 0.7.84 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -52,6 +52,16 @@ Privacy note: the selected remote node can read the prompt it executes. IICP-CX
 keeps key-ready transport/relay paths confidential, but it is not
 executor-blind inference. For sensitive data, use local/browser inference or a
 fail-closed routing profile.
+
+## MCP gateway safety
+
+`iicp-node mcp-gateway --tools format_json,summarize_text` advertises only the
+tools you name. Shell, file, network, browser, credential, system-control and
+regulated-decision tools are denied by default. Enabling one requires all four
+controls: `--allow-dangerous-tools`, `--authz-policy ID`, `--sandbox container`
+and `--audit-redaction` (equivalent `IICP_MCP_*` environment variables exist).
+Policy receipts include risk/decision metadata and argument counts, never tool
+arguments, prompts, credentials or response content.
 
 ## Use from Rust
 
