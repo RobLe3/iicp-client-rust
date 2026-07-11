@@ -1880,6 +1880,32 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
         backend_attention,
     );
     let prefix = iicp_client::recovery::node_registry_prefix(&node.node_id);
+    let handoff_markers: Vec<String> = config_dir()
+        .ok()
+        .and_then(|dir| fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("operator-handoff-pending-") && name.ends_with(".json"))
+        })
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .filter_map(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .filter(|body| {
+            body["affected_node_names"]
+                .as_array()
+                .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(node.name.as_str())))
+        })
+        .map(|body| {
+            if body["restart_attempted"].as_bool().unwrap_or(false) {
+                "restart_attempted".to_string()
+            } else {
+                "grace_pending".to_string()
+            }
+        })
+        .collect();
     let binary_resolution = iicp_client::updater::binary_resolution();
     let managed_rust_path = binary_resolution.managed_rust_path.display().to_string();
     let shell_path = binary_resolution
@@ -1901,6 +1927,7 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
                 "local_health_error": health_error,
                 "directory_presence": presence,
                 "saved_credential_status": saved_credential_status,
+                "operator_handoff": handoff_markers.first(),
                 "binary_resolution": {
                     "managed_rust_path": managed_rust_path,
                     "shell_path": shell_path,
@@ -1924,6 +1951,9 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
         println!("  Directory prefix        {prefix}");
         println!("  Directory presence      {presence:?}");
         println!("  Saved credential        {saved_credential_status}");
+        if let Some(handoff) = handoff_markers.first() {
+            println!("  Operator handoff        {handoff} (redacted local marker)");
+        }
         println!("  Managed Rust binary     {managed_rust_path}");
         if shell_shadows_managed_rust {
             println!(
@@ -3734,6 +3764,32 @@ fn write_private_json_new(path: &PathBuf, value: &serde_json::Value) -> Result<(
     Ok(())
 }
 
+/// A redacted local handoff marker lets the supervised updater perform one
+/// delayed, sequential restart after an operator rotation. It deliberately
+/// contains node *names* only: never operator IDs, private keys, node tokens,
+/// or directory receipts.
+fn write_operator_handoff_marker(node_names: &[String]) -> Result<PathBuf, String> {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+    let path = config_dir()
+        .map_err(|e| e.to_string())?
+        .join(format!("operator-handoff-pending-{stamp}.json"));
+    write_private_json_new(
+        &path,
+        &serde_json::json!({
+            "schema": "iicp.operator-handoff.v1",
+            "action": "rotate",
+            "created_at_unix": stamp,
+            "grace_seconds": 300,
+            "affected_node_names": node_names,
+            "restart_attempted": false,
+        }),
+    )?;
+    Ok(path)
+}
+
 async fn run_operator_key(args: &[String]) -> Result<(), String> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         print!("usage: iicp-node operator key <rotate|revoke> --yes [--directory-url URL]\n");
@@ -3813,7 +3869,7 @@ async fn run_operator_key(args: &[String]) -> Result<(), String> {
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0);
     let receipt = config_dir().map_err(|e| e.to_string())?.join(format!("operator-{receipt_action}-receipt-{stamp}.json"));
     write_private_json_new(&receipt, &serde_json::json!({"schema":"iicp.operator-key-receipt.v1","action":receipt_action,"status":body.get("status"),"operator_fingerprint":body.get("operator_fingerprint"),"linked_nodes":body.get("linked_nodes"),"receipt_id_prefix":body.get("receipt_id_prefix")}))?;
-    if let Some(next) = successor { save_operator(&next).map_err(|e| e.to_string())?; let mut migrated = 0; for mut node in list_nodes().map_err(|e| e.to_string())? { if node.operator_id == old.operator_id { node.operator_id = next.operator_id.clone(); save_node(&node).map_err(|e| e.to_string())?; migrated += 1; } } println!("Operator identity migrated; {migrated} saved node(s) will re-register with the new key. Encrypted old-key backup: {}. Redacted receipt: {}.", backup_path.unwrap().display(), receipt.display()); }
+    if let Some(next) = successor { save_operator(&next).map_err(|e| e.to_string())?; let mut migrated = 0; let mut node_names = Vec::new(); for mut node in list_nodes().map_err(|e| e.to_string())? { if node.operator_id == old.operator_id { node.operator_id = next.operator_id.clone(); node_names.push(node.name.clone()); save_node(&node).map_err(|e| e.to_string())?; migrated += 1; } } let handoff = write_operator_handoff_marker(&node_names)?; println!("Operator identity migrated; {migrated} saved node(s) will re-register with the new key. Encrypted old-key backup: {}. Redacted receipt: {}. Supervised handoff marker: {} (one restart pass after 5 minutes).", backup_path.unwrap().display(), receipt.display(), handoff.display()); }
     else { println!("Operator identity revoked; redacted receipt: {}.", receipt.display()); }
     Ok(())
 }
