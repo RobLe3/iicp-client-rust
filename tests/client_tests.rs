@@ -122,6 +122,7 @@ async fn policy_refuses_high_risk_intent_before_discovery() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // serializes process-global environment changes in this integration test
 async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
     // The mock route is deliberately loopback-only.  Keep the production SSRF
     // default fail-closed while explicitly enabling the documented test escape
