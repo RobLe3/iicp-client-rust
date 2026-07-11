@@ -280,21 +280,27 @@ impl IicpClient {
 
             if status == 201 {
                 let node_id = body["node_id"].as_str().unwrap_or("");
-                let directory_key = {
-                    let mut cached = self.dispatch_ticket_key.lock().unwrap();
-                    if cached.is_none() {
-                        let key_url = format!("{base}/v1/directory-key");
-                        if let Ok(key_response) = self.http.inner().get(key_url).send().await {
-                            if key_response.status().is_success() {
-                                if let Ok(key_body) = key_response.json::<serde_json::Value>().await
-                                {
-                                    *cached = key_body["public_key"].as_str().map(str::to_owned);
+                // Never hold a std::sync::MutexGuard across an await. Besides
+                // blocking parallel dispatches, that makes the proxy feature's
+                // boxed request future non-Send. Fetch outside the lock, then
+                // cache the first usable key once the response arrives.
+                let key_missing = self.dispatch_ticket_key.lock().unwrap().is_none();
+                if key_missing {
+                    let key_url = format!("{base}/v1/directory-key");
+                    if let Ok(key_response) = self.http.inner().get(key_url).send().await {
+                        if key_response.status().is_success() {
+                            if let Ok(key_body) = key_response.json::<serde_json::Value>().await {
+                                if let Some(key) = key_body["public_key"].as_str() {
+                                    let mut cached = self.dispatch_ticket_key.lock().unwrap();
+                                    if cached.is_none() {
+                                        *cached = Some(key.to_owned());
+                                    }
                                 }
                             }
                         }
                     }
-                    cached.clone()
-                };
+                }
+                let directory_key = self.dispatch_ticket_key.lock().unwrap().clone();
                 let issuer = base.strip_suffix("/api").unwrap_or(base);
                 if body["ticket"]
                     .as_str()

@@ -9,7 +9,11 @@
 //! process so the node comes back on the new binary in covered service paths.
 //! The loop is failure-isolated and opt-out via `IICP_AUTO_UPDATE=0`.
 
-use std::sync::{Mutex, OnceLock};
+use std::{
+    env,
+    path::{Path, PathBuf},
+    sync::{Mutex, OnceLock},
+};
 
 const DEFAULT_AUTO_UPDATE_INTERVAL_SECS: u64 = 3600;
 
@@ -62,6 +66,66 @@ pub fn is_outdated(current: &str, latest: &str) -> bool {
 }
 
 pub const UPGRADE_COMMAND: &str = "cargo install iicp-client --force";
+
+/// The unattended host updater and generated supervisor units use this Cargo
+/// installation by default.  It is deliberately separate from whichever
+/// `iicp-node` happens to be first in an interactive shell's PATH: operators
+/// can have another SDK flavour installed for testing without changing the
+/// binary that keeps their provider services current.
+pub fn managed_rust_binary_path() -> PathBuf {
+    env::var_os("IICP_MANAGED_RUST_BIN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo/bin/iicp-node"))
+        })
+        .unwrap_or_else(|| PathBuf::from(".cargo/bin/iicp-node"))
+}
+
+/// Find the first executable-like `iicp-node` path in a supplied PATH string.
+/// This intentionally does not execute that path: a diagnostic must not run a
+/// competing client merely to explain an interactive-shell collision.
+pub fn binary_in_path(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    env::split_paths(path).find_map(|dir| {
+        let candidate = dir.join("iicp-node");
+        candidate.is_file().then_some(candidate)
+    })
+}
+
+fn normalized_path(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Return whether the interactive shell will invoke a different binary from
+/// the Cargo-managed Rust binary. A collision is advisory: IICP never changes
+/// PATH or removes another installed client automatically.
+pub fn shell_shadows_managed_rust(managed: &Path, shell: Option<&Path>) -> bool {
+    shell
+        .map(|path| normalized_path(path) != normalized_path(managed))
+        .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryResolution {
+    pub managed_rust_path: PathBuf,
+    pub shell_path: Option<PathBuf>,
+    pub shell_shadows_managed_rust: bool,
+}
+
+/// Report the relationship between the service-managed Rust binary and the
+/// binary an interactive shell would resolve. This is a read-only UX and
+/// support diagnostic, not an updater decision.
+pub fn binary_resolution() -> BinaryResolution {
+    let managed_rust_path = managed_rust_binary_path();
+    let shell_path = binary_in_path(env::var_os("PATH").as_deref());
+    let shell_shadows_managed_rust =
+        shell_shadows_managed_rust(&managed_rust_path, shell_path.as_deref());
+    BinaryResolution {
+        managed_rust_path,
+        shell_path,
+        shell_shadows_managed_rust,
+    }
+}
 
 /// Fetch the newest published version from crates.io, or None on any error.
 /// crates.io requires a descriptive User-Agent.
@@ -290,5 +354,16 @@ mod tests {
     fn parse_truncates_prerelease() {
         assert_eq!(parse_version("1.2.3-rc1"), vec![1, 2, 3]);
         assert_eq!(parse_version("0.7.57"), vec![0, 7, 57]);
+    }
+
+    #[test]
+    fn shell_collision_is_advisory_and_path_based() {
+        let managed = Path::new("/Users/example/.cargo/bin/iicp-node");
+        assert!(!shell_shadows_managed_rust(managed, Some(managed)));
+        assert!(!shell_shadows_managed_rust(managed, None));
+        assert!(shell_shadows_managed_rust(
+            managed,
+            Some(Path::new("/Users/example/.nvm/bin/iicp-node"))
+        ));
     }
 }

@@ -341,12 +341,36 @@ fn print_update_help() {
     print!(
         "usage: iicp-node update\n\n\
          Check whether a newer published iicp-client release is available. Read-only:\n\
-         this command never installs or restarts anything.\n\n\
+         this command never installs or restarts anything. It also reports when an\n\
+         interactive shell resolves a different client binary than the managed Rust\n\
+         provider-service binary; that warning never changes PATH or removes a client.\n\n\
          Exit codes:\n\
          \x20 0   current, unreachable registry, or help\n\
          \x20 10  newer release available\n\n\
          Options:\n\
          \x20 -h, --help            Print this help (does NOT contact crates.io)\n"
+    );
+}
+
+/// Explain a common multi-SDK support trap without changing the user's shell
+/// configuration or uninstalling a competing client. The launchd/systemd
+/// updater is intentionally pinned to the Cargo-managed Rust binary, while an
+/// interactive terminal can resolve a different `iicp-node` first in PATH.
+fn print_managed_binary_notice() {
+    let resolution = iicp_client::updater::binary_resolution();
+    if !resolution.shell_shadows_managed_rust {
+        return;
+    }
+    let shell_path = resolution
+        .shell_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "(not found)".to_string());
+    let managed_path = resolution.managed_rust_path.display();
+    println!(
+        "  Notice: shell `iicp-node` is {shell_path}, not managed Rust binary {managed_path}.\n\
+           The hourly provider updater manages the Rust binary and supervised services, not this shell path.\n\
+           No PATH or installed client was changed. To use Rust in this shell, put ~/.cargo/bin before competing client bins, then run `hash -r`."
     );
 }
 
@@ -1856,6 +1880,13 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
         backend_attention,
     );
     let prefix = iicp_client::recovery::node_registry_prefix(&node.node_id);
+    let binary_resolution = iicp_client::updater::binary_resolution();
+    let managed_rust_path = binary_resolution.managed_rust_path.display().to_string();
+    let shell_path = binary_resolution
+        .shell_path
+        .as_ref()
+        .map(|path| path.display().to_string());
+    let shell_shadows_managed_rust = binary_resolution.shell_shadows_managed_rust;
 
     if as_json {
         println!(
@@ -1870,6 +1901,11 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
                 "local_health_error": health_error,
                 "directory_presence": presence,
                 "saved_credential_status": saved_credential_status,
+                "binary_resolution": {
+                    "managed_rust_path": managed_rust_path,
+                    "shell_path": shell_path,
+                    "shell_shadows_managed_rust": shell_shadows_managed_rust,
+                },
                 "recovery_state": state,
                 "recommended_action": action,
                 "health": health_json,
@@ -1888,6 +1924,13 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
         println!("  Directory prefix        {prefix}");
         println!("  Directory presence      {presence:?}");
         println!("  Saved credential        {saved_credential_status}");
+        println!("  Managed Rust binary     {managed_rust_path}");
+        if shell_shadows_managed_rust {
+            println!(
+                "  Shell command warning   resolves to {} instead; updater manages the Rust binary only (no automatic PATH/client changes)",
+                shell_path.as_deref().unwrap_or("unknown")
+            );
+        }
         if saved_credential_status == "stale_or_invalid" {
             println!(
                 "  Credential detail       saved node token is stale; serving may be healthy while credits fail"
@@ -4467,6 +4510,7 @@ async fn main() {
         // #521 P1 — read-only version check. Exit 10 when a newer release
         // exists (cron/scripts can act), 0 when current/unreachable. No install.
         use iicp_client::updater::{is_outdated, latest_crates_version, UPGRADE_COMMAND};
+        print_managed_binary_notice();
         let current = env!("CARGO_PKG_VERSION");
         match latest_crates_version(5).await {
             None => {
