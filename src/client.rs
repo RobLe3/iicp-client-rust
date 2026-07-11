@@ -7,6 +7,7 @@ use regex::Regex;
 
 use crate::confidentiality::encrypt_payload;
 use crate::consumer_token::{acquire_consumer_token, ConsumerTokenCache};
+use crate::dispatch_ticket::verify_dispatch_route_ticket;
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
 use crate::policy::ensure_intent_allowed;
@@ -169,6 +170,7 @@ pub struct IicpClient {
     http: HttpClient,
     /// Phase 2 (#496): in-process consumer token cache.
     ct_cache: ConsumerTokenCache,
+    dispatch_ticket_key: std::sync::Mutex<Option<String>>,
 }
 
 impl IicpClient {
@@ -190,6 +192,7 @@ impl IicpClient {
             config,
             http,
             ct_cache: ConsumerTokenCache::new(),
+            dispatch_ticket_key: std::sync::Mutex::new(None),
         })
     }
 
@@ -276,6 +279,45 @@ impl IicpClient {
             let error_code = body["error"]["code"].as_str();
 
             if status == 201 {
+                let node_id = body["node_id"].as_str().unwrap_or("");
+                let directory_key = {
+                    let mut cached = self.dispatch_ticket_key.lock().unwrap();
+                    if cached.is_none() {
+                        let key_url = format!("{base}/v1/directory-key");
+                        if let Ok(key_response) = self.http.inner().get(key_url).send().await {
+                            if key_response.status().is_success() {
+                                if let Ok(key_body) = key_response.json::<serde_json::Value>().await
+                                {
+                                    *cached = key_body["public_key"].as_str().map(str::to_owned);
+                                }
+                            }
+                        }
+                    }
+                    cached.clone()
+                };
+                let issuer = base.strip_suffix("/api").unwrap_or(base);
+                if body["ticket"]
+                    .as_str()
+                    .and_then(|ticket| {
+                        directory_key.as_deref().and_then(|key| {
+                            verify_dispatch_route_ticket(
+                                ticket,
+                                key,
+                                issuer,
+                                node_id,
+                                intent,
+                                chrono::Utc::now().timestamp(),
+                            )
+                        })
+                    })
+                    .is_none()
+                {
+                    return Err(TicketRouteError::Iicp(IicpError::Protocol {
+                        code: "IICP-DISPATCH-TICKET-UNVERIFIED".into(),
+                        message: "Directory returned an unverifiable dispatch ticket".into(),
+                        status,
+                    }));
+                }
                 let mut route = body["route"].clone();
                 if let Some(obj) = route.as_object_mut() {
                     obj.insert("node_id".into(), body["node_id"].clone());

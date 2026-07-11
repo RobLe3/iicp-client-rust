@@ -131,13 +131,38 @@ async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
     unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
     let mut server = mockito::Server::new_async().await;
     let endpoint = server.url();
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer, SigningKey};
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let claims = serde_json::json!({
+        "v": 1, "typ": "dispatch-route-ticket", "iss": server.url(),
+        "aud": "iicp.directory.dispatch", "jti": "0123456789abcdef01234567",
+        "node_id": "node-ticket", "intent": "urn:iicp:intent:llm:chat:v1", "iat": 1, "exp": 4_102_444_800i64
+    });
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
+    let ticket_token = format!(
+        "{}.{}",
+        payload,
+        hex::encode(
+            signing_key
+                .sign(format!("iicp:dispatch-route-ticket:v1\n{payload}").as_bytes())
+                .to_bytes()
+        )
+    );
+    let _key = server
+        .mock("GET", "/v1/directory-key")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(serde_json::json!({"public_key": hex::encode(signing_key.verifying_key().to_bytes()), "algorithm": "ed25519"}).to_string())
+        .create_async()
+        .await;
     let _ticket = server
         .mock("POST", "/v1/dispatch/ticket")
         .with_status(201)
         .with_header("content-type", "application/json")
         .with_body(
             serde_json::json!({
-                "ticket": "secret-ticket-token",
+                "ticket": ticket_token,
                 "ticket_id_prefix": "abc123def456",
                 "node_id": "node-ticket",
                 "route": {

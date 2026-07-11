@@ -19,6 +19,7 @@
 
 mod client;
 pub mod consumer_token;
+pub mod dispatch_ticket;
 mod errors;
 mod http;
 pub mod node;
