@@ -17,9 +17,13 @@
 //! Mirrors the Python (`iicp_client.cli`) and TypeScript (`@iicp/client/cli`)
 //! entry points so operators choosing Rust get the same one-liner setup.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
@@ -434,6 +438,7 @@ fn print_operator_help() {
         "usage: iicp-node operator <subcommand> [options]\n\n\
          Subcommands:\n\
          \x20 rename <name>   Change your public display_name (signed by your operator key)\n\
+         \x20 dsr <action>    Export, restrict, or anonymize your directory records\n\
          \x20 encrypt         Password-encrypt the operator secret at rest ($IICP_OPERATOR_PASSPHRASE)\n\
          \x20 decrypt         Remove at-rest encryption of the operator secret\n\n\
          rename options:\n\
@@ -3494,13 +3499,199 @@ fn run_operator_decrypt() -> Result<(), String> {
     Ok(())
 }
 
+async fn run_operator_dsr(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!(
+            "usage: iicp-node operator dsr <export|restrict|anonymize> [options]\n\n\
+             The local operator key signs a one-use directory challenge. It never enters a browser or request body.\n\n\
+             \x20 --output FILE             Required for export; creates a new mode-0600 local file\n\
+             \x20 --yes                     Confirm restrict or anonymize after the retained-record notice\n\
+             \x20 --tracking-id ID          Optional local reference\n\
+             \x20 --directory-url URL       IICP directory base URL\n"
+        );
+        return Ok(());
+    }
+    let action = args.first().map(String::as_str).unwrap_or("");
+    if !matches!(action, "export" | "restrict" | "anonymize") {
+        return Err("usage: iicp-node operator dsr <export|restrict|anonymize> [options]".into());
+    }
+    let mut directory_url: Option<String> = None;
+    let mut tracking_id: Option<String> = None;
+    let mut output_path: Option<PathBuf> = None;
+    let mut yes = false;
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
+        if arg == "--yes" {
+            yes = true;
+        } else if let Some(value) = arg.strip_prefix("--directory-url=") {
+            directory_url = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--tracking-id=") {
+            tracking_id = Some(value.to_string());
+        } else if let Some(value) = arg.strip_prefix("--output=") {
+            output_path = Some(PathBuf::from(value));
+        } else if matches!(
+            arg.as_str(),
+            "--directory-url" | "--tracking-id" | "--output"
+        ) {
+            i += 1;
+            let value = args
+                .get(i)
+                .ok_or_else(|| format!("{arg} requires a value"))?
+                .clone();
+            match arg.as_str() {
+                "--directory-url" => directory_url = Some(value),
+                "--tracking-id" => tracking_id = Some(value),
+                "--output" => output_path = Some(PathBuf::from(value)),
+                _ => unreachable!(),
+            }
+        } else {
+            return Err(format!("unknown operator dsr option: {arg}"));
+        }
+        i += 1;
+    }
+    if action == "export" && output_path.is_none() {
+        return Err(
+            "export requires --output <new-file>; it is not printed to the terminal.".into(),
+        );
+    }
+    if output_path.as_ref().is_some_and(|path| path.exists()) {
+        return Err(
+            "--output already exists; choose a new path to avoid replacing an export.".into(),
+        );
+    }
+    if action != "export" {
+        eprintln!(
+            "This action restricts or anonymizes directory records. Minimal signed ledger, security and accounting records may be retained and are explained in the receipt."
+        );
+        if !yes {
+            return Err("Re-run with --yes to confirm.".into());
+        }
+    }
+
+    let op = load_operator()
+        .map_err(|e| e.to_string())?
+        .ok_or("no operator identity — run `iicp-node init` first")?;
+    if !op.is_key_backed() {
+        return Err("this legacy operator identity cannot sign a rights request; regenerate a key-backed identity.".into());
+    }
+    let directory_url = directory_url.unwrap_or_else(|| {
+        env::var("IICP_DIRECTORY_URL").unwrap_or_else(|_| "https://iicp.network/api".to_string())
+    });
+    let base = format!("{}/v1/operator", directory_url.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("client: {e}"))?;
+    let challenge = client
+        .post(format!("{base}/challenge"))
+        .json(&serde_json::json!({"operator_pub": op.operator_id}))
+        .send()
+        .await
+        .map_err(|e| format!("rights request failed: {e}"))?;
+    let challenge_status = challenge.status();
+    let challenge_body: serde_json::Value =
+        challenge.json().await.unwrap_or(serde_json::Value::Null);
+    if !challenge_status.is_success() {
+        let message = challenge_body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("challenge rejected");
+        return Err(format!("directory challenge rejected: {message}"));
+    }
+    let nonce = challenge_body
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .ok_or("directory challenge was incomplete")?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "operator_pub".to_string(),
+        serde_json::Value::String(op.operator_id.clone()),
+    );
+    fields.insert(
+        "nonce".to_string(),
+        serde_json::Value::String(nonce.to_string()),
+    );
+    fields.insert("ts".to_string(), serde_json::Value::Number(ts.into()));
+    fields.insert(
+        "tracking_id".to_string(),
+        serde_json::Value::String(
+            tracking_id.unwrap_or_else(|| format!("dsr-{}", uuid::Uuid::new_v4())),
+        ),
+    );
+    if action != "export" {
+        fields.insert("confirm".to_string(), serde_json::Value::Bool(true));
+    }
+    let signing_key = op.signing_key()?;
+    let sig = iicp_client::delegation::sign_operator_self_service(
+        &signing_key,
+        &format!("dsr_{action}"),
+        &fields,
+    );
+    fields.insert("sig".to_string(), serde_json::Value::String(sig));
+    let response = client
+        .post(format!("{base}/dsr/{action}"))
+        .json(&fields)
+        .send()
+        .await
+        .map_err(|e| format!("rights request failed: {e}"))?;
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        let message = body
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("request rejected");
+        return Err(format!("directory rejected rights request: {message}"));
+    }
+    if let Some(path) = output_path {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
+            .open(&path)
+            .map_err(|e| format!("unable to save export safely: {e}"))?;
+        serde_json::to_writer_pretty(&mut file, &body)
+            .map_err(|e| format!("unable to encode export: {e}"))?;
+        file.write_all(b"\n")
+            .map_err(|e| format!("unable to save export safely: {e}"))?;
+        println!(
+            "Saved redacted directory export to {} (mode 0600).",
+            path.display()
+        );
+    } else {
+        println!("Directory {action} request completed.");
+    }
+    if let Some(id) = body.get("tracking_id").and_then(|v| v.as_str()) {
+        println!("Receipt reference: {id}");
+    }
+    if let Some(reason) = body
+        .get("retention_notice")
+        .or_else(|| body.get("retention_reason"))
+        .and_then(|v| v.as_str())
+    {
+        println!("Retained records: {reason}");
+    }
+    Ok(())
+}
+
 async fn run_operator(args: &[String]) -> Result<(), String> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    // DSR owns its detailed help because its safety requirements differ from
+    // identity management. Other operator help stays intentionally compact.
+    if sub == "dsr" {
+        return run_operator_dsr(&args[1..]).await;
+    }
     // `-h`/`--help` anywhere prints usage + exits 0 (covers the sub-dispatch too).
     if wants_help(args) {
         print_operator_help();
         return Ok(());
     }
-    let sub = args.first().map(String::as_str).unwrap_or("");
     if sub == "encrypt" {
         return run_operator_encrypt();
     }
@@ -4272,6 +4463,8 @@ fn apply_tunnel_profile(_node: &mut iicp_client::node::IicpNode, _url: &str) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     // Reachability escalation order (tunnel-FIRST, relay = last resort; maintainer 2026-06-13).
     // serve consumes plan_reachability, so the tested order is the used order. Parity w/ Py/TS.
@@ -4877,5 +5070,51 @@ mod tests {
             opts.relay_accept_port, 9485,
             "relay_accept_port must default to 9485"
         );
+    }
+
+    #[tokio::test]
+    async fn operator_dsr_export_uses_local_identity_and_creates_private_file() {
+        let home = std::env::temp_dir().join(format!("iicp-dsr-{}", uuid::Uuid::new_v4()));
+        std::env::set_var("IICP_HOME", &home);
+        save_operator(&OperatorIdentity::generate(
+            "Rights Test",
+            "private@example.test",
+        ))
+        .unwrap();
+        let mut server = mockito::Server::new_async().await;
+        let challenge = server
+            .mock("POST", "/v1/operator/challenge")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"nonce":"nonce-1234567890123456"}"#)
+            .create_async()
+            .await;
+        let export = server
+            .mock("POST", "/v1/operator/dsr/export")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"schema":"iicp.dsr.export.v1","tracking_id":"dsr-test","retention_notice":"ledger retained"}"#)
+            .create_async()
+            .await;
+        let output = home.join("rights.json");
+        let args = vec![
+            "export".to_string(),
+            "--directory-url".to_string(),
+            server.url(),
+            "--output".to_string(),
+            output.display().to_string(),
+        ];
+        run_operator_dsr(&args).await.unwrap();
+        challenge.assert_async().await;
+        export.assert_async().await;
+        let body: serde_json::Value = serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(body["schema"], "iicp.dsr.export.v1");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = fs::remove_dir_all(&home);
+        std::env::remove_var("IICP_HOME");
     }
 }

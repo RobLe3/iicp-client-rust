@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.86"
+iicp-client = "0.7.87"
 ```
 
 ## One-line test
@@ -41,7 +41,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.86 or newer
+iicp-node --version    # prints iicp-node 0.7.87 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -517,6 +517,16 @@ and wallet); there is no central recovery. Back it up (encrypted), never commit 
 and the identity, with its founder ordinal, is gone.
 
 Full guide: **[iicp.network/docs/operator-identity](https://iicp.network/docs/operator-identity)**
+
+### Operator data rights
+
+You can request a portable, redacted record of the operator metadata held by a compatible directory without uploading your private identity key:
+
+```bash
+iicp-node operator dsr export --output ~/iicp-operator-export.json
+```
+
+The client obtains a short-lived challenge and signs it locally. The receipt excludes the private key, node tokens, prompt content, and contact details; it is saved owner-only on Unix. `restrict` and `anonymize` are explicit, confirmed requests and do not erase retention records that a directory must keep for security, fraud prevention, or legal obligations. See the [operator rights guide](https://iicp.network/operator/rights).
 
 ---
 

@@ -9,6 +9,13 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.87] — 2026-07-11
+
+### Added — operator data-rights self-service
+- `iicp-node operator dsr export --output FILE` requests a short-lived directory challenge, signs it locally with the existing operator identity, and writes a redacted, owner-only receipt (mode `0600` on Unix).
+- `iicp-node operator dsr restrict --yes` and `iicp-node operator dsr anonymize --yes` require explicit confirmation and report the directory retention boundary; they never transmit the operator secret or node tokens.
+- Docker release coverage now verifies the signed, redacted DSR flow against a fake directory for Python, TypeScript, and Rust alongside existing registration and recovery checks.
+
 ## [0.7.86] — 2026-07-10
 
 ### Added — operator-signed node policy publishing
