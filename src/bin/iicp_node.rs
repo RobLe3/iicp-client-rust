@@ -17,7 +17,7 @@
 //! Mirrors the Python (`iicp_client.cli`) and TypeScript (`@iicp/client/cli`)
 //! entry points so operators choosing Rust get the same one-liner setup.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -60,6 +60,7 @@ fn env_bool(name: &str) -> bool {
 }
 
 const TUNNEL_DEAD_EXIT_CODE: i32 = 75;
+const OPERATOR_HANDOFF_EXIT_CODE: i32 = 75;
 const TUNNEL_DEAD_RETRY_INITIAL: Duration = Duration::from_secs(30);
 const TUNNEL_DEAD_RETRY_MAX: Duration = Duration::from_secs(300);
 
@@ -3186,6 +3187,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                             let _ = save_node(&ni);
                         }
                     }
+                    if !opts.node.is_empty() {
+                        complete_handoff_for_node(&opts.node);
+                    }
                     break Some(t);
                 }
                 Err(e) if attempt >= 3 => {
@@ -3281,6 +3285,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let backend_type = opts.backend_type.clone();
     let bind = fmt_bind_addr(&opts.host, opts.port);
     let token_for_serve = token.clone();
+    schedule_supervised_handoff_restart(&opts.node);
     let serve_result = tokio::select! {
         r = node.serve(
             move |req| {
@@ -3784,10 +3789,115 @@ fn write_operator_handoff_marker(node_names: &[String]) -> Result<PathBuf, Strin
             "created_at_unix": stamp,
             "grace_seconds": 300,
             "affected_node_names": node_names,
-            "restart_attempted": false,
+            "restart_requested_node_names": [],
+            "completed_node_names": [],
         }),
     )?;
     Ok(path)
+}
+
+fn handoff_marker_paths() -> Vec<PathBuf> {
+    config_dir()
+        .ok()
+        .and_then(|dir| fs::read_dir(dir).ok())
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+            name.starts_with("operator-handoff-pending-") && name.ends_with(".json")
+        }))
+        .collect()
+}
+
+fn handoff_names(marker: &serde_json::Value, field: &str) -> BTreeSet<String> {
+    marker[field]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Return the delay before a supervised service should restart for a completed
+/// rotation. A node claims its own restart in the marker first, so a normal
+/// supervisor restart cannot loop indefinitely.
+fn handoff_restart_delay(marker: &serde_json::Value, node_name: &str, now: u64) -> Option<u64> {
+    let affected = handoff_names(marker, "affected_node_names");
+    let requested = handoff_names(marker, "restart_requested_node_names");
+    let completed = handoff_names(marker, "completed_node_names");
+    if !affected.contains(node_name) || requested.contains(node_name) || completed.contains(node_name) {
+        return None;
+    }
+    let created = marker["created_at_unix"].as_u64()?;
+    let grace = marker["grace_seconds"].as_u64().unwrap_or(300);
+    Some(created.saturating_add(grace).saturating_sub(now))
+}
+
+fn write_handoff_marker(path: &PathBuf, marker: &serde_json::Value) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(marker).map_err(|e| e.to_string())?;
+    fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+fn pending_handoff_delay(node_name: &str) -> Option<u64> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    for path in handoff_marker_paths() {
+        let Ok(body) = fs::read_to_string(&path) else { continue; };
+        let Ok(marker) = serde_json::from_str::<serde_json::Value>(&body) else { continue; };
+        if let Some(delay) = handoff_restart_delay(&marker, node_name, now) { return Some(delay); }
+    }
+    None
+}
+
+fn claim_handoff_restart(node_name: &str) -> bool {
+    let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(value) => value.as_secs(),
+        Err(_) => return false,
+    };
+    for path in handoff_marker_paths() {
+        let Ok(body) = fs::read_to_string(&path) else { continue; };
+        let Ok(mut marker) = serde_json::from_str::<serde_json::Value>(&body) else { continue; };
+        if handoff_restart_delay(&marker, node_name, now) != Some(0) { continue; }
+        let mut requested = handoff_names(&marker, "restart_requested_node_names");
+        requested.insert(node_name.to_string());
+        marker["restart_requested_node_names"] = serde_json::json!(requested);
+        if write_handoff_marker(&path, &marker).is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+fn complete_handoff_for_node(node_name: &str) {
+    for path in handoff_marker_paths() {
+        let Ok(mut marker) = fs::read_to_string(&path).and_then(|body| serde_json::from_str(&body).map_err(io::Error::other)) else {
+            continue;
+        };
+        let affected = handoff_names(&marker, "affected_node_names");
+        if !affected.contains(node_name) { continue; }
+        let mut completed = handoff_names(&marker, "completed_node_names");
+        completed.insert(node_name.to_string());
+        if affected.is_subset(&completed) {
+            let _ = fs::remove_file(path);
+        } else {
+            marker["completed_node_names"] = serde_json::json!(completed);
+            let _ = write_handoff_marker(&path, &marker);
+        }
+    }
+}
+
+fn schedule_supervised_handoff_restart(node_name: &str) {
+    if node_name.is_empty() || !env_bool("IICP_SUPERVISED") { return; }
+    let name = node_name.to_string();
+    tokio::spawn(async move {
+        let Some(delay) = pending_handoff_delay(&name) else { return; };
+        if delay > 0 {
+            tokio::time::sleep(Duration::from_secs(delay)).await;
+        }
+        if claim_handoff_restart(&name) {
+            eprintln!("[iicp-node] operator handoff grace period complete — exiting with code {OPERATOR_HANDOFF_EXIT_CODE} so the supervisor reloads the successor identity.");
+            process::exit(OPERATOR_HANDOFF_EXIT_CODE);
+        }
+    });
 }
 
 async fn run_operator_key(args: &[String]) -> Result<(), String> {
@@ -5268,6 +5378,41 @@ mod tests {
             opts.relay_accept_port, 9485,
             "relay_accept_port must default to 9485"
         );
+    }
+
+    #[test]
+    fn operator_handoff_waits_once_then_restarts_once() {
+        let marker = serde_json::json!({
+            "affected_node_names": ["ollama"],
+            "restart_requested_node_names": [],
+            "completed_node_names": [],
+            "created_at_unix": 100,
+            "grace_seconds": 300,
+        });
+        assert_eq!(handoff_restart_delay(&marker, "ollama", 200), Some(200));
+        assert_eq!(handoff_restart_delay(&marker, "ollama", 400), Some(0));
+
+        let already_requested = serde_json::json!({
+            "affected_node_names": ["ollama"],
+            "restart_requested_node_names": ["ollama"],
+            "completed_node_names": [],
+            "created_at_unix": 100,
+            "grace_seconds": 300,
+        });
+        assert_eq!(handoff_restart_delay(&already_requested, "ollama", 400), None);
+    }
+
+    #[test]
+    fn operator_handoff_ignores_unaffected_or_completed_nodes() {
+        let marker = serde_json::json!({
+            "affected_node_names": ["ollama"],
+            "restart_requested_node_names": [],
+            "completed_node_names": ["ollama"],
+            "created_at_unix": 100,
+            "grace_seconds": 300,
+        });
+        assert_eq!(handoff_restart_delay(&marker, "vllm", 400), None);
+        assert_eq!(handoff_restart_delay(&marker, "ollama", 400), None);
     }
 
     #[tokio::test]
