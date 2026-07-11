@@ -3838,16 +3838,6 @@ fn write_handoff_marker(path: &PathBuf, marker: &serde_json::Value) -> Result<()
     fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
-fn pending_handoff_delay(node_name: &str) -> Option<u64> {
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    for path in handoff_marker_paths() {
-        let Ok(body) = fs::read_to_string(&path) else { continue; };
-        let Ok(marker) = serde_json::from_str::<serde_json::Value>(&body) else { continue; };
-        if let Some(delay) = handoff_restart_delay(&marker, node_name, now) { return Some(delay); }
-    }
-    None
-}
-
 fn claim_handoff_restart(node_name: &str) -> bool {
     let now = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(value) => value.as_secs(),
@@ -3889,13 +3879,17 @@ fn schedule_supervised_handoff_restart(node_name: &str) {
     if node_name.is_empty() || !env_bool("IICP_SUPERVISED") { return; }
     let name = node_name.to_string();
     tokio::spawn(async move {
-        let Some(delay) = pending_handoff_delay(&name) else { return; };
-        if delay > 0 {
-            tokio::time::sleep(Duration::from_secs(delay)).await;
-        }
-        if claim_handoff_restart(&name) {
-            eprintln!("[iicp-node] operator handoff grace period complete — exiting with code {OPERATOR_HANDOFF_EXIT_CODE} so the supervisor reloads the successor identity.");
-            process::exit(OPERATOR_HANDOFF_EXIT_CODE);
+        // `operator key rotate` runs in a separate CLI process, so its marker
+        // commonly appears after this provider has already started. Poll the
+        // redacted local marker instead of treating startup as the only chance
+        // to observe a future handoff.
+        let mut interval = tokio::time::interval(Duration::from_secs(15));
+        loop {
+            interval.tick().await;
+            if claim_handoff_restart(&name) {
+                eprintln!("[iicp-node] operator handoff grace period complete — exiting with code {OPERATOR_HANDOFF_EXIT_CODE} so the supervisor reloads the successor identity.");
+                process::exit(OPERATOR_HANDOFF_EXIT_CODE);
+            }
         }
     });
 }
