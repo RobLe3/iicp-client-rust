@@ -438,6 +438,7 @@ fn print_operator_help() {
         "usage: iicp-node operator <subcommand> [options]\n\n\
          Subcommands:\n\
          \x20 rename <name>   Change your public display_name (signed by your operator key)\n\
+         \x20 key <action>    Safely rotate or revoke your cryptographic operator key\n\
          \x20 dsr <action>    Export, restrict, or anonymize your directory records\n\
          \x20 encrypt         Password-encrypt the operator secret at rest ($IICP_OPERATOR_PASSPHRASE)\n\
          \x20 decrypt         Remove at-rest encryption of the operator secret\n\n\
@@ -3680,12 +3681,109 @@ async fn run_operator_dsr(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn write_private_json_new(path: &PathBuf, value: &serde_json::Value) -> Result<(), String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)] { options.mode(0o600); }
+    let mut file = options.open(path).map_err(|e| e.to_string())?;
+    writeln!(file, "{}", serde_json::to_string_pretty(value).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+async fn run_operator_key(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print!("usage: iicp-node operator key <rotate|revoke> --yes [--directory-url URL]\n");
+        return Ok(());
+    }
+    let action = args.first().map(String::as_str).unwrap_or("");
+    if !matches!(action, "rotate" | "revoke") { return Err("usage: iicp-node operator key <rotate|revoke> --yes".into()); }
+    let mut yes = false;
+    let mut directory_url: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--yes" => yes = true,
+            "--directory-url" => { i += 1; directory_url = Some(args.get(i).ok_or("--directory-url requires a value")?.clone()); }
+            arg if arg.starts_with("--directory-url=") => directory_url = Some(arg[16..].to_string()),
+            arg => return Err(format!("unknown operator key option: {arg}")),
+        }
+        i += 1;
+    }
+    if !yes { return Err("this changes the cryptographic operator identity used by saved nodes; re-run with --yes".into()); }
+    let stored = load_operator().map_err(|e| e.to_string())?.ok_or("no operator identity — run `iicp-node init` first")?;
+    if !stored.is_key_backed() { return Err("a key-backed local operator identity is required".into()); }
+    let unlock = if stored.is_encrypted() { Some(operator_passphrase("Operator passphrase", false)?) } else { None };
+    let old = if let Some(ref pw) = unlock { stored.decrypt_at_rest(pw)? } else { stored };
+    let mut backup_path: Option<PathBuf> = None;
+    let mut successor: Option<OperatorIdentity> = None;
+    if action == "rotate" {
+        let backup_pw = unlock.clone().or_else(|| env::var("IICP_OPERATOR_BACKUP_PASSPHRASE").ok()).unwrap_or(operator_passphrase("New backup passphrase", true)?);
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0);
+        let path = config_dir().map_err(|e| e.to_string())?.join(format!("operator-before-rotation-{stamp}.json"));
+        write_private_json_new(&path, &serde_json::to_value(old.encrypt_at_rest(&backup_pw)?).map_err(|e| e.to_string())?)?;
+        backup_path = Some(path);
+        successor = Some(OperatorIdentity::generate(&old.display_name, &old.contact));
+    }
+    let base = format!("{}/v1/operator", directory_url.unwrap_or_else(|| env::var("IICP_DIRECTORY_URL").unwrap_or_else(|_| "https://iicp.network/api".to_string())).trim_end_matches('/'));
+    let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
+    let challenge = client.post(format!("{base}/challenge")).json(&serde_json::json!({"operator_pub": old.operator_id})).send().await.map_err(|e| e.to_string())?;
+    let challenge_status = challenge.status();
+    let challenge_body: serde_json::Value = challenge.json().await.unwrap_or(serde_json::Value::Null);
+    let nonce = challenge_body.get("nonce").and_then(|v| v.as_str()).ok_or("directory challenge was incomplete")?;
+    if !challenge_status.is_success() { return Err("directory challenge rejected".into()); }
+    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs() as i64).unwrap_or(0);
+    let old_key = old.signing_key()?;
+    let (response, receipt_action) = if action == "rotate" {
+        let next = successor.as_ref().ok_or("successor identity missing")?;
+        let mut fields = BTreeMap::from([
+            ("operator_pub".to_string(), serde_json::Value::String(old.operator_id.clone())),
+            ("new_operator_pub".to_string(), serde_json::Value::String(next.operator_id.clone())),
+            ("nonce".to_string(), serde_json::Value::String(nonce.to_string())),
+            ("ts".to_string(), serde_json::Value::from(ts)),
+            ("reason_class".to_string(), serde_json::Value::String("operator_rotation".to_string())),
+        ]);
+        let sig = iicp_client::delegation::sign_operator_self_service(&old_key, "key_rotate", &fields);
+        fields.insert("sig".to_string(), serde_json::Value::String(sig));
+        let proof = BTreeMap::from([
+            ("operator_pub".to_string(), serde_json::Value::String(old.operator_id.clone())),
+            ("new_operator_pub".to_string(), serde_json::Value::String(next.operator_id.clone())),
+            ("nonce".to_string(), serde_json::Value::String(nonce.to_string())),
+            ("ts".to_string(), serde_json::Value::from(ts)),
+            ("rotation_epoch".to_string(), serde_json::Value::Null),
+        ]);
+        fields.insert("new_key_sig".to_string(), serde_json::Value::String(iicp_client::delegation::sign_operator_self_service(&next.signing_key()?, "key_rotate_successor", &proof)));
+        (client.post(format!("{base}/key/rotate")).json(&fields).send().await.map_err(|e| e.to_string())?, "rotate")
+    } else {
+        let mut fields = BTreeMap::from([
+            ("operator_pub".to_string(), serde_json::Value::String(old.operator_id.clone())),
+            ("nonce".to_string(), serde_json::Value::String(nonce.to_string())),
+            ("ts".to_string(), serde_json::Value::from(ts)),
+            ("confirm".to_string(), serde_json::Value::Bool(true)),
+            ("reason_class".to_string(), serde_json::Value::String("operator_request".to_string())),
+        ]);
+        fields.insert("sig".to_string(), serde_json::Value::String(iicp_client::delegation::sign_operator_self_service(&old_key, "key_revoke", &fields)));
+        (client.post(format!("{base}/key/revoke")).json(&fields).send().await.map_err(|e| e.to_string())?, "revoke")
+    };
+    let status = response.status(); let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() { if let Some(path) = backup_path { let _ = fs::remove_file(path); } return Err("directory rejected operator key request".into()); }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0);
+    let receipt = config_dir().map_err(|e| e.to_string())?.join(format!("operator-{receipt_action}-receipt-{stamp}.json"));
+    write_private_json_new(&receipt, &serde_json::json!({"schema":"iicp.operator-key-receipt.v1","action":receipt_action,"status":body.get("status"),"operator_fingerprint":body.get("operator_fingerprint"),"linked_nodes":body.get("linked_nodes"),"receipt_id_prefix":body.get("receipt_id_prefix")}))?;
+    if let Some(next) = successor { save_operator(&next).map_err(|e| e.to_string())?; let mut migrated = 0; for mut node in list_nodes().map_err(|e| e.to_string())? { if node.operator_id == old.operator_id { node.operator_id = next.operator_id.clone(); save_node(&node).map_err(|e| e.to_string())?; migrated += 1; } } println!("Operator identity migrated; {migrated} saved node(s) will re-register with the new key. Encrypted old-key backup: {}. Redacted receipt: {}.", backup_path.unwrap().display(), receipt.display()); }
+    else { println!("Operator identity revoked; redacted receipt: {}.", receipt.display()); }
+    Ok(())
+}
+
 async fn run_operator(args: &[String]) -> Result<(), String> {
     let sub = args.first().map(String::as_str).unwrap_or("");
     // DSR owns its detailed help because its safety requirements differ from
     // identity management. Other operator help stays intentionally compact.
     if sub == "dsr" {
         return run_operator_dsr(&args[1..]).await;
+    }
+    if sub == "key" {
+        return run_operator_key(&args[1..]).await;
     }
     // `-h`/`--help` anywhere prints usage + exits 0 (covers the sub-dispatch too).
     if wants_help(args) {

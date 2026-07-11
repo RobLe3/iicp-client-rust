@@ -84,6 +84,7 @@ pub fn canonical_operator_self_service_bytes(
 ) -> Vec<u8> {
     let mut payload = fields.clone();
     payload.remove("sig");
+    payload.remove("new_key_sig");
     payload.insert("action".to_string(), Value::String(action.to_string()));
     let mut out = b"iicp:operator:self-service:v1\n".to_vec();
     out.extend(serde_json::to_vec(&payload).expect("canonical operator self-service json"));
@@ -239,6 +240,19 @@ mod tests {
             String::from_utf8(canonical_operator_self_service_bytes("accept", &fields)).unwrap(),
             "iicp:operator:self-service:v1\n{\"action\":\"accept\",\"dpa_version\":\"2026-07\",\"nonce\":\"nonce-1234567890\",\"operator_pub\":\"T3BQdWI=\",\"terms_version\":\"2026-07\",\"ts\":1893456000}"
         );
+    }
+
+    #[test]
+    fn rotation_old_key_signature_excludes_successor_proof() {
+        let fields = BTreeMap::from([
+            ("operator_pub".to_string(), Value::String("old".to_string())),
+            ("new_operator_pub".to_string(), Value::String("new".to_string())),
+            ("nonce".to_string(), Value::String("nonce-1234567890".to_string())),
+            ("ts".to_string(), Value::from(1_893_456_000_i64)),
+            ("new_key_sig".to_string(), Value::String("must-not-be-signed-by-old-key".to_string())),
+        ]);
+        let bytes = canonical_operator_self_service_bytes("key_rotate", &fields);
+        assert!(!String::from_utf8(bytes).unwrap().contains("new_key_sig"));
     }
 
     #[test]
