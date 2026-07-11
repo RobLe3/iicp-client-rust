@@ -123,6 +123,11 @@ async fn policy_refuses_high_risk_intent_before_discovery() {
 
 #[tokio::test]
 async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
+    // The mock route is deliberately loopback-only.  Keep the production SSRF
+    // default fail-closed while explicitly enabling the documented test escape
+    // hatch for this route-selection integration test.
+    let _guard = env_test_lock();
+    unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
     let mut server = mockito::Server::new_async().await;
     let endpoint = server.url();
     let _ticket = server
@@ -182,6 +187,7 @@ async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
         Some("abc123def456")
     );
     assert!(!format!("{response:?}").contains("secret-ticket-token"));
+    unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
 }
 
 #[tokio::test]
