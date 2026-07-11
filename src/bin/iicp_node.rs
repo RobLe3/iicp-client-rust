@@ -3857,13 +3857,22 @@ fn claim_handoff_restart(node_name: &str) -> bool {
     false
 }
 
+fn handoff_completion_allowed(marker: &serde_json::Value, node_name: &str) -> bool {
+    handoff_names(marker, "affected_node_names").contains(node_name)
+        && handoff_names(marker, "restart_requested_node_names").contains(node_name)
+}
+
 fn complete_handoff_for_node(node_name: &str) {
     for path in handoff_marker_paths() {
         let Ok(mut marker) = fs::read_to_string(&path).and_then(|body| serde_json::from_str(&body).map_err(io::Error::other)) else {
             continue;
         };
         let affected = handoff_names(&marker, "affected_node_names");
-        if !affected.contains(node_name) { continue; }
+        if !handoff_completion_allowed(&marker, node_name) { continue; }
+        // Registration may already be in flight when a separate `operator key
+        // rotate` command writes a marker. Only the process that first claimed
+        // the marker's supervised restart may complete it; otherwise that
+        // initial registration would erase a new handoff without a reload.
         let mut completed = handoff_names(&marker, "completed_node_names");
         completed.insert(node_name.to_string());
         if affected.is_subset(&completed) {
@@ -5413,6 +5422,20 @@ mod tests {
         });
         assert_eq!(handoff_restart_delay(&marker, "vllm", 400), None);
         assert_eq!(handoff_restart_delay(&marker, "ollama", 400), None);
+    }
+
+    #[test]
+    fn operator_handoff_completion_requires_claimed_restart() {
+        let unclaimed = serde_json::json!({
+            "affected_node_names": ["ollama"],
+            "restart_requested_node_names": [],
+        });
+        assert!(!handoff_completion_allowed(&unclaimed, "ollama"));
+        let claimed = serde_json::json!({
+            "affected_node_names": ["ollama"],
+            "restart_requested_node_names": ["ollama"],
+        });
+        assert!(handoff_completion_allowed(&claimed, "ollama"));
     }
 
     #[tokio::test]
