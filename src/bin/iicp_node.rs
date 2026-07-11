@@ -3921,7 +3921,13 @@ async fn run_operator_key(args: &[String]) -> Result<(), String> {
     let mut backup_path: Option<PathBuf> = None;
     let mut successor: Option<OperatorIdentity> = None;
     if action == "rotate" {
-        let backup_pw = unlock.clone().or_else(|| env::var("IICP_OPERATOR_BACKUP_PASSPHRASE").ok()).unwrap_or(operator_passphrase("New backup passphrase", true)?);
+        // Do not use `unwrap_or(operator_passphrase(...)?)` here: Rust eagerly
+        // evaluates the fallback argument, which made headless/Docker rotation
+        // prompt (and fail) even when IICP_OPERATOR_BACKUP_PASSPHRASE was set.
+        let backup_pw = match unlock.clone().or_else(|| env::var("IICP_OPERATOR_BACKUP_PASSPHRASE").ok()) {
+            Some(passphrase) => passphrase,
+            None => operator_passphrase("New backup passphrase", true)?,
+        };
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0);
         let path = config_dir().map_err(|e| e.to_string())?.join(format!("operator-before-rotation-{stamp}.json"));
         write_private_json_new(&path, &serde_json::to_value(old.encrypt_at_rest(&backup_pw)?).map_err(|e| e.to_string())?)?;
