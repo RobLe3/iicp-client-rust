@@ -66,6 +66,7 @@ pub mod relay_ticket;
 pub mod relay_worker_client;
 pub mod routing_policy;
 pub mod scheduler;
+pub mod selection;
 pub mod token_validator;
 pub mod trust_auditor;
 pub mod tunnel;

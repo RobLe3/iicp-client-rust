@@ -15,6 +15,7 @@ use crate::routing_policy::{
     filter_nodes_for_routing_policy, resolved_policy, routing_policy_refusal_message,
     ROUTING_POLICY_REFUSAL_CODE,
 };
+use crate::selection::weighted_v1_index;
 use crate::types::*;
 
 // Compiled once at first use — avoid per-call allocation (fix: rust#3).
@@ -464,6 +465,17 @@ impl IicpClient {
             let safe_nodes = decision.eligible;
             if self.config.routing_strategy == "deterministic" || safe_nodes.len() <= 1 {
                 safe_nodes.into_iter().take(max_retries).collect()
+            } else if self.config.routing_strategy == "weighted_v1" {
+                let top_k = self.config.routing_top_k.max(1).min(safe_nodes.len());
+                let index = weighted_v1_index(
+                    &safe_nodes[..top_k].iter().map(|node| node.score).collect::<Vec<_>>(),
+                    &safe_nodes[..top_k].iter().map(|node| node.load).collect::<Vec<_>>(),
+                    rng.gen::<f64>(),
+                );
+                let chosen = safe_nodes[index].clone();
+                let mut c = vec![chosen.clone()];
+                c.extend(safe_nodes.iter().take(max_retries).filter(|node| node.node_id != chosen.node_id).take(max_retries - 1).cloned());
+                c
             } else if self.config.routing_strategy == "softmax_top_k" {
                 let top_k = self.config.routing_top_k.max(1).min(safe_nodes.len());
                 let pool = &safe_nodes[..top_k];

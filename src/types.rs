@@ -59,7 +59,7 @@ pub struct ClientConfig {
     /// ε-greedy exploration probability for provider selection (R4). Default: 0.05.
     /// Override with IICP_ROUTING_EPSILON env var. Set to 0.0 to disable.
     pub routing_epsilon: f64,
-    /// Selection strategy: deterministic | epsilon | softmax_top_k.
+    /// Selection strategy: deterministic | epsilon | softmax_top_k | weighted_v1 (opt-in).
     pub routing_strategy: String,
     /// Candidate pool size for softmax_top_k.
     pub routing_top_k: usize,
@@ -80,7 +80,7 @@ impl Default for ClientConfig {
             .unwrap_or(0.05);
         let strategy = std::env::var("IICP_ROUTING_STRATEGY")
             .ok()
-            .filter(|s| matches!(s.as_str(), "deterministic" | "epsilon" | "softmax_top_k"))
+            .filter(|s| matches!(s.as_str(), "deterministic" | "epsilon" | "softmax_top_k" | "weighted_v1"))
             .unwrap_or_else(|| "epsilon".into());
         let top_k = std::env::var("IICP_ROUTING_TOP_K")
             .ok()
@@ -141,6 +141,7 @@ pub struct Node {
     pub node_id: String,
     pub endpoint: String,
     pub score: f64,
+    pub load: f64,
     pub available: bool,
     pub region: String,
     pub models: Option<Vec<String>>,
@@ -171,6 +172,8 @@ struct NodeWire {
     pub node_id: String,
     pub endpoint: String,
     pub score: f64,
+    #[serde(default)]
+    pub load: f64,
     pub available: bool,
     pub region: String,
     pub models: Option<Vec<String>>,
@@ -203,6 +206,7 @@ impl From<NodeWire> for Node {
             node_id: wire.node_id,
             endpoint: wire.endpoint,
             score: wire.score,
+            load: wire.load,
             available: wire.available,
             region: wire.region,
             models: wire.models,

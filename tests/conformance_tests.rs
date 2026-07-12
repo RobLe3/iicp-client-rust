@@ -425,6 +425,22 @@ fn profile_fixture_scenarios_use_native_compatibility_evaluator() {
 }
 
 #[test]
+fn weighted_v1_fixture_vectors_are_deterministic() {
+    use iicp_client::selection::weighted_v1_index;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/selection-v1.json")).unwrap();
+    for vector in fixture["vectors"].as_array().unwrap() {
+        let nodes = vector["nodes"].as_array().unwrap();
+        let scores = nodes.iter().map(|node| node["score"].as_f64().unwrap()).collect::<Vec<_>>();
+        let loads = nodes.iter().map(|node| node["load"].as_f64().unwrap()).collect::<Vec<_>>();
+        let chosen = weighted_v1_index(&scores, &loads, vector["random"].as_f64().unwrap());
+        let mut actual = vec![nodes[chosen]["node_id"].as_str().unwrap().to_string()];
+        actual.extend(nodes.iter().take(3).filter(|node| node["node_id"] != nodes[chosen]["node_id"]).map(|node| node["node_id"].as_str().unwrap().to_string()));
+        let expected = vector["expected_order"].as_array().unwrap().iter().map(|node| node.as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(actual, expected, "{}", vector["name"]);
+    }
+}
+
+#[test]
 fn profile_fixture_native_policy_scenarios_use_routing_gate() {
     use iicp_client::{filter_nodes_for_routing_policy, resolved_policy, Node, RoutingPolicy, RoutingProfile};
     let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();
