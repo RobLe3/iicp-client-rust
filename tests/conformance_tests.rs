@@ -443,8 +443,15 @@ fn weighted_v1_fixture_vectors_are_deterministic() {
 #[test]
 fn profile_negotiation_fixture_preserves_legacy_and_required_fail_closed_boundary() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-negotiation-v0.json")).unwrap();
-    assert_eq!(fixture["fixture_version"], "0.1.0-draft");
+    assert_eq!(fixture["fixture_version"], "0.2.0-draft");
+    assert_eq!(fixture["profile_fixture_sha256"], "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf");
     for case in fixture["cases"].as_array().unwrap() {
+        let requested = case["expected"]["requested"].as_bool().unwrap_or(true);
+        if !requested {
+            assert!(case["request"].as_object().unwrap().is_empty(), "{}", case["name"]);
+            continue;
+        }
+        assert!(case["request"]["profile_fixture_sha256"].as_str().is_some(), "{}", case["name"]);
         let required = case["request"]["profile_required"].as_bool().unwrap();
         let allowed = case["expected"]["dispatch_allowed"].as_bool().unwrap();
         assert!(!required || !allowed || case["expected"]["status"] == "compatible", "{}", case["name"]);
