@@ -409,3 +409,32 @@ fn pre_normative_profile_fixture_has_portable_reasons() {
     assert_eq!(scenarios.len(), 9);
     assert!(scenarios.iter().all(|scenario| scenario["expected_reason"].is_string()));
 }
+
+#[test]
+fn profile_fixture_native_policy_scenarios_use_routing_gate() {
+    use iicp_client::{filter_nodes_for_routing_policy, resolved_policy, Node, RoutingPolicy, RoutingProfile};
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();
+    for scenario in fixture["native_policy_scenarios"].as_array().unwrap() {
+        let raw = &scenario["node"];
+        let node: Node = serde_json::from_value(serde_json::json!({
+            "node_id": format!("fixture-{}", scenario["name"].as_str().unwrap()), "endpoint": "https://node.example.test",
+            "score": 0.5, "available": true, "region": raw["region"], "models": null, "cip_policy": null,
+            "cx_public_key": if raw.get("cx_public_key").and_then(|v| v.as_bool()).unwrap_or(false) { serde_json::json!({"algorithm":"X25519","key":"fixture","key_id":"fixture"}) } else { serde_json::Value::Null },
+            "node_policy_manifest": raw.get("node_policy_manifest").cloned().unwrap_or(serde_json::Value::Null)
+        })).unwrap();
+        let policy_data = scenario["policy"].as_object().unwrap();
+        let policy = RoutingPolicy {
+            profile: RoutingProfile::Standard,
+            allowed_regions: policy_data.get("allowed_regions").and_then(|v| v.as_array()).map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+            require_encryption: policy_data.get("require_encryption").and_then(|v| v.as_bool()),
+            require_policy_manifest: policy_data.get("require_policy_manifest").and_then(|v| v.as_bool()),
+            require_no_payload_retention: policy_data.get("require_no_payload_retention").and_then(|v| v.as_bool()),
+            allow_remote_executor: policy_data.get("allow_remote_executor").and_then(|v| v.as_bool()),
+            known_operator_only: policy_data.get("known_operator_only").and_then(|v| v.as_bool()),
+            required_manifest_identity_level: policy_data.get("required_manifest_identity_level").and_then(|v| v.as_str().map(str::to_string)),
+        };
+        let decision = filter_nodes_for_routing_policy(vec![node], &resolved_policy(Some(&policy)), false);
+        assert!(decision.eligible.is_empty());
+        assert_eq!(decision.rejected_reasons, vec![scenario["expected_reason"].as_str().unwrap()]);
+    }
+}
