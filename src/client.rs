@@ -221,8 +221,36 @@ impl IicpClient {
         if let Some(rep) = opts.min_reputation {
             url.push_str(&format!("&min_reputation={rep}"));
         }
+        if let Some(profile) = &opts.profile_request {
+            if is_safe_query_param(&profile.profile_id)
+                && is_safe_query_param(&profile.profile_version)
+                && profile.profile_fixture_sha256.len() == 64
+                && profile.profile_fixture_sha256.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                url.push_str(&format!(
+                    "&profile_id={}&profile_version={}&profile_fixture_sha256={}&profile_required={}",
+                    profile.profile_id,
+                    profile.profile_version,
+                    profile.profile_fixture_sha256,
+                    profile.required,
+                ));
+            } else {
+                return Err(IicpError::PolicyRefused {
+                    code: "unsupported_pre_normative_profile".into(),
+                    message: "invalid pre-normative profile request".into(),
+                });
+            }
+        }
         url.push_str(&format!("&limit={}", opts.limit.unwrap_or(10)));
         let mut list: NodeList = self.http.get_json(&url, traceparent).await?;
+        if opts.profile_request.as_ref().is_some_and(|p| p.required)
+            && !matches!(list.profile_negotiation.as_ref(), Some(n) if n.status.as_deref() == Some("compatible") && n.dispatch_allowed == Some(true))
+        {
+            return Err(IicpError::PolicyRefused {
+                code: "unsupported_pre_normative_profile".into(),
+                message: "required pre-normative profile is not supported by the directory".into(),
+            });
+        }
         if opts.browser_usable_only.unwrap_or(false) {
             list.nodes.retain(|n| {
                 n.browser_usable
@@ -368,8 +396,8 @@ impl IicpClient {
         }
 
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
-        let nodes = if self.config.route_discovery_mode == "legacy" {
-            self.discover(&request.intent, None, Some(&tp)).await?
+        let nodes = if self.config.route_discovery_mode == "legacy" || self.config.profile_request.is_some() {
+            self.discover(&request.intent, Some(DiscoverOptions { profile_request: self.config.profile_request.clone(), ..Default::default() }), Some(&tp)).await?
         } else {
             match self
                 .ticketed_candidates(&request.intent, &DiscoverOptions::default(), &tp)
@@ -378,6 +406,7 @@ impl IicpClient {
                 Ok(nodes) => NodeList {
                     count: nodes.len() as u32,
                     nodes,
+                    profile_negotiation: None,
                 },
                 Err(TicketRouteError::LegacyRequired)
                     if self.config.route_discovery_mode == "auto" =>
@@ -398,6 +427,7 @@ impl IicpClient {
         // selection. A keyless provider must never receive plaintext by default; the
         // temporary escape hatch is intentionally explicit and noisy for controlled
         // transition/debugging only.
+        let profile_negotiation = nodes.profile_negotiation.clone();
         let pre_policy_nodes: Vec<_> = nodes
             .nodes
             .into_iter()
@@ -459,6 +489,7 @@ impl IicpClient {
             });
         }
 
+        let eligible_candidate_count = decision.eligible.len();
         let candidates: Vec<_> = {
             let mut rng = rand::thread_rng();
             let max_retries = MAX_RETRIES as usize;
@@ -587,6 +618,14 @@ impl IicpClient {
                     Ok(mut resp) => {
                         resp.generated_by_ai = true;
                         resp.dispatch_ticket_id_prefix = node.dispatch_ticket_id_prefix.clone();
+                        resp.routing_receipt = Some(RoutingReceipt {
+                            receipt_version: "iicp-routing-receipt-v1".into(),
+                            selection_profile: if profile_negotiation.is_some() || self.config.route_discovery_mode == "legacy" { self.config.routing_strategy.clone() } else { "directory_ticket_v1".into() },
+                            eligible_candidate_count,
+                            selected_node_id_prefix: node_short_id(&node.node_id).to_string(),
+                            profile_negotiation: profile_negotiation.clone(),
+                            redaction: "prompt_response_endpoint_token_excluded".into(),
+                        });
                         return Ok(resp);
                     }
                     Err(e) => {

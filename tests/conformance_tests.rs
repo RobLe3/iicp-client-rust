@@ -441,6 +441,17 @@ fn weighted_v1_fixture_vectors_are_deterministic() {
 }
 
 #[test]
+fn profile_negotiation_fixture_preserves_legacy_and_required_fail_closed_boundary() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-negotiation-v0.json")).unwrap();
+    assert_eq!(fixture["fixture_version"], "0.1.0-draft");
+    for case in fixture["cases"].as_array().unwrap() {
+        let required = case["request"]["profile_required"].as_bool().unwrap();
+        let allowed = case["expected"]["dispatch_allowed"].as_bool().unwrap();
+        assert!(!required || !allowed || case["expected"]["status"] == "compatible", "{}", case["name"]);
+    }
+}
+
+#[test]
 fn profile_fixture_native_policy_scenarios_use_routing_gate() {
     use iicp_client::{filter_nodes_for_routing_policy, resolved_policy, Node, RoutingPolicy, RoutingProfile};
     let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();

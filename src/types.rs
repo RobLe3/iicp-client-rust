@@ -69,6 +69,7 @@ pub struct ClientConfig {
     pub routing_policy: RoutingPolicy,
     /// Route endpoint migration mode: auto | ticketed | legacy.
     pub route_discovery_mode: String,
+    pub profile_request: Option<ProfileRequest>,
 }
 
 impl Default for ClientConfig {
@@ -107,6 +108,7 @@ impl Default for ClientConfig {
                 .ok()
                 .filter(|s| matches!(s.as_str(), "auto" | "ticketed" | "legacy"))
                 .unwrap_or_else(|| "auto".into()),
+            profile_request: None,
         }
     }
 }
@@ -120,6 +122,24 @@ pub struct DiscoverOptions {
     pub limit: Option<u32>,
     /// Browser-like consumers can keep only HTTPS/loopback endpoints. Native default: false.
     pub browser_usable_only: Option<bool>,
+    /// Optional additive directory capability request for a draft profile.
+    pub profile_request: Option<ProfileRequest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProfileRequest {
+    pub profile_id: String,
+    pub profile_version: String,
+    pub profile_fixture_sha256: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileNegotiation {
+    pub requested: bool,
+    pub status: Option<String>,
+    pub reason: Option<String>,
+    pub dispatch_allowed: Option<bool>,
 }
 
 /// X25519 public key advertised by a CX-Provider node (IICP-CX S.16 §3.1).
@@ -248,6 +268,8 @@ pub struct CipPolicy {
 pub struct NodeList {
     pub nodes: Vec<Node>,
     pub count: u32,
+    #[serde(default)]
+    pub profile_negotiation: Option<ProfileNegotiation>,
 }
 
 /// IICP task request body.
@@ -302,6 +324,19 @@ pub struct TaskResponse {
     pub generated_by_ai: bool,
     #[serde(default)]
     pub dispatch_ticket_id_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_receipt: Option<RoutingReceipt>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoutingReceipt {
+    pub receipt_version: String,
+    pub selection_profile: String,
+    pub eligible_candidate_count: usize,
+    pub selected_node_id_prefix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_negotiation: Option<ProfileNegotiation>,
+    pub redaction: String,
 }
 
 /// Task execution metrics.
