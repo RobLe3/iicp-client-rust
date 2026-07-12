@@ -402,12 +402,26 @@ async fn test_orchestrator_counts_pass_and_fail() {
 fn pre_normative_profile_fixture_has_portable_reasons() {
     let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
         .expect("profile fixture must be valid JSON");
-    assert_eq!(fixture["fixture_version"], "0.2.0-draft");
+    assert_eq!(fixture["fixture_version"], "0.3.0-draft");
     assert_eq!(fixture["status"], "pre-normative");
     assert_eq!(fixture["result_contract"]["unsupported_status"], "unsupported_pre_normative_profile");
     let scenarios = fixture["scenarios"].as_array().expect("scenarios must be an array");
-    assert_eq!(scenarios.len(), 9);
+    assert_eq!(scenarios.len(), 11);
     assert!(scenarios.iter().all(|scenario| scenario["expected_reason"].is_string()));
+}
+
+#[test]
+fn profile_fixture_scenarios_use_native_compatibility_evaluator() {
+    use iicp_client::profile_compatibility::evaluate_pre_normative_profile;
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();
+    for scenario in fixture["scenarios"].as_array().unwrap() {
+        let decision = evaluate_pre_normative_profile(
+            &scenario["request"], &scenario["provider"], &fixture["intent_aliases"],
+            scenario.get("now_s").and_then(serde_json::Value::as_i64).unwrap_or_default(),
+        );
+        assert_eq!(decision.eligible, scenario["expected"] == "eligible", "{}", scenario["name"]);
+        assert_eq!(decision.reason, scenario["expected_reason"].as_str().unwrap(), "{}", scenario["name"]);
+    }
 }
 
 #[test]
