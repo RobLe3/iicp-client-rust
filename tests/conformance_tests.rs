@@ -397,3 +397,15 @@ async fn test_orchestrator_counts_pass_and_fail() {
     assert_eq!(report.fail_count, 1);
     assert_eq!(report.tests.len(), 4);
 }
+
+#[test]
+fn pre_normative_profile_fixture_has_portable_reasons() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
+        .expect("profile fixture must be valid JSON");
+    assert_eq!(fixture["fixture_version"], "0.2.0-draft");
+    assert_eq!(fixture["status"], "pre-normative");
+    assert_eq!(fixture["result_contract"]["unsupported_status"], "unsupported_pre_normative_profile");
+    let scenarios = fixture["scenarios"].as_array().expect("scenarios must be an array");
+    assert_eq!(scenarios.len(), 9);
+    assert!(scenarios.iter().all(|scenario| scenario["expected_reason"].is_string()));
+}
