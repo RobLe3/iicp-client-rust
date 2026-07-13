@@ -268,6 +268,11 @@ pub struct NodeIdentity {
     pub operator_id: String,
     pub name: String,
     pub backend_url: String,
+    /// Named backend adapter selected for this node. Kept in the saved node
+    /// record so a supervised `serve --node NAME` restart preserves adapters
+    /// such as MeshLLM instead of silently falling back to OpenAI compatibility.
+    #[serde(default = "default_backend_type")]
+    pub backend_type: String,
     pub model: String,
     #[serde(default = "default_intent")]
     pub intent: String,
@@ -299,6 +304,10 @@ pub struct NodeIdentity {
     #[serde(default)]
     pub node_hmac_key: Option<String>,
     pub created_at: String,
+}
+
+fn default_backend_type() -> String {
+    "openai_compat".to_string()
 }
 
 fn default_intent() -> String {
@@ -417,6 +426,7 @@ pub fn generate_node(
         operator_id: operator_id.to_string(),
         name: name.to_string(),
         backend_url: backend_url.to_string(),
+        backend_type: default_backend_type(),
         model: model.to_string(),
         intent: intent.to_string(),
         region: region.to_string(),

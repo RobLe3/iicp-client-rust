@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use iicp_client::backends::openai_compat::{invoke, OpenAiCompatOptions};
-use iicp_client::backends::{invoke_backend, llamacpp, vllm, BACKEND_TYPES};
+use iicp_client::backends::{invoke_backend, llamacpp, meshllm, vllm, BACKEND_TYPES};
 use serde_json::json;
 
 fn opts(base_url: String, model: Option<&str>) -> OpenAiCompatOptions {
@@ -15,6 +15,19 @@ fn opts(base_url: String, model: Option<&str>) -> OpenAiCompatOptions {
         api_key: None,
         timeout: Duration::from_secs(5),
     }
+}
+
+#[tokio::test]
+async fn meshllm_rejects_unverified_non_chat_intents() {
+    let result = invoke_backend(
+        "meshllm",
+        &meshllm::default_options(),
+        "urn:iicp:intent:llm:embedding:v1",
+        &json!({}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(result["error_code"], 400);
 }
 
 #[tokio::test]

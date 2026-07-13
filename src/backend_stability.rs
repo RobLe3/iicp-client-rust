@@ -109,6 +109,26 @@ fn model_matches(candidate: &str, expected_model: Option<&str>) -> bool {
     }
 }
 
+/// MeshLLM's OpenAI model inventory is authoritative for its currently
+/// routable local/mesh-backed models. Its internal topology stays opaque.
+pub fn parse_meshllm_models(data: &Value, expected_model: Option<&str>) -> BackendStabilityObservation {
+    let Some(models) = data.get("data").and_then(Value::as_array) else {
+        return BackendStabilityObservation::draining(
+            "backend_loading", now_s() + 30, json!({"ready": false}),
+        );
+    };
+    let present = models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str))
+        .any(|id| model_matches(id, expected_model));
+    if expected_model.is_some() && !present {
+        return BackendStabilityObservation::draining(
+            "backend_loading", now_s() + 30, json!({"selected_model_ready": false}),
+        );
+    }
+    BackendStabilityObservation::ok()
+}
+
 pub fn parse_ollama_ps(data: &Value, expected_model: Option<&str>) -> BackendStabilityObservation {
     let Some(models) = data.get("models").and_then(Value::as_array) else {
         return BackendStabilityObservation::degraded("observer_error");
@@ -248,6 +268,20 @@ pub async fn observe_backend_stability(
             rb
         }
     };
+    if flavor == "meshllm" {
+        match add_auth(http.get(format!("{root}/readyz")).timeout(std::time::Duration::from_secs(2))).send().await {
+            Ok(resp) if resp.status().is_success() => {}
+            _ => return BackendStabilityObservation::draining(
+                "backend_loading", now_s() + 30, json!({"ready": false}),
+            ),
+        }
+        return match add_auth(http.get(format!("{root}/v1/models")).timeout(std::time::Duration::from_secs(2))).send().await {
+            Ok(resp) if resp.status().is_success() => resp.json::<Value>().await
+                .map(|value| parse_meshllm_models(&value, expected_model))
+                .unwrap_or_else(|_| BackendStabilityObservation::draining("backend_loading", now_s() + 30, json!({"ready": false}))),
+            _ => BackendStabilityObservation::draining("backend_loading", now_s() + 30, json!({"ready": false})),
+        };
+    }
     if flavor == "ollama" || flavor.is_empty() {
         match add_auth(
             http.get(format!("{root}/api/ps"))
@@ -311,6 +345,15 @@ mod tests {
             obs.public_json(),
             json!({"backend_state":"ok","reason_class":"ok"})
         );
+    }
+
+    #[test]
+    fn meshllm_requires_the_selected_model_in_its_ready_inventory() {
+        let ready = parse_meshllm_models(&json!({"data":[{"id":"stable-model"}]}), Some("stable-model"));
+        assert_eq!(ready.backend_state, "ok");
+        let missing = parse_meshllm_models(&json!({"data":[{"id":"other-model"}]}), Some("stable-model"));
+        assert_eq!(missing.backend_state, "draining");
+        assert_eq!(missing.reason_class, "backend_loading");
     }
 
     #[test]

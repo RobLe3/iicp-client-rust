@@ -17,6 +17,7 @@
 
 pub mod anthropic;
 pub mod llamacpp;
+pub mod meshllm;
 pub mod openai_compat;
 pub mod vllm;
 
@@ -25,7 +26,7 @@ use serde_json::Value;
 use openai_compat::OpenAiCompatOptions;
 
 /// Selectable backend engine names (mirrors the Python/TS `BACKEND_TYPES`).
-pub const BACKEND_TYPES: &[&str] = &["openai_compat", "vllm", "llamacpp", "anthropic"];
+pub const BACKEND_TYPES: &[&str] = &["openai_compat", "vllm", "llamacpp", "meshllm", "anthropic"];
 
 /// Dispatch a stand-alone (HTTP-style) invocation to the named engine.
 ///
@@ -43,6 +44,7 @@ pub async fn invoke_backend(
         "openai_compat" => Ok(openai_compat::invoke(opts, intent, payload).await),
         "vllm" => Ok(vllm::invoke(opts, intent, payload).await),
         "llamacpp" => Ok(llamacpp::invoke(opts, intent, payload).await),
+        "meshllm" => Ok(meshllm::invoke(opts, intent, payload).await),
         "anthropic" => Ok(anthropic::invoke(opts, intent, payload).await),
         other => Err(format!(
             "unknown backend_type {other:?}; choose one of {BACKEND_TYPES:?}"

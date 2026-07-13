@@ -55,6 +55,17 @@ pub struct RegistryRouteStatus {
     pub route_needs_promotion: bool,
 }
 
+/// A live, bound relay is a usable public route even while the directory still
+/// reports an older direct IPv6 route as self-attested.  This deliberately
+/// requires bind evidence, not merely a relay configuration value.
+pub fn effective_public_route_available(
+    runtime_available: bool,
+    route_needs_promotion: bool,
+    relay_bound: bool,
+) -> bool {
+    runtime_available && (relay_bound || !route_needs_promotion)
+}
+
 pub fn node_registry_prefix(node_id: &str) -> String {
     let is_uuid = node_id.len() == 36
         && node_id.chars().enumerate().all(|(idx, c)| {
@@ -297,5 +308,13 @@ mod tests {
                 RecoveryAction::RestartSelf
             )
         );
+    }
+
+    #[test]
+    fn bound_relay_prevents_self_attested_ipv6_from_triggering_restart() {
+        assert!(!effective_public_route_available(true, true, false));
+        assert!(effective_public_route_available(true, true, true));
+        assert!(effective_public_route_available(true, false, false));
+        assert!(!effective_public_route_available(false, true, true));
     }
 }

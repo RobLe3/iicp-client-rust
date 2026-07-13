@@ -214,6 +214,8 @@ struct ServeOpts {
     node: String,
     backend_url: String,
     backend_type: String,
+    /// Permit an explicitly selected preview backend feature.
+    experimental: bool,
     model: String,
     public_endpoint: String,
     directory_url: String,
@@ -270,7 +272,7 @@ fn print_help() {
          \x20 (or --node NAME            load from ~/.iicp/nodes/<NAME>.json after `iicp-node init`)\n\n\
          serve optional:\n\
          \x20 --backend-url URL          IICP_BACKEND_URL (default http://localhost:11434 — local Ollama)\n\
-         \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp | anthropic (default openai_compat)\n\
+         \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp | meshllm | anthropic (default openai_compat)\n\
          \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --region REGION            IICP_REGION (e.g. us-east; unknown if unset)\n\
@@ -282,6 +284,7 @@ fn print_help() {
          \x20 --skip-registration        IICP_SKIP_REGISTRATION — dev mode\n\
          \x20 --force                    IICP_FORCE — take over the single-instance lock for this node_id\n\
          \x20 --backend-api-key KEY      IICP_BACKEND_API_KEY — Bearer key for an auth'd backend (LM Studio, hosted)\n\
+         \x20 --experimental             IICP_EXPERIMENTAL — enable an explicitly selected preview backend feature\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup (default on)\n\
          \x20 --no-auto-detect-nat       disable NAT detection (overrides IICP_AUTO_DETECT_NAT)\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
@@ -386,8 +389,9 @@ fn print_serve_help() {
          \x20 --node NAME                Load ~/.iicp/nodes/<NAME>.json from `iicp-node init`\n\n\
          Core options:\n\
          \x20 --backend-url URL          IICP_BACKEND_URL (default http://localhost:11434)\n\
-         \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp | anthropic\n\
+         \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp | meshllm | anthropic\n\
          \x20 --backend-api-key KEY      IICP_BACKEND_API_KEY — Bearer key for auth'd backends\n\
+         \x20 --experimental             IICP_EXPERIMENTAL — enable an explicitly selected preview backend feature\n\
          \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --region REGION            IICP_REGION (e.g. eu-central)\n\
@@ -757,6 +761,24 @@ fn render_service_unit(
     }
 }
 
+/// Return an executable path safe for an OS supervisor. A bare override such
+/// as `IICP_MANAGED_RUST_BIN=iicp-node` is useful interactively, but launchd
+/// has a minimal PATH and would fail before the CLI can log an explanation.
+fn supervised_executable_path() -> PathBuf {
+    let configured = iicp_client::updater::managed_rust_binary_path();
+    if configured.is_absolute() && configured.is_file() {
+        return configured;
+    }
+    // Prefer Cargo's standard absolute installation path when available. On
+    // macOS, `current_exe()` may preserve a bare argv[0] when the command was
+    // found through PATH, which is unsafe in a LaunchAgent.
+    let cargo_binary = home_dir().join(".cargo").join("bin").join("iicp-node");
+    if cargo_binary.is_file() {
+        return cargo_binary;
+    }
+    std::env::current_exe().unwrap_or(configured)
+}
+
 fn run_service(args: &[String]) -> Result<(), String> {
     let subcmd = args.first().map(|s| s.as_str()).unwrap_or("");
     if subcmd.is_empty() || matches!(subcmd, "--help" | "-h" | "help") {
@@ -805,7 +827,12 @@ fn run_service(args: &[String]) -> Result<(), String> {
         i += 1;
     }
     let node = node.ok_or("service requires --node NAME")?;
-    let unit = render_service_unit(&node, name.as_deref(), &platform, "iicp-node")?;
+    // launchd/systemd do not inherit an interactive shell PATH. Use the same
+    // Cargo-managed Rust binary as the unattended updater so a generated
+    // service cannot accidentally fail to exec (or run a different SDK).
+    let managed_binary = supervised_executable_path();
+    let executable = managed_binary.to_string_lossy().to_string();
+    let unit = render_service_unit(&node, name.as_deref(), &platform, &executable)?;
     match subcmd {
         "install" => {
             if dry_run {
@@ -1611,6 +1638,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         // correct precedence: flag > env > saved-config > built-in default.
         backend_url: env_or("IICP_BACKEND_URL", None).unwrap_or_default(),
         backend_type: env_or("IICP_BACKEND_TYPE", Some("openai_compat")).unwrap(),
+        experimental: env_bool("IICP_EXPERIMENTAL"),
         model: env_or("IICP_BACKEND_MODEL", None).unwrap_or_default(),
         public_endpoint: env_or("IICP_PUBLIC_ENDPOINT", None).unwrap_or_default(),
         directory_url: env_or("IICP_DIRECTORY_URL", Some("https://iicp.network/api")).unwrap(),
@@ -1661,6 +1689,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             }
             "--with-proxy" => {
                 opts.with_proxy = true;
+                i += 1;
+            }
+            "--experimental" => {
+                opts.experimental = true;
                 i += 1;
             }
             "--relay-capable" => {
@@ -1986,6 +2018,12 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
     if opts.backend_url.is_empty() {
         opts.backend_url = saved.backend_url.clone();
     }
+    // `openai_compat` is the parser default. A saved named adapter must win
+    // during supervised `serve --node NAME` restarts or a MeshLLM node is
+    // treated as generic OpenAI compatibility after its first launch.
+    if opts.backend_type == "openai_compat" && !saved.backend_type.is_empty() {
+        opts.backend_type = saved.backend_type.clone();
+    }
     if opts.model.is_empty() {
         opts.model = saved.model.clone();
     }
@@ -2011,8 +2049,10 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
         opts.port = saved.port;
     }
     if opts.host == "::" || opts.host == "0.0.0.0" {
-        // Both are "default" / all-interfaces — let the saved config win
-        if !saved.host.is_empty() && saved.host != "::" && saved.host != "0.0.0.0" {
+        // Both are parser defaults / all-interfaces — let the saved config
+        // win, including an explicitly saved IPv4 wildcard. This matters on
+        // macOS where an IPv6 wildcard may not accept 127.0.0.1 health probes.
+        if !saved.host.is_empty() {
             opts.host = saved.host.clone();
         }
     }
@@ -2097,6 +2137,9 @@ async fn detect_backend_flavor(backend_url: &str, api_key: &str, backend_type: &
         "anthropic" => return "anthropic".into(),
         "vllm" => return "vllm".into(),
         "llamacpp" => return "llamacpp".into(),
+        // MeshLLM is an informational runtime flavor. IICP still routes by
+        // capability and policy, never by MeshLLM topology or control-plane data.
+        "meshllm" => return "meshllm".into(),
         _ => {}
     }
     let client = match reqwest::Client::builder()
@@ -2530,10 +2573,10 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // never shadows a saved-node backend_url. #414/C1 (parity with Python) — an `anthropic`
     // backend defaults to the Anthropic API, not localhost Ollama.
     if opts.backend_url.is_empty() {
-        opts.backend_url = if opts.backend_type == "anthropic" {
-            "https://api.anthropic.com".to_string()
-        } else {
-            "http://localhost:11434".to_string()
+        opts.backend_url = match opts.backend_type.as_str() {
+            "anthropic" => "https://api.anthropic.com".to_string(),
+            "meshllm" => "http://localhost:9337/v1".to_string(),
+            _ => "http://localhost:11434".to_string(),
         };
     }
 
@@ -2541,6 +2584,12 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // (Ollama /api/tags or OpenAI /v1/models) so a bare `iicp-node serve` just works.
     if opts.model.is_empty() && !opts.backend_url.is_empty() {
         let models = probe_backend_models(&opts.backend_url, &opts.backend_api_key).await;
+        if opts.backend_type == "meshllm" && models.len() > 1 {
+            return Err(format!(
+                "MeshLLM advertises multiple models; select one with --model: {}",
+                models.join(", ")
+            ));
+        }
         if let Some(first) = models.first() {
             eprintln!(
                 "[iicp-node] no --model given — auto-selected '{first}' from backend {}",
@@ -2564,6 +2613,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
              (e.g. `ollama pull qwen2.5:0.5b`).",
             opts.backend_url
         ));
+    }
+    if opts.backend_type == "meshllm" && opts.model == "mesh" && !opts.experimental {
+        return Err("MeshLLM model 'mesh' is experimental; pass --experimental explicitly to enable it.".into());
     }
     if opts.backend_url.is_empty() {
         return Err("backend URL is empty — pass --backend-url URL or $IICP_BACKEND_URL".into());
@@ -2720,7 +2772,17 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     cfg.capabilities = discovered_models
         .into_iter()
         .filter(|m| m != &opts.model)
+        // MeshLLM's `mesh` pseudo-model fans a task out to an experimental
+        // ensemble. It is not an ordinary model capability and must never be
+        // advertised accidentally by a normal MeshLLM node.
+        .filter(|m| opts.backend_type != "meshllm" || opts.experimental || m != "mesh")
         .collect();
+    if opts.backend_type == "meshllm" && !opts.experimental {
+        // MeshLLM includes a `mesh` orchestration alias in /v1/models. Preserve
+        // the operator's explicit experimental choice across the later
+        // heartbeat/model-drift path as well as first registration.
+        cfg.excluded_models.push("mesh".to_string());
+    }
     if !cfg.capabilities.is_empty() {
         eprintln!(
             "[iicp-node] GAP-6: advertising {} additional model(s): {:?}",
@@ -4858,6 +4920,34 @@ mod tests {
         assert_eq!(opts.model, "qwen2.5-coder-14b-instruct-mlx");
     }
 
+    #[test]
+    fn saved_named_backend_survives_supervised_node_restart() {
+        let mut opts = ServeOpts {
+            backend_type: "openai_compat".to_string(),
+            ..Default::default()
+        };
+        let saved = NodeIdentity {
+            backend_type: "meshllm".to_string(),
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert_eq!(opts.backend_type, "meshllm");
+    }
+
+    #[test]
+    fn saved_ipv4_wildcard_applies_to_supervised_node_restart() {
+        let mut opts = ServeOpts {
+            host: "::".to_string(),
+            ..Default::default()
+        };
+        let saved = NodeIdentity {
+            host: "0.0.0.0".to_string(),
+            ..Default::default()
+        };
+        apply_saved_node(&mut opts, &saved);
+        assert_eq!(opts.host, "0.0.0.0");
+    }
+
     // region: an unset region (empty after parse) must restore the saved region and never
     // silently register as "eu-central". Regression for the first external operator (@shaal:
     // set us-east, the directory showed eu-central — --region defaulted to the truthy
@@ -4904,13 +4994,14 @@ mod tests {
     fn launchd_service_runs_foreground_serve_with_hourly_auto_update() {
         env::remove_var("IICP_AUTO_UPDATE");
         env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
-        let unit = render_launchd_service("mynode", None, "iicp-node").unwrap();
+        let unit = render_launchd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert_eq!(unit.platform, "launchd");
         assert!(unit
             .path
             .to_string_lossy()
             .contains("network.iicp.node.mynode.plist"));
         assert!(unit.content.contains("<string>serve</string>"));
+        assert!(unit.content.contains("<string>/tmp/iicp-node</string>"));
         assert!(unit.content.contains("<string>--node</string>"));
         assert!(unit.content.contains("<string>mynode</string>"));
         assert!(unit
@@ -4930,10 +5021,15 @@ mod tests {
     }
 
     #[test]
+    fn supervised_service_executable_is_absolute() {
+        assert!(supervised_executable_path().is_absolute());
+    }
+
+    #[test]
     fn systemd_service_runs_foreground_serve_with_hourly_auto_update() {
         env::remove_var("IICP_AUTO_UPDATE");
         env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
-        let unit = render_systemd_service("mynode", None, "iicp-node").unwrap();
+        let unit = render_systemd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert_eq!(unit.platform, "systemd");
         assert!(unit
             .path
@@ -4941,7 +5037,7 @@ mod tests {
             .contains("network.iicp.node.mynode.service"));
         assert!(unit
             .content
-            .contains("ExecStart=iicp-node serve --node mynode"));
+            .contains("ExecStart=/tmp/iicp-node serve --node mynode"));
         assert!(unit.content.contains("Environment=IICP_AUTO_UPDATE=1"));
         assert!(unit
             .content

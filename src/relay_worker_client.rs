@@ -120,6 +120,13 @@ pub type OnBindFn = Arc<
     dyn Fn(String, u16, String) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
 >;
 
+/// Callback invoked after a previously bound relay session ends.  Consumers use
+/// this to distinguish a configured relay from a relay route that is currently
+/// carrying a live worker session.
+pub type OnDisconnectFn = Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
+>;
+
 /// Relay worker client — connects outbound to a relay, handles CALL frames.
 pub struct RelayWorkerClient {
     worker_id: String,
@@ -129,6 +136,7 @@ pub struct RelayWorkerClient {
     handler: RelayHandlerFn,
     models: Vec<String>,
     on_bind: Option<OnBindFn>,
+    on_disconnect: Option<OnDisconnectFn>,
     bind_ticket: Option<String>,
     directory_url: Option<String>,
     node_token: Option<String>,
@@ -152,6 +160,7 @@ impl RelayWorkerClient {
             handler,
             models,
             on_bind: None,
+            on_disconnect: None,
             bind_ticket: None,
             directory_url: None,
             node_token: None,
@@ -161,6 +170,11 @@ impl RelayWorkerClient {
 
     pub fn with_on_bind(mut self, cb: OnBindFn) -> Self {
         self.on_bind = Some(cb);
+        self
+    }
+
+    pub fn with_on_disconnect(mut self, cb: OnDisconnectFn) -> Self {
+        self.on_disconnect = Some(cb);
         self
     }
 
@@ -361,6 +375,9 @@ impl RelayWorkerClient {
         }
 
         ping_task.abort();
+        if let Some(cb) = &self.on_disconnect {
+            cb().await;
+        }
         Ok(())
     }
 }

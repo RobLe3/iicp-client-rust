@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
-## [Unreleased]
+## [0.7.88] — 2026-07-13
+
+### Added — MeshLLM provider compatibility
+- `iicp-node serve --backend-type meshllm` uses MeshLLM's local OpenAI-compatible gateway at `http://localhost:9337/v1` for stable chat capability.
+- Readiness requires both MeshLLM `/readyz` and the selected model in `/v1/models`; the experimental `mesh` ensemble remains explicit opt-in.
+
+### Fixed — relay recovery evidence
+- A successfully bound relay worker is treated as a live public route while directory evidence converges; a disconnected worker returns to normal limited-reach recovery.
 
 ## [0.7.87] — 2026-07-11
 

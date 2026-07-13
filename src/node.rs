@@ -34,6 +34,17 @@ const DEFAULT_DIRECTORY: &str = "https://iicp.network/api";
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const NONCE_TTL_SECS: u64 = 300;
 
+/// Keep operator-disabled pseudo-models out of health evidence and every
+/// model-drift re-registration path. A backend inventory may include routing
+/// aliases that are not safe to advertise as ordinary IICP capabilities.
+fn filter_excluded_models(mut models: Vec<String>, excluded: &[String]) -> Vec<String> {
+    if excluded.is_empty() {
+        return models;
+    }
+    models.retain(|model| !excluded.iter().any(|excluded_model| excluded_model == model));
+    models
+}
+
 fn attach_update_status(body: &mut Value) {
     if let (Some(dst), Some(src)) = (
         body.as_object_mut(),
@@ -51,6 +62,7 @@ async fn probe_health_models_bg(
     http: &Client,
     backend_url: &str,
     api_key: &Option<String>,
+    excluded_models: &[String],
 ) -> Option<Vec<String>> {
     let base = backend_url.trim_end_matches('/');
     if base.is_empty() {
@@ -76,7 +88,7 @@ async fn probe_health_models_bg(
                         .into_iter()
                         .collect();
                     names.sort();
-                    return Some(names);
+                    return Some(filter_excluded_models(names, excluded_models));
                 }
             }
         }
@@ -93,11 +105,12 @@ async fn probe_health_models_bg(
         if resp.status().is_success() {
             if let Ok(data) = resp.json::<Value>().await {
                 if let Some(arr) = data["data"].as_array() {
-                    return Some(
+                    return Some(filter_excluded_models(
                         arr.iter()
                             .filter_map(|m| m["id"].as_str().map(str::to_string))
                             .collect(),
-                    );
+                        excluded_models,
+                    ));
                 }
             }
         }
@@ -377,6 +390,9 @@ pub struct NodeConfig {
     pub backend_url: Option<String>,
     /// Bearer API key for authenticated backends (LM Studio, hosted services).
     pub backend_api_key: Option<String>,
+    /// Model IDs a backend may expose for internal or preview routing but that
+    /// this node must not publish or use as live-health drift evidence.
+    pub excluded_models: Vec<String>,
 }
 
 impl NodeConfig {
@@ -427,6 +443,7 @@ impl NodeConfig {
             policy_manifest: None,
             backend_url: None,
             backend_api_key: None,
+            excluded_models: Vec::new(),
         }
     }
 }
@@ -1454,6 +1471,10 @@ pub struct IicpNode {
     /// Runtime public reachability gate. Quick Tunnel recovery can set this false
     /// while the local server is alive but the public edge is stale/rebuilding.
     runtime_available: Arc<AtomicBool>,
+    /// True only while an outbound relay worker has completed its bind
+    /// handshake.  A configured relay is not sufficient evidence: the session
+    /// must be live before it can satisfy public-route recovery checks.
+    runtime_relay_bound: Arc<AtomicBool>,
     /// #527 — endpoint registered at last register(); compared each heartbeat
     /// tick so a rotated endpoint triggers a live re-registration (the new URL
     /// is accepted via the IICP-E050 token path, current_node_token #529).
@@ -1497,6 +1518,7 @@ impl IicpNode {
             registered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
             endpoint_override: Arc::new(std::sync::RwLock::new(None)),
             runtime_available: Arc::new(AtomicBool::new(true)),
+            runtime_relay_bound: Arc::new(AtomicBool::new(false)),
             registered_endpoint: Arc::new(std::sync::RwLock::new(String::new())),
             cx_public_key,
             cx_private_key,
@@ -1984,59 +2006,14 @@ impl IicpNode {
     /// Tries Ollama /api/tags first, then OpenAI-compat /v1/models.
     /// Returns None on any error (probe failure is soft — heartbeat still sends without health_models).
     async fn probe_health_models(&self) -> Option<Vec<String>> {
-        let base = self.cfg.backend_url.as_deref()?.trim_end_matches('/');
-        if base.is_empty() {
-            return None;
-        }
-        let root = base.strip_suffix("/v1").unwrap_or(base);
-        let mut rb = self
-            .http
-            .get(format!("{root}/api/tags"))
-            .timeout(std::time::Duration::from_secs(2));
-        if let Some(key) = &self.cfg.backend_api_key {
-            if !key.is_empty() {
-                rb = rb.bearer_auth(key);
-            }
-        }
-        if let Ok(resp) = rb.send().await {
-            if resp.status().is_success() {
-                if let Ok(data) = resp.json::<Value>().await {
-                    if let Some(arr) = data["models"].as_array() {
-                        let mut names: Vec<String> = arr
-                            .iter()
-                            .filter_map(|m| m["name"].as_str().map(str::to_string))
-                            .collect::<std::collections::HashSet<_>>()
-                            .into_iter()
-                            .collect();
-                        names.sort();
-                        return Some(names);
-                    }
-                }
-            }
-        }
-        let mut rb2 = self
-            .http
-            .get(format!("{root}/v1/models"))
-            .timeout(std::time::Duration::from_secs(2));
-        if let Some(key) = &self.cfg.backend_api_key {
-            if !key.is_empty() {
-                rb2 = rb2.bearer_auth(key);
-            }
-        }
-        if let Ok(resp) = rb2.send().await {
-            if resp.status().is_success() {
-                if let Ok(data) = resp.json::<Value>().await {
-                    if let Some(arr) = data["data"].as_array() {
-                        let names: Vec<String> = arr
-                            .iter()
-                            .filter_map(|m| m["id"].as_str().map(str::to_string))
-                            .collect();
-                        return Some(names);
-                    }
-                }
-            }
-        }
-        None
+        let base = self.cfg.backend_url.as_deref()?;
+        probe_health_models_bg(
+            &self.http,
+            base,
+            &self.cfg.backend_api_key,
+            &self.cfg.excluded_models,
+        )
+        .await
     }
 
     /// Send a single heartbeat to the directory.
@@ -2355,6 +2332,7 @@ impl IicpNode {
             // #494 — model drift detection: capture backend probe config + registered models.
             let hb_backend_url = self.cfg.backend_url.clone();
             let hb_backend_api_key = self.cfg.backend_api_key.clone();
+            let hb_excluded_models = self.cfg.excluded_models.clone();
             let hb_backend = self.cfg.backend.clone();
             let hb_model = self.cfg.model.clone();
             let hb_backend_stability = Arc::clone(&self.backend_stability);
@@ -2368,6 +2346,7 @@ impl IicpNode {
             let hb_liveness_challenge = Arc::clone(&self.liveness_challenge);
             let hb_runtime_hmac_key = Arc::clone(&self.runtime_hmac_key);
             let hb_runtime_available = Arc::clone(&self.runtime_available);
+            let hb_runtime_relay_bound = Arc::clone(&self.runtime_relay_bound);
             let hb_recovery_grace = crate::recovery::env_grace_checks();
             let hb_recovery_check_every = crate::recovery::env_check_every_heartbeats();
             let hb_recovery_supervised = crate::recovery::supervised_recovery_enabled();
@@ -2398,7 +2377,7 @@ impl IicpNode {
                     };
                     // #494 — probe the backend for the current model list before heartbeat.
                     let live_models = if let Some(ref bu) = hb_backend_url {
-                        probe_health_models_bg(&http, bu, &hb_backend_api_key).await
+                        probe_health_models_bg(&http, bu, &hb_backend_api_key, &hb_excluded_models).await
                     } else {
                         None
                     };
@@ -2559,9 +2538,20 @@ impl IicpNode {
                                 let presence = route_status.presence;
                                 let public_available_now =
                                     hb_runtime_available.load(Ordering::Relaxed);
+                                let relay_bound_now =
+                                    hb_runtime_relay_bound.load(Ordering::Relaxed);
                                 let route_needs_promotion = route_status.route_needs_promotion;
-                                if !public_available_now
-                                    || route_needs_promotion
+                                // A successfully bound relay is a public route in its
+                                // own right. Do not recycle a supervised worker merely
+                                // because its old direct IPv6 advertisement is still
+                                // self-attested while relay re-registration converges.
+                                let effective_public_route =
+                                    crate::recovery::effective_public_route_available(
+                                        public_available_now,
+                                        route_needs_promotion,
+                                        relay_bound_now,
+                                    );
+                                if !effective_public_route
                                     || matches!(
                                         presence,
                                         crate::recovery::DirectoryPresence::Absent
@@ -2586,7 +2576,7 @@ impl IicpNode {
                                     });
                                 let (recovery_state, recovery_action) = crate::recovery::classify(
                                     true,
-                                    public_available_now && !route_needs_promotion,
+                                    effective_public_route,
                                     presence,
                                     recovery_failures,
                                     hb_recovery_grace,
@@ -2598,14 +2588,14 @@ impl IicpNode {
                                         | crate::recovery::RecoveryState::Unknown
                                 ) {
                                     tracing::warn!(
-                                        "seq={seq} recovery check state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace} route_needs_promotion={route_needs_promotion}"
+                                        "seq={seq} recovery check state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace} route_needs_promotion={route_needs_promotion} relay_bound={relay_bound_now}"
                                     );
                                     if let Some(ref log) = hb_log {
                                         log.write(
                                             "recovery_check",
                                             &hb_node_id,
                                             &format!(
-                                                "seq={seq} state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace} route_needs_promotion={route_needs_promotion}"
+                                                "seq={seq} state={recovery_state:?} action={recovery_action:?} failures={recovery_failures}/{hb_recovery_grace} route_needs_promotion={route_needs_promotion} relay_bound={relay_bound_now}"
                                             ),
                                         );
                                     }
@@ -2801,6 +2791,7 @@ impl IicpNode {
             let relay_hmac_arc = Arc::clone(&self.runtime_hmac_key);
             let relay_saved_node_name = self.saved_node_name.clone();
             let relay_registered_endpoint = Arc::clone(&self.registered_endpoint);
+            let relay_bound_arc = Arc::clone(&self.runtime_relay_bound);
             let handler_fn: crate::relay_worker_client::RelayHandlerFn =
                 Arc::new(move |task: Value| {
                     let h = Arc::clone(&handler_for_relay);
@@ -2854,7 +2845,12 @@ impl IicpNode {
                     let hmac_arc = Arc::clone(&relay_hmac_arc);
                     let saved_node_name = relay_saved_node_name.clone();
                     let registered_endpoint = Arc::clone(&relay_registered_endpoint);
+                    let relay_bound = Arc::clone(&relay_bound_arc);
                     Box::pin(async move {
+                        // Binding succeeded before directory convergence. Keep this
+                        // separate from registration so recovery can preserve the
+                        // working relay session while it retries control-plane work.
+                        relay_bound.store(true, Ordering::Relaxed);
                         // Path-scoped endpoint (#450): consumers compose
                         // "{endpoint}/v1/task", so this route forwards to this
                         // worker instead of the relay's own backend.
@@ -2892,12 +2888,22 @@ impl IicpNode {
                         }
                     })
                 });
+            let relay_bound_on_disconnect = Arc::clone(&self.runtime_relay_bound);
+            let on_disconnect_cb: crate::relay_worker_client::OnDisconnectFn =
+                Arc::new(move || {
+                    let relay_bound = Arc::clone(&relay_bound_on_disconnect);
+                    Box::pin(async move {
+                        relay_bound.store(false, Ordering::Relaxed);
+                        tracing::warn!("Relay worker session ended — route is no longer bound");
+                    })
+                });
             tokio::spawn(async move {
                 let rwc = Arc::new(
                     crate::relay_worker_client::RelayWorkerClient::new(
                         node_id, intent, rhost, rport, handler_fn, models,
                     )
-                    .with_on_bind(on_bind_cb),
+                    .with_on_bind(on_bind_cb)
+                    .with_on_disconnect(on_disconnect_cb),
                 );
                 rwc.run().await;
             });
@@ -3033,10 +3039,19 @@ mod task_rate_tests {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::build_capabilities;
+    use super::{build_capabilities, filter_excluded_models};
 
     const CHAT: &str = "urn:iicp:intent:llm:chat:v1";
     const EMBED: &str = "urn:iicp:intent:llm:embedding:v1";
+
+    #[test]
+    fn excluded_backend_alias_is_not_used_as_health_or_registration_evidence() {
+        let models = vec!["stable-model".to_string(), "mesh".to_string()];
+        assert_eq!(
+            filter_excluded_models(models, &["mesh".to_string()]),
+            vec!["stable-model".to_string()]
+        );
+    }
 
     // #409 — a backend serving a chat model AND an embedding model advertises
     // BOTH intents (the verified LM Studio case). Fails on the old single-cap code.
@@ -3135,7 +3150,7 @@ mod capability_tests {
 
 #[cfg(test)]
 mod reregister_tests {
-    use super::{reregister, update_saved_identity_credentials};
+    use super::{probe_health_models_bg, reregister, update_saved_identity_credentials};
     use serde_json::json;
 
     // #404 — the re-register seam used by the self-healing heartbeat loop:
@@ -3170,6 +3185,7 @@ mod reregister_tests {
             operator_id: "op-test".to_string(),
             name: "drift".to_string(),
             backend_url: "http://mock-backend".to_string(),
+            backend_type: "openai_compat".to_string(),
             model: "phi3:mini".to_string(),
             intent: "urn:iicp:intent:llm:chat:v1".to_string(),
             region: "eu-central".to_string(),
@@ -3203,6 +3219,26 @@ mod reregister_tests {
         let url = format!("{}/v1/register", server.url());
         let tok = reregister(&http, &url, &json!({})).await;
         assert_eq!(tok, None);
+    }
+
+    #[tokio::test]
+    async fn health_inventory_excludes_meshllm_preview_alias_before_drift_logic() {
+        let mut server = mockito::Server::new_async().await;
+        let _models = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(json!({"data": [{"id": "stable-model"}, {"id": "mesh"}]}).to_string())
+            .create_async()
+            .await;
+
+        let observed = probe_health_models_bg(
+            &reqwest::Client::new(),
+            &format!("{}/v1", server.url()),
+            &None,
+            &["mesh".to_string()],
+        )
+        .await;
+        assert_eq!(observed, Some(vec!["stable-model".to_string()]));
     }
 }
 

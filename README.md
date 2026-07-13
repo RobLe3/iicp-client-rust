@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.87"
+iicp-client = "0.7.88"
 ```
 
 ## One-line test
@@ -41,7 +41,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.87 or newer
+iicp-node --version    # prints iicp-node 0.7.88 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -158,7 +158,7 @@ base URL. Full guide: <https://iicp.network/docs/proxy>
 
 ## Keep provider nodes current
 
-The current public release line is **0.7.87**. Upgrade through your package
+The current public release line is **0.7.88**. Upgrade through your package
 manager before troubleshooting an older installation. Routing profiles can
 refuse remote dispatch before a prompt leaves the client; use `sensitive` for
 local-only work, `eu-restricted` for EU/EEA routing, or `strict-policy` when a
@@ -334,16 +334,33 @@ Ok(v.get("result").cloned().unwrap_or(v))
 
 ### Backends — pick an inference engine
 
-`iicp-node serve` (and the `backends::invoke_backend` dispatch) supports four
+`iicp-node serve` (and the `backends::invoke_backend` dispatch) supports named
 backend engines, selected with `--backend-type` / `IICP_BACKEND_TYPE`
 (default `openai_compat`):
 
 | `--backend-type` | Speaks | Typical backend |
 |------------------|--------|-----------------|
 | `openai_compat` | OpenAI `/v1/*` | Ollama, LM Studio, any OpenAI-compatible server |
+| `meshllm` | Stable chat over local OpenAI `/v1` | MeshLLM at `http://localhost:9337/v1` |
 | `vllm` | OpenAI `/v1/*` | vLLM OpenAI server (default port 8000) |
 | `llamacpp` | OpenAI `/v1/*` | llama.cpp `llama-server` (default port 8080) |
 | `anthropic` | Anthropic Messages API (`POST /v1/messages`) | Anthropic API → first-class Claude |
+
+### MeshLLM
+
+MeshLLM is a local OpenAI-compatible backend. Start its local gateway, then choose
+one advertised model explicitly (the stable IICP profile serves chat only):
+
+```bash
+iicp-node serve --backend-type meshllm --model <meshllm-model-id>
+```
+
+The upstream experimental `mesh` ensemble is never selected automatically. Use it
+only with an explicit `--model mesh --experimental` opt-in.
+
+MeshLLM remains the local inference runtime. IICP uses its local OpenAI-compatible
+gateway for task execution and does not publish MeshLLM peer or topology details
+through IICP discovery.
 
 The `anthropic` backend translates the IICP `llm:chat:v1` task into an Anthropic
 Messages request and translates the reply back to the OpenAI chat-completion
