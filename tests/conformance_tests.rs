@@ -400,68 +400,129 @@ async fn test_orchestrator_counts_pass_and_fail() {
 
 #[test]
 fn pre_normative_profile_fixture_has_portable_reasons() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
-        .expect("profile fixture must be valid JSON");
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
+            .expect("profile fixture must be valid JSON");
     assert_eq!(fixture["fixture_version"], "0.3.0-draft");
     assert_eq!(fixture["status"], "pre-normative");
-    assert_eq!(fixture["result_contract"]["unsupported_status"], "unsupported_pre_normative_profile");
-    let scenarios = fixture["scenarios"].as_array().expect("scenarios must be an array");
+    assert_eq!(
+        fixture["result_contract"]["unsupported_status"],
+        "unsupported_pre_normative_profile"
+    );
+    let scenarios = fixture["scenarios"]
+        .as_array()
+        .expect("scenarios must be an array");
     assert_eq!(scenarios.len(), 11);
-    assert!(scenarios.iter().all(|scenario| scenario["expected_reason"].is_string()));
+    assert!(scenarios
+        .iter()
+        .all(|scenario| scenario["expected_reason"].is_string()));
 }
 
 #[test]
 fn profile_fixture_scenarios_use_native_compatibility_evaluator() {
     use iicp_client::profile_compatibility::evaluate_pre_normative_profile;
-    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();
     for scenario in fixture["scenarios"].as_array().unwrap() {
         let decision = evaluate_pre_normative_profile(
-            &scenario["request"], &scenario["provider"], &fixture["intent_aliases"],
-            scenario.get("now_s").and_then(serde_json::Value::as_i64).unwrap_or_default(),
+            &scenario["request"],
+            &scenario["provider"],
+            &fixture["intent_aliases"],
+            scenario
+                .get("now_s")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default(),
         );
-        assert_eq!(decision.eligible, scenario["expected"] == "eligible", "{}", scenario["name"]);
-        assert_eq!(decision.reason, scenario["expected_reason"].as_str().unwrap(), "{}", scenario["name"]);
+        assert_eq!(
+            decision.eligible,
+            scenario["expected"] == "eligible",
+            "{}",
+            scenario["name"]
+        );
+        assert_eq!(
+            decision.reason,
+            scenario["expected_reason"].as_str().unwrap(),
+            "{}",
+            scenario["name"]
+        );
     }
 }
 
 #[test]
 fn weighted_v1_fixture_vectors_are_deterministic() {
     use iicp_client::selection::weighted_v1_index;
-    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/selection-v1.json")).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/selection-v1.json")).unwrap();
     for vector in fixture["vectors"].as_array().unwrap() {
         let nodes = vector["nodes"].as_array().unwrap();
-        let scores = nodes.iter().map(|node| node["score"].as_f64().unwrap()).collect::<Vec<_>>();
-        let loads = nodes.iter().map(|node| node["load"].as_f64().unwrap()).collect::<Vec<_>>();
+        let scores = nodes
+            .iter()
+            .map(|node| node["score"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        let loads = nodes
+            .iter()
+            .map(|node| node["load"].as_f64().unwrap())
+            .collect::<Vec<_>>();
         let chosen = weighted_v1_index(&scores, &loads, vector["random"].as_f64().unwrap());
         let mut actual = vec![nodes[chosen]["node_id"].as_str().unwrap().to_string()];
-        actual.extend(nodes.iter().take(3).filter(|node| node["node_id"] != nodes[chosen]["node_id"]).map(|node| node["node_id"].as_str().unwrap().to_string()));
-        let expected = vector["expected_order"].as_array().unwrap().iter().map(|node| node.as_str().unwrap().to_string()).collect::<Vec<_>>();
+        actual.extend(
+            nodes
+                .iter()
+                .take(3)
+                .filter(|node| node["node_id"] != nodes[chosen]["node_id"])
+                .map(|node| node["node_id"].as_str().unwrap().to_string()),
+        );
+        let expected = vector["expected_order"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|node| node.as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
         assert_eq!(actual, expected, "{}", vector["name"]);
     }
 }
 
 #[test]
 fn profile_negotiation_fixture_preserves_legacy_and_required_fail_closed_boundary() {
-    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-negotiation-v0.json")).unwrap();
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/profile-negotiation-v0.json")).unwrap();
     assert_eq!(fixture["fixture_version"], "0.2.0-draft");
-    assert_eq!(fixture["profile_fixture_sha256"], "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf");
+    assert_eq!(
+        fixture["profile_fixture_sha256"],
+        "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf"
+    );
     for case in fixture["cases"].as_array().unwrap() {
         let requested = case["expected"]["requested"].as_bool().unwrap_or(true);
         if !requested {
-            assert!(case["request"].as_object().unwrap().is_empty(), "{}", case["name"]);
+            assert!(
+                case["request"].as_object().unwrap().is_empty(),
+                "{}",
+                case["name"]
+            );
             continue;
         }
-        assert!(case["request"]["profile_fixture_sha256"].as_str().is_some(), "{}", case["name"]);
+        assert!(
+            case["request"]["profile_fixture_sha256"].as_str().is_some(),
+            "{}",
+            case["name"]
+        );
         let required = case["request"]["profile_required"].as_bool().unwrap();
         let allowed = case["expected"]["dispatch_allowed"].as_bool().unwrap();
-        assert!(!required || !allowed || case["expected"]["status"] == "compatible", "{}", case["name"]);
+        assert!(
+            !required || !allowed || case["expected"]["status"] == "compatible",
+            "{}",
+            case["name"]
+        );
     }
 }
 
 #[test]
 fn profile_fixture_native_policy_scenarios_use_routing_gate() {
-    use iicp_client::{filter_nodes_for_routing_policy, resolved_policy, Node, RoutingPolicy, RoutingProfile};
-    let fixture: serde_json::Value = serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();
+    use iicp_client::{
+        filter_nodes_for_routing_policy, resolved_policy, Node, RoutingPolicy, RoutingProfile,
+    };
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json")).unwrap();
     for scenario in fixture["native_policy_scenarios"].as_array().unwrap() {
         let raw = &scenario["node"];
         let node: Node = serde_json::from_value(serde_json::json!({
@@ -473,16 +534,41 @@ fn profile_fixture_native_policy_scenarios_use_routing_gate() {
         let policy_data = scenario["policy"].as_object().unwrap();
         let policy = RoutingPolicy {
             profile: RoutingProfile::Standard,
-            allowed_regions: policy_data.get("allowed_regions").and_then(|v| v.as_array()).map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default(),
-            require_encryption: policy_data.get("require_encryption").and_then(|v| v.as_bool()),
-            require_policy_manifest: policy_data.get("require_policy_manifest").and_then(|v| v.as_bool()),
-            require_no_payload_retention: policy_data.get("require_no_payload_retention").and_then(|v| v.as_bool()),
-            allow_remote_executor: policy_data.get("allow_remote_executor").and_then(|v| v.as_bool()),
-            known_operator_only: policy_data.get("known_operator_only").and_then(|v| v.as_bool()),
-            required_manifest_identity_level: policy_data.get("required_manifest_identity_level").and_then(|v| v.as_str().map(str::to_string)),
+            allowed_regions: policy_data
+                .get("allowed_regions")
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            require_encryption: policy_data
+                .get("require_encryption")
+                .and_then(|v| v.as_bool()),
+            require_policy_manifest: policy_data
+                .get("require_policy_manifest")
+                .and_then(|v| v.as_bool()),
+            require_no_payload_retention: policy_data
+                .get("require_no_payload_retention")
+                .and_then(|v| v.as_bool()),
+            allow_remote_executor: policy_data
+                .get("allow_remote_executor")
+                .and_then(|v| v.as_bool()),
+            known_operator_only: policy_data
+                .get("known_operator_only")
+                .and_then(|v| v.as_bool()),
+            required_manifest_identity_level: policy_data
+                .get("required_manifest_identity_level")
+                .and_then(|v| v.as_str().map(str::to_string)),
         };
-        let decision = filter_nodes_for_routing_policy(vec![node], &resolved_policy(Some(&policy)), false);
+        let decision =
+            filter_nodes_for_routing_policy(vec![node], &resolved_policy(Some(&policy)), false);
         assert!(decision.eligible.is_empty());
-        assert_eq!(decision.rejected_reasons, vec![scenario["expected_reason"].as_str().unwrap()]);
+        assert_eq!(
+            decision.rejected_reasons,
+            vec![scenario["expected_reason"].as_str().unwrap()]
+        );
     }
 }

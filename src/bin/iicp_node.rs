@@ -1922,14 +1922,18 @@ async fn run_doctor(args: &[String]) -> Result<(), String> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("operator-handoff-pending-") && name.ends_with(".json"))
+                .is_some_and(|name| {
+                    name.starts_with("operator-handoff-pending-") && name.ends_with(".json")
+                })
         })
         .filter_map(|path| fs::read_to_string(path).ok())
         .filter_map(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
         .filter(|body| {
-            body["affected_node_names"]
-                .as_array()
-                .is_some_and(|names| names.iter().any(|name| name.as_str() == Some(node.name.as_str())))
+            body["affected_node_names"].as_array().is_some_and(|names| {
+                names
+                    .iter()
+                    .any(|name| name.as_str() == Some(node.name.as_str()))
+            })
         })
         .map(|body| {
             if body["restart_attempted"].as_bool().unwrap_or(false) {
@@ -2615,7 +2619,10 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         ));
     }
     if opts.backend_type == "meshllm" && opts.model == "mesh" && !opts.experimental {
-        return Err("MeshLLM model 'mesh' is experimental; pass --experimental explicitly to enable it.".into());
+        return Err(
+            "MeshLLM model 'mesh' is experimental; pass --experimental explicitly to enable it."
+                .into(),
+        );
     }
     if opts.backend_url.is_empty() {
         return Err("backend URL is empty — pass --backend-url URL or $IICP_BACKEND_URL".into());
@@ -3824,10 +3831,17 @@ async fn run_operator_dsr(args: &[String]) -> Result<(), String> {
 fn write_private_json_new(path: &PathBuf, value: &serde_json::Value) -> Result<(), String> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
-    #[cfg(unix)] { options.mode(0o600); }
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
     let mut file = options.open(path).map_err(|e| e.to_string())?;
-    writeln!(file, "{}", serde_json::to_string_pretty(value).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    writeln!(
+        file,
+        "{}",
+        serde_json::to_string_pretty(value).map_err(|e| e.to_string())?
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -3865,9 +3879,13 @@ fn handoff_marker_paths() -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
-            name.starts_with("operator-handoff-pending-") && name.ends_with(".json")
-        }))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("operator-handoff-pending-") && name.ends_with(".json")
+                })
+        })
         .collect()
 }
 
@@ -3887,7 +3905,10 @@ fn handoff_restart_delay(marker: &serde_json::Value, node_name: &str, now: u64) 
     let affected = handoff_names(marker, "affected_node_names");
     let requested = handoff_names(marker, "restart_requested_node_names");
     let completed = handoff_names(marker, "completed_node_names");
-    if !affected.contains(node_name) || requested.contains(node_name) || completed.contains(node_name) {
+    if !affected.contains(node_name)
+        || requested.contains(node_name)
+        || completed.contains(node_name)
+    {
         return None;
     }
     let created = marker["created_at_unix"].as_u64()?;
@@ -3906,9 +3927,15 @@ fn claim_handoff_restart(node_name: &str) -> bool {
         Err(_) => return false,
     };
     for path in handoff_marker_paths() {
-        let Ok(body) = fs::read_to_string(&path) else { continue; };
-        let Ok(mut marker) = serde_json::from_str::<serde_json::Value>(&body) else { continue; };
-        if handoff_restart_delay(&marker, node_name, now) != Some(0) { continue; }
+        let Ok(body) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(mut marker) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if handoff_restart_delay(&marker, node_name, now) != Some(0) {
+            continue;
+        }
         let mut requested = handoff_names(&marker, "restart_requested_node_names");
         requested.insert(node_name.to_string());
         marker["restart_requested_node_names"] = serde_json::json!(requested);
@@ -3926,11 +3953,15 @@ fn handoff_completion_allowed(marker: &serde_json::Value, node_name: &str) -> bo
 
 fn complete_handoff_for_node(node_name: &str) {
     for path in handoff_marker_paths() {
-        let Ok(mut marker) = fs::read_to_string(&path).and_then(|body| serde_json::from_str(&body).map_err(io::Error::other)) else {
+        let Ok(mut marker) = fs::read_to_string(&path)
+            .and_then(|body| serde_json::from_str(&body).map_err(io::Error::other))
+        else {
             continue;
         };
         let affected = handoff_names(&marker, "affected_node_names");
-        if !handoff_completion_allowed(&marker, node_name) { continue; }
+        if !handoff_completion_allowed(&marker, node_name) {
+            continue;
+        }
         // Registration may already be in flight when a separate `operator key
         // rotate` command writes a marker. Only the process that first claimed
         // the marker's supervised restart may complete it; otherwise that
@@ -3947,7 +3978,9 @@ fn complete_handoff_for_node(node_name: &str) {
 }
 
 fn schedule_supervised_handoff_restart(node_name: &str) {
-    if node_name.is_empty() || !env_bool("IICP_SUPERVISED") { return; }
+    if node_name.is_empty() || !env_bool("IICP_SUPERVISED") {
+        return;
+    }
     let name = node_name.to_string();
     tokio::spawn(async move {
         // `operator key rotate` runs in a separate CLI process, so its marker
@@ -3967,91 +4000,243 @@ fn schedule_supervised_handoff_restart(node_name: &str) {
 
 async fn run_operator_key(args: &[String]) -> Result<(), String> {
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
-        print!("usage: iicp-node operator key <rotate|revoke> --yes [--directory-url URL]\n");
+        println!("usage: iicp-node operator key <rotate|revoke> --yes [--directory-url URL]");
         return Ok(());
     }
     let action = args.first().map(String::as_str).unwrap_or("");
-    if !matches!(action, "rotate" | "revoke") { return Err("usage: iicp-node operator key <rotate|revoke> --yes".into()); }
+    if !matches!(action, "rotate" | "revoke") {
+        return Err("usage: iicp-node operator key <rotate|revoke> --yes".into());
+    }
     let mut yes = false;
     let mut directory_url: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--yes" => yes = true,
-            "--directory-url" => { i += 1; directory_url = Some(args.get(i).ok_or("--directory-url requires a value")?.clone()); }
-            arg if arg.starts_with("--directory-url=") => directory_url = Some(arg[16..].to_string()),
+            "--directory-url" => {
+                i += 1;
+                directory_url = Some(
+                    args.get(i)
+                        .ok_or("--directory-url requires a value")?
+                        .clone(),
+                );
+            }
+            arg if arg.starts_with("--directory-url=") => {
+                directory_url = Some(arg[16..].to_string())
+            }
             arg => return Err(format!("unknown operator key option: {arg}")),
         }
         i += 1;
     }
-    if !yes { return Err("this changes the cryptographic operator identity used by saved nodes; re-run with --yes".into()); }
-    let stored = load_operator().map_err(|e| e.to_string())?.ok_or("no operator identity — run `iicp-node init` first")?;
-    if !stored.is_key_backed() { return Err("a key-backed local operator identity is required".into()); }
-    let unlock = if stored.is_encrypted() { Some(operator_passphrase("Operator passphrase", false)?) } else { None };
-    let old = if let Some(ref pw) = unlock { stored.decrypt_at_rest(pw)? } else { stored };
+    if !yes {
+        return Err("this changes the cryptographic operator identity used by saved nodes; re-run with --yes".into());
+    }
+    let stored = load_operator()
+        .map_err(|e| e.to_string())?
+        .ok_or("no operator identity — run `iicp-node init` first")?;
+    if !stored.is_key_backed() {
+        return Err("a key-backed local operator identity is required".into());
+    }
+    let unlock = if stored.is_encrypted() {
+        Some(operator_passphrase("Operator passphrase", false)?)
+    } else {
+        None
+    };
+    let old = if let Some(ref pw) = unlock {
+        stored.decrypt_at_rest(pw)?
+    } else {
+        stored
+    };
     let mut backup_path: Option<PathBuf> = None;
     let mut successor: Option<OperatorIdentity> = None;
     if action == "rotate" {
         // Do not use `unwrap_or(operator_passphrase(...)?)` here: Rust eagerly
         // evaluates the fallback argument, which made headless/Docker rotation
         // prompt (and fail) even when IICP_OPERATOR_BACKUP_PASSPHRASE was set.
-        let backup_pw = match unlock.clone().or_else(|| env::var("IICP_OPERATOR_BACKUP_PASSPHRASE").ok()) {
+        let backup_pw = match unlock
+            .clone()
+            .or_else(|| env::var("IICP_OPERATOR_BACKUP_PASSPHRASE").ok())
+        {
             Some(passphrase) => passphrase,
             None => operator_passphrase("New backup passphrase", true)?,
         };
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0);
-        let path = config_dir().map_err(|e| e.to_string())?.join(format!("operator-before-rotation-{stamp}.json"));
-        write_private_json_new(&path, &serde_json::to_value(old.encrypt_at_rest(&backup_pw)?).map_err(|e| e.to_string())?)?;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|v| v.as_secs())
+            .unwrap_or(0);
+        let path = config_dir()
+            .map_err(|e| e.to_string())?
+            .join(format!("operator-before-rotation-{stamp}.json"));
+        write_private_json_new(
+            &path,
+            &serde_json::to_value(old.encrypt_at_rest(&backup_pw)?).map_err(|e| e.to_string())?,
+        )?;
         backup_path = Some(path);
         successor = Some(OperatorIdentity::generate(&old.display_name, &old.contact));
     }
-    let base = format!("{}/v1/operator", directory_url.unwrap_or_else(|| env::var("IICP_DIRECTORY_URL").unwrap_or_else(|_| "https://iicp.network/api".to_string())).trim_end_matches('/'));
-    let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build().map_err(|e| e.to_string())?;
-    let challenge = client.post(format!("{base}/challenge")).json(&serde_json::json!({"operator_pub": old.operator_id})).send().await.map_err(|e| e.to_string())?;
+    let base = format!(
+        "{}/v1/operator",
+        directory_url
+            .unwrap_or_else(|| env::var("IICP_DIRECTORY_URL")
+                .unwrap_or_else(|_| "https://iicp.network/api".to_string()))
+            .trim_end_matches('/')
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let challenge = client
+        .post(format!("{base}/challenge"))
+        .json(&serde_json::json!({"operator_pub": old.operator_id}))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     let challenge_status = challenge.status();
-    let challenge_body: serde_json::Value = challenge.json().await.unwrap_or(serde_json::Value::Null);
-    let nonce = challenge_body.get("nonce").and_then(|v| v.as_str()).ok_or("directory challenge was incomplete")?;
-    if !challenge_status.is_success() { return Err("directory challenge rejected".into()); }
-    let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs() as i64).unwrap_or(0);
+    let challenge_body: serde_json::Value =
+        challenge.json().await.unwrap_or(serde_json::Value::Null);
+    let nonce = challenge_body
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .ok_or("directory challenge was incomplete")?;
+    if !challenge_status.is_success() {
+        return Err("directory challenge rejected".into());
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|v| v.as_secs() as i64)
+        .unwrap_or(0);
     let old_key = old.signing_key()?;
     let (response, receipt_action) = if action == "rotate" {
         let next = successor.as_ref().ok_or("successor identity missing")?;
         let mut fields = BTreeMap::from([
-            ("operator_pub".to_string(), serde_json::Value::String(old.operator_id.clone())),
-            ("new_operator_pub".to_string(), serde_json::Value::String(next.operator_id.clone())),
-            ("nonce".to_string(), serde_json::Value::String(nonce.to_string())),
+            (
+                "operator_pub".to_string(),
+                serde_json::Value::String(old.operator_id.clone()),
+            ),
+            (
+                "new_operator_pub".to_string(),
+                serde_json::Value::String(next.operator_id.clone()),
+            ),
+            (
+                "nonce".to_string(),
+                serde_json::Value::String(nonce.to_string()),
+            ),
             ("ts".to_string(), serde_json::Value::from(ts)),
-            ("reason_class".to_string(), serde_json::Value::String("operator_rotation".to_string())),
+            (
+                "reason_class".to_string(),
+                serde_json::Value::String("operator_rotation".to_string()),
+            ),
         ]);
-        let sig = iicp_client::delegation::sign_operator_self_service(&old_key, "key_rotate", &fields);
+        let sig =
+            iicp_client::delegation::sign_operator_self_service(&old_key, "key_rotate", &fields);
         fields.insert("sig".to_string(), serde_json::Value::String(sig));
         let proof = BTreeMap::from([
-            ("operator_pub".to_string(), serde_json::Value::String(old.operator_id.clone())),
-            ("new_operator_pub".to_string(), serde_json::Value::String(next.operator_id.clone())),
-            ("nonce".to_string(), serde_json::Value::String(nonce.to_string())),
+            (
+                "operator_pub".to_string(),
+                serde_json::Value::String(old.operator_id.clone()),
+            ),
+            (
+                "new_operator_pub".to_string(),
+                serde_json::Value::String(next.operator_id.clone()),
+            ),
+            (
+                "nonce".to_string(),
+                serde_json::Value::String(nonce.to_string()),
+            ),
             ("ts".to_string(), serde_json::Value::from(ts)),
             ("rotation_epoch".to_string(), serde_json::Value::Null),
         ]);
-        fields.insert("new_key_sig".to_string(), serde_json::Value::String(iicp_client::delegation::sign_operator_self_service(&next.signing_key()?, "key_rotate_successor", &proof)));
-        (client.post(format!("{base}/key/rotate")).json(&fields).send().await.map_err(|e| e.to_string())?, "rotate")
+        fields.insert(
+            "new_key_sig".to_string(),
+            serde_json::Value::String(iicp_client::delegation::sign_operator_self_service(
+                &next.signing_key()?,
+                "key_rotate_successor",
+                &proof,
+            )),
+        );
+        (
+            client
+                .post(format!("{base}/key/rotate"))
+                .json(&fields)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?,
+            "rotate",
+        )
     } else {
         let mut fields = BTreeMap::from([
-            ("operator_pub".to_string(), serde_json::Value::String(old.operator_id.clone())),
-            ("nonce".to_string(), serde_json::Value::String(nonce.to_string())),
+            (
+                "operator_pub".to_string(),
+                serde_json::Value::String(old.operator_id.clone()),
+            ),
+            (
+                "nonce".to_string(),
+                serde_json::Value::String(nonce.to_string()),
+            ),
             ("ts".to_string(), serde_json::Value::from(ts)),
             ("confirm".to_string(), serde_json::Value::Bool(true)),
-            ("reason_class".to_string(), serde_json::Value::String("operator_request".to_string())),
+            (
+                "reason_class".to_string(),
+                serde_json::Value::String("operator_request".to_string()),
+            ),
         ]);
-        fields.insert("sig".to_string(), serde_json::Value::String(iicp_client::delegation::sign_operator_self_service(&old_key, "key_revoke", &fields)));
-        (client.post(format!("{base}/key/revoke")).json(&fields).send().await.map_err(|e| e.to_string())?, "revoke")
+        fields.insert(
+            "sig".to_string(),
+            serde_json::Value::String(iicp_client::delegation::sign_operator_self_service(
+                &old_key,
+                "key_revoke",
+                &fields,
+            )),
+        );
+        (
+            client
+                .post(format!("{base}/key/revoke"))
+                .json(&fields)
+                .send()
+                .await
+                .map_err(|e| e.to_string())?,
+            "revoke",
+        )
     };
-    let status = response.status(); let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
-    if !status.is_success() { if let Some(path) = backup_path { let _ = fs::remove_file(path); } return Err("directory rejected operator key request".into()); }
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|v| v.as_secs()).unwrap_or(0);
-    let receipt = config_dir().map_err(|e| e.to_string())?.join(format!("operator-{receipt_action}-receipt-{stamp}.json"));
-    write_private_json_new(&receipt, &serde_json::json!({"schema":"iicp.operator-key-receipt.v1","action":receipt_action,"status":body.get("status"),"operator_fingerprint":body.get("operator_fingerprint"),"linked_nodes":body.get("linked_nodes"),"receipt_id_prefix":body.get("receipt_id_prefix")}))?;
-    if let Some(next) = successor { save_operator(&next).map_err(|e| e.to_string())?; let mut migrated = 0; let mut node_names = Vec::new(); for mut node in list_nodes().map_err(|e| e.to_string())? { if node.operator_id == old.operator_id { node.operator_id = next.operator_id.clone(); node_names.push(node.name.clone()); save_node(&node).map_err(|e| e.to_string())?; migrated += 1; } } let handoff = write_operator_handoff_marker(&node_names)?; println!("Operator identity migrated; {migrated} saved node(s) will re-register with the new key. Encrypted old-key backup: {}. Redacted receipt: {}. Supervised handoff marker: {} (one restart pass after 5 minutes).", backup_path.unwrap().display(), receipt.display(), handoff.display()); }
-    else { println!("Operator identity revoked; redacted receipt: {}.", receipt.display()); }
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.unwrap_or(serde_json::Value::Null);
+    if !status.is_success() {
+        if let Some(path) = backup_path {
+            let _ = fs::remove_file(path);
+        }
+        return Err("directory rejected operator key request".into());
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|v| v.as_secs())
+        .unwrap_or(0);
+    let receipt = config_dir()
+        .map_err(|e| e.to_string())?
+        .join(format!("operator-{receipt_action}-receipt-{stamp}.json"));
+    write_private_json_new(
+        &receipt,
+        &serde_json::json!({"schema":"iicp.operator-key-receipt.v1","action":receipt_action,"status":body.get("status"),"operator_fingerprint":body.get("operator_fingerprint"),"linked_nodes":body.get("linked_nodes"),"receipt_id_prefix":body.get("receipt_id_prefix")}),
+    )?;
+    if let Some(next) = successor {
+        save_operator(&next).map_err(|e| e.to_string())?;
+        let mut migrated = 0;
+        let mut node_names = Vec::new();
+        for mut node in list_nodes().map_err(|e| e.to_string())? {
+            if node.operator_id == old.operator_id {
+                node.operator_id = next.operator_id.clone();
+                node_names.push(node.name.clone());
+                save_node(&node).map_err(|e| e.to_string())?;
+                migrated += 1;
+            }
+        }
+        let handoff = write_operator_handoff_marker(&node_names)?;
+        println!("Operator identity migrated; {migrated} saved node(s) will re-register with the new key. Encrypted old-key backup: {}. Redacted receipt: {}. Supervised handoff marker: {} (one restart pass after 5 minutes).", backup_path.unwrap().display(), receipt.display(), handoff.display());
+    } else {
+        println!(
+            "Operator identity revoked; redacted receipt: {}.",
+            receipt.display()
+        );
+    }
     Ok(())
 }
 
@@ -5504,7 +5689,10 @@ mod tests {
             "created_at_unix": 100,
             "grace_seconds": 300,
         });
-        assert_eq!(handoff_restart_delay(&already_requested, "ollama", 400), None);
+        assert_eq!(
+            handoff_restart_delay(&already_requested, "ollama", 400),
+            None
+        );
     }
 
     #[test]

@@ -41,7 +41,11 @@ fn filter_excluded_models(mut models: Vec<String>, excluded: &[String]) -> Vec<S
     if excluded.is_empty() {
         return models;
     }
-    models.retain(|model| !excluded.iter().any(|excluded_model| excluded_model == model));
+    models.retain(|model| {
+        !excluded
+            .iter()
+            .any(|excluded_model| excluded_model == model)
+    });
     models
 }
 
@@ -2377,7 +2381,8 @@ impl IicpNode {
                     };
                     // #494 — probe the backend for the current model list before heartbeat.
                     let live_models = if let Some(ref bu) = hb_backend_url {
-                        probe_health_models_bg(&http, bu, &hb_backend_api_key, &hb_excluded_models).await
+                        probe_health_models_bg(&http, bu, &hb_backend_api_key, &hb_excluded_models)
+                            .await
                     } else {
                         None
                     };

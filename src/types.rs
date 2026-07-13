@@ -81,7 +81,12 @@ impl Default for ClientConfig {
             .unwrap_or(0.05);
         let strategy = std::env::var("IICP_ROUTING_STRATEGY")
             .ok()
-            .filter(|s| matches!(s.as_str(), "deterministic" | "epsilon" | "softmax_top_k" | "weighted_v1"))
+            .filter(|s| {
+                matches!(
+                    s.as_str(),
+                    "deterministic" | "epsilon" | "softmax_top_k" | "weighted_v1"
+                )
+            })
             .unwrap_or_else(|| "epsilon".into());
         let top_k = std::env::var("IICP_ROUTING_TOP_K")
             .ok()

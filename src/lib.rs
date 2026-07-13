@@ -55,8 +55,8 @@ pub mod operator_crypto;
 pub mod peer_manager;
 pub mod policy;
 pub mod policy_manifest;
-pub mod profile_compatibility;
 pub mod pricing;
+pub mod profile_compatibility;
 pub mod recovery;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_session;

@@ -123,9 +123,8 @@ pub type OnBindFn = Arc<
 /// Callback invoked after a previously bound relay session ends.  Consumers use
 /// this to distinguish a configured relay from a relay route that is currently
 /// carrying a live worker session.
-pub type OnDisconnectFn = Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type OnDisconnectFn =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Relay worker client — connects outbound to a relay, handles CALL frames.
 pub struct RelayWorkerClient {

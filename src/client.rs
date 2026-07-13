@@ -225,7 +225,10 @@ impl IicpClient {
             if is_safe_query_param(&profile.profile_id)
                 && is_safe_query_param(&profile.profile_version)
                 && profile.profile_fixture_sha256.len() == 64
-                && profile.profile_fixture_sha256.chars().all(|c| c.is_ascii_hexdigit())
+                && profile
+                    .profile_fixture_sha256
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit())
             {
                 url.push_str(&format!(
                     "&profile_id={}&profile_version={}&profile_fixture_sha256={}&profile_required={}",
@@ -396,8 +399,18 @@ impl IicpClient {
         }
 
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
-        let nodes = if self.config.route_discovery_mode == "legacy" || self.config.profile_request.is_some() {
-            self.discover(&request.intent, Some(DiscoverOptions { profile_request: self.config.profile_request.clone(), ..Default::default() }), Some(&tp)).await?
+        let nodes = if self.config.route_discovery_mode == "legacy"
+            || self.config.profile_request.is_some()
+        {
+            self.discover(
+                &request.intent,
+                Some(DiscoverOptions {
+                    profile_request: self.config.profile_request.clone(),
+                    ..Default::default()
+                }),
+                Some(&tp),
+            )
+            .await?
         } else {
             match self
                 .ticketed_candidates(&request.intent, &DiscoverOptions::default(), &tp)
@@ -499,13 +512,26 @@ impl IicpClient {
             } else if self.config.routing_strategy == "weighted_v1" {
                 let top_k = self.config.routing_top_k.max(1).min(safe_nodes.len());
                 let index = weighted_v1_index(
-                    &safe_nodes[..top_k].iter().map(|node| node.score).collect::<Vec<_>>(),
-                    &safe_nodes[..top_k].iter().map(|node| node.load).collect::<Vec<_>>(),
+                    &safe_nodes[..top_k]
+                        .iter()
+                        .map(|node| node.score)
+                        .collect::<Vec<_>>(),
+                    &safe_nodes[..top_k]
+                        .iter()
+                        .map(|node| node.load)
+                        .collect::<Vec<_>>(),
                     rng.gen::<f64>(),
                 );
                 let chosen = safe_nodes[index].clone();
                 let mut c = vec![chosen.clone()];
-                c.extend(safe_nodes.iter().take(max_retries).filter(|node| node.node_id != chosen.node_id).take(max_retries - 1).cloned());
+                c.extend(
+                    safe_nodes
+                        .iter()
+                        .take(max_retries)
+                        .filter(|node| node.node_id != chosen.node_id)
+                        .take(max_retries - 1)
+                        .cloned(),
+                );
                 c
             } else if self.config.routing_strategy == "softmax_top_k" {
                 let top_k = self.config.routing_top_k.max(1).min(safe_nodes.len());
@@ -620,7 +646,13 @@ impl IicpClient {
                         resp.dispatch_ticket_id_prefix = node.dispatch_ticket_id_prefix.clone();
                         resp.routing_receipt = Some(RoutingReceipt {
                             receipt_version: "iicp-routing-receipt-v1".into(),
-                            selection_profile: if profile_negotiation.is_some() || self.config.route_discovery_mode == "legacy" { self.config.routing_strategy.clone() } else { "directory_ticket_v1".into() },
+                            selection_profile: if profile_negotiation.is_some()
+                                || self.config.route_discovery_mode == "legacy"
+                            {
+                                self.config.routing_strategy.clone()
+                            } else {
+                                "directory_ticket_v1".into()
+                            },
                             eligible_candidate_count,
                             selected_node_id_prefix: node_short_id(&node.node_id).to_string(),
                             profile_negotiation: profile_negotiation.clone(),

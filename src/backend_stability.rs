@@ -111,10 +111,15 @@ fn model_matches(candidate: &str, expected_model: Option<&str>) -> bool {
 
 /// MeshLLM's OpenAI model inventory is authoritative for its currently
 /// routable local/mesh-backed models. Its internal topology stays opaque.
-pub fn parse_meshllm_models(data: &Value, expected_model: Option<&str>) -> BackendStabilityObservation {
+pub fn parse_meshllm_models(
+    data: &Value,
+    expected_model: Option<&str>,
+) -> BackendStabilityObservation {
     let Some(models) = data.get("data").and_then(Value::as_array) else {
         return BackendStabilityObservation::draining(
-            "backend_loading", now_s() + 30, json!({"ready": false}),
+            "backend_loading",
+            now_s() + 30,
+            json!({"ready": false}),
         );
     };
     let present = models
@@ -123,7 +128,9 @@ pub fn parse_meshllm_models(data: &Value, expected_model: Option<&str>) -> Backe
         .any(|id| model_matches(id, expected_model));
     if expected_model.is_some() && !present {
         return BackendStabilityObservation::draining(
-            "backend_loading", now_s() + 30, json!({"selected_model_ready": false}),
+            "backend_loading",
+            now_s() + 30,
+            json!({"selected_model_ready": false}),
         );
     }
     BackendStabilityObservation::ok()
@@ -269,17 +276,45 @@ pub async fn observe_backend_stability(
         }
     };
     if flavor == "meshllm" {
-        match add_auth(http.get(format!("{root}/readyz")).timeout(std::time::Duration::from_secs(2))).send().await {
+        match add_auth(
+            http.get(format!("{root}/readyz"))
+                .timeout(std::time::Duration::from_secs(2)),
+        )
+        .send()
+        .await
+        {
             Ok(resp) if resp.status().is_success() => {}
-            _ => return BackendStabilityObservation::draining(
-                "backend_loading", now_s() + 30, json!({"ready": false}),
-            ),
+            _ => {
+                return BackendStabilityObservation::draining(
+                    "backend_loading",
+                    now_s() + 30,
+                    json!({"ready": false}),
+                )
+            }
         }
-        return match add_auth(http.get(format!("{root}/v1/models")).timeout(std::time::Duration::from_secs(2))).send().await {
-            Ok(resp) if resp.status().is_success() => resp.json::<Value>().await
+        return match add_auth(
+            http.get(format!("{root}/v1/models"))
+                .timeout(std::time::Duration::from_secs(2)),
+        )
+        .send()
+        .await
+        {
+            Ok(resp) if resp.status().is_success() => resp
+                .json::<Value>()
+                .await
                 .map(|value| parse_meshllm_models(&value, expected_model))
-                .unwrap_or_else(|_| BackendStabilityObservation::draining("backend_loading", now_s() + 30, json!({"ready": false}))),
-            _ => BackendStabilityObservation::draining("backend_loading", now_s() + 30, json!({"ready": false})),
+                .unwrap_or_else(|_| {
+                    BackendStabilityObservation::draining(
+                        "backend_loading",
+                        now_s() + 30,
+                        json!({"ready": false}),
+                    )
+                }),
+            _ => BackendStabilityObservation::draining(
+                "backend_loading",
+                now_s() + 30,
+                json!({"ready": false}),
+            ),
         };
     }
     if flavor == "ollama" || flavor.is_empty() {
@@ -349,9 +384,15 @@ mod tests {
 
     #[test]
     fn meshllm_requires_the_selected_model_in_its_ready_inventory() {
-        let ready = parse_meshllm_models(&json!({"data":[{"id":"stable-model"}]}), Some("stable-model"));
+        let ready = parse_meshllm_models(
+            &json!({"data":[{"id":"stable-model"}]}),
+            Some("stable-model"),
+        );
         assert_eq!(ready.backend_state, "ok");
-        let missing = parse_meshllm_models(&json!({"data":[{"id":"other-model"}]}), Some("stable-model"));
+        let missing = parse_meshllm_models(
+            &json!({"data":[{"id":"other-model"}]}),
+            Some("stable-model"),
+        );
         assert_eq!(missing.backend_state, "draining");
         assert_eq!(missing.reason_class, "backend_loading");
     }

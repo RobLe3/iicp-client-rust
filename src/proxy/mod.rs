@@ -209,6 +209,10 @@ fn ai_generated(mut response: Response) -> Response {
 }
 
 // ── dispatch ─────────────────────────────────────────────────────────────────
+// `TaskResponse` is intentionally returned by value on the common successful
+// path. Boxing it here would add an allocation to every proxy response solely
+// to optimise the much smaller error variant.
+#[allow(clippy::large_enum_variant)]
 enum Outcome {
     Ok(TaskResponse),
     Err(StatusCode, String),

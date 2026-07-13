@@ -32,26 +32,60 @@ pub fn evaluate_pre_normative_profile(
             return reject("schema_digest_mismatch");
         }
     }
-    for extension in request.get("extensions").and_then(Value::as_array).into_iter().flatten() {
-        if extension.get("required").and_then(Value::as_bool) != Some(true) { continue; }
+    for extension in request
+        .get("extensions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if extension.get("required").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
         if extension.get("experimental").and_then(Value::as_bool) == Some(true)
-            && extension.get("review_expires_at_s").and_then(Value::as_i64).unwrap_or_default() <= now_s {
+            && extension
+                .get("review_expires_at_s")
+                .and_then(Value::as_i64)
+                .unwrap_or_default()
+                <= now_s
+        {
             return reject("experimental_extension_expired");
         }
         let uri = extension.get("uri").and_then(Value::as_str);
-        let supported = provider.get("extensions").and_then(Value::as_array).is_some_and(|items| {
-            items.iter().any(|item| item.get("uri").and_then(Value::as_str) == uri)
-        });
-        if !supported { return reject("required_extension_missing"); }
+        let supported = provider
+            .get("extensions")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items
+                    .iter()
+                    .any(|item| item.get("uri").and_then(Value::as_str) == uri)
+            });
+        if !supported {
+            return reject("required_extension_missing");
+        }
     }
-    ProfileCompatibilityDecision { eligible: true, reason: "compatible" }
+    ProfileCompatibilityDecision {
+        eligible: true,
+        reason: "compatible",
+    }
 }
 
-fn reject(reason: &'static str) -> ProfileCompatibilityDecision { ProfileCompatibilityDecision { eligible: false, reason } }
+fn reject(reason: &'static str) -> ProfileCompatibilityDecision {
+    ProfileCompatibilityDecision {
+        eligible: false,
+        reason,
+    }
+}
 
 fn resolve<'a>(intent: Option<&'a str>, aliases: &'a Value) -> Option<&'a str> {
     let intent = intent?;
-    aliases.as_array().and_then(|items| items.iter().find_map(|item| {
-        (item.get("from").and_then(Value::as_str) == Some(intent)).then(|| item.get("to").and_then(Value::as_str)).flatten()
-    })).or(Some(intent))
+    aliases
+        .as_array()
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                (item.get("from").and_then(Value::as_str) == Some(intent))
+                    .then(|| item.get("to").and_then(Value::as_str))
+                    .flatten()
+            })
+        })
+        .or(Some(intent))
 }

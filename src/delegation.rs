@@ -246,10 +246,19 @@ mod tests {
     fn rotation_old_key_signature_excludes_successor_proof() {
         let fields = BTreeMap::from([
             ("operator_pub".to_string(), Value::String("old".to_string())),
-            ("new_operator_pub".to_string(), Value::String("new".to_string())),
-            ("nonce".to_string(), Value::String("nonce-1234567890".to_string())),
+            (
+                "new_operator_pub".to_string(),
+                Value::String("new".to_string()),
+            ),
+            (
+                "nonce".to_string(),
+                Value::String("nonce-1234567890".to_string()),
+            ),
             ("ts".to_string(), Value::from(1_893_456_000_i64)),
-            ("new_key_sig".to_string(), Value::String("must-not-be-signed-by-old-key".to_string())),
+            (
+                "new_key_sig".to_string(),
+                Value::String("must-not-be-signed-by-old-key".to_string()),
+            ),
         ]);
         let bytes = canonical_operator_self_service_bytes("key_rotate", &fields);
         assert!(!String::from_utf8(bytes).unwrap().contains("new_key_sig"));

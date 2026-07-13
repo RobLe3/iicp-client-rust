@@ -68,17 +68,30 @@ mod tests {
     }
 }
 
-    #[test]
-    fn canonical_fixture_vectors_fail_closed() {
-        let f: serde_json::Value = serde_json::from_str(include_str!("../parity/dispatch-route-ticket-v1.json")).unwrap();
-        for vector in f["validation_vectors"].as_array().unwrap() {
-            let token = match vector["token"].as_str().unwrap() {
-                "valid" => f["valid"]["token"].as_str().unwrap().to_string(),
-                "valid+0" => format!("{}0", f["valid"]["token"].as_str().unwrap()),
-                "wrong_audience" => f["wrong_audience"]["token"].as_str().unwrap().to_string(),
-                other => other.to_string(),
-            };
-            let result = verify_dispatch_route_ticket(&token, f["public_key_hex"].as_str().unwrap(), vector["issuer"].as_str().unwrap(), vector["node_id"].as_str().unwrap(), vector["intent"].as_str().unwrap(), vector["now_s"].as_i64().unwrap());
-            assert_eq!(result.is_some(), vector["expected"] == "valid", "{}", vector["name"].as_str().unwrap());
-        }
+#[test]
+fn canonical_fixture_vectors_fail_closed() {
+    let f: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/dispatch-route-ticket-v1.json")).unwrap();
+    for vector in f["validation_vectors"].as_array().unwrap() {
+        let token = match vector["token"].as_str().unwrap() {
+            "valid" => f["valid"]["token"].as_str().unwrap().to_string(),
+            "valid+0" => format!("{}0", f["valid"]["token"].as_str().unwrap()),
+            "wrong_audience" => f["wrong_audience"]["token"].as_str().unwrap().to_string(),
+            other => other.to_string(),
+        };
+        let result = verify_dispatch_route_ticket(
+            &token,
+            f["public_key_hex"].as_str().unwrap(),
+            vector["issuer"].as_str().unwrap(),
+            vector["node_id"].as_str().unwrap(),
+            vector["intent"].as_str().unwrap(),
+            vector["now_s"].as_i64().unwrap(),
+        );
+        assert_eq!(
+            result.is_some(),
+            vector["expected"] == "valid",
+            "{}",
+            vector["name"].as_str().unwrap()
+        );
     }
+}
