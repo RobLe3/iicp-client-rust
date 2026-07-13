@@ -482,12 +482,20 @@ IICP_AUTO_DETECT_NAT=false              # disable detection entirely
 IICP_PUBLIC_ENDPOINT=http://x.x.x.x:8020  # trust this endpoint
 IICP_TUNNEL=0                           # opt out of Quick Tunnel fallback
 IICP_TUNNEL_CREATE_MIN_INTERVAL_S=120   # host-wide Quick Tunnel create pacing
-IICP_TUNNEL_DEAD_POLICY=auto             # auto|retry|exit|log-only (auto = supervised exit, manual retry)
+IICP_TUNNEL_CREATE_JITTER_MAX_S=15       # randomized suffix after shared deadlines
+IICP_TUNNEL_WAIT_FOR_CAPACITY=1          # default: wait through local/provider cooldowns
+IICP_TUNNEL_DEAD_POLICY=auto             # auto|retry|exit|log-only (unrecoverable dead-state policy)
 IICP_SUPERVISED=1                        # set by generated services/Docker so supervisors can restart
 IICP_AUTO_UPDATE=1                       # hourly provider self-update; set 0 to disable
 IICP_AUTO_UPDATE_INTERVAL_S=3600         # update cadence in seconds; minimum 300
 IICP_RELAY_WORKER_ENDPOINT=host:9485    # specific relay instead of auto-elect
 ```
+
+When several nodes on one host wake or recover together, they share a local creation
+lease and cooldown state. A node waits until the authoritative deadline, then adds a
+small randomized delay before attempting its own Quick Tunnel. This prevents a restart
+storm without advertising an unverified direct route. Set
+`IICP_TUNNEL_WAIT_FOR_CAPACITY=0` only for diagnostics that need the raw cooldown error.
 
 ### Publish a signed node policy
 

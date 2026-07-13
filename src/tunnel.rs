@@ -15,6 +15,7 @@
 //! (`close()` idempotent; Drop kills the child so a normal exit never
 //! orphans it).
 
+use rand::Rng;
 use std::collections::VecDeque;
 use std::fs;
 use std::io::BufRead;
@@ -47,6 +48,10 @@ pub const TUNNEL_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(15 * 60);
 /// IICP services must therefore avoid a create/verify/kill thundering herd.
 pub const TUNNEL_CREATE_MIN_INTERVAL: Duration = Duration::from_secs(120);
 pub const TUNNEL_CREATE_LEASE: Duration = Duration::from_secs(45);
+/// Random delay added after a shared creation deadline.  This is deliberately
+/// small: the persistent deadline remains authoritative, while the jitter keeps
+/// services that woke together from immediately colliding again.
+pub const TUNNEL_CREATE_JITTER_MAX: Duration = Duration::from_secs(15);
 
 static QUICK_TUNNEL_RATE_LIMIT_UNTIL: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
 
@@ -221,6 +226,42 @@ fn quick_tunnel_create_lease_duration() -> Duration {
         .filter(|v| *v > 0)
         .map(Duration::from_secs)
         .unwrap_or(TUNNEL_CREATE_LEASE)
+}
+
+fn quick_tunnel_create_jitter_max() -> Duration {
+    std::env::var("IICP_TUNNEL_CREATE_JITTER_MAX_S")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(TUNNEL_CREATE_JITTER_MAX)
+}
+
+fn quick_tunnel_wait_for_capacity() -> bool {
+    !matches!(
+        std::env::var("IICP_TUNNEL_WAIT_FOR_CAPACITY")
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("0" | "false" | "no")
+    )
+}
+
+/// Return a decorrelated wait after a shared cooldown/lease deadline.
+///
+/// We must never retry *before* `remaining`, because that value represents a
+/// host-wide or provider-enforced deadline.  The randomized suffix is the
+/// CMA/CD-style collision-avoidance part: simultaneously restarted services do
+/// not all attempt creation at the exact same instant after the deadline.
+fn quick_tunnel_wait_with_jitter(remaining: Duration) -> Duration {
+    let max_jitter = quick_tunnel_create_jitter_max();
+    if max_jitter.is_zero() {
+        return remaining;
+    }
+    let upper_ms = max_jitter.as_millis().min(u64::MAX as u128) as u64;
+    let jitter_ms = rand::thread_rng().gen_range(0..=upper_ms);
+    remaining.saturating_add(Duration::from_millis(jitter_ms))
 }
 
 fn clear_create_gate_if_safe() {
@@ -1011,27 +1052,38 @@ fn spawn_and_parse(
     timeout: Duration,
     binary: &Path,
 ) -> Result<(Child, String), String> {
-    if let Some(remaining) = quick_tunnel_rate_limit_remaining() {
-        return Err(format!(
-            "accountless Quick Tunnel creation paused for {}s after Cloudflare rate limiting; \
-             retry later or configure a named tunnel / IICP_PUBLIC_ENDPOINT",
-            remaining.as_secs().max(1)
-        ));
-    }
-    if let Some(remaining) = quick_tunnel_create_gate_remaining() {
-        return Err(format!(
-            "accountless Quick Tunnel creation paced for {}s to avoid Cloudflare rate limits; \
-             falling back to the previous reachability method while the tunnel budget recovers",
-            remaining.as_secs().max(1)
-        ));
-    }
-    let _create_lease = acquire_quick_tunnel_create_lease().map_err(|remaining| {
-        format!(
-            "accountless Quick Tunnel creation held by another local IICP node for {}s; \
-             falling back to the previous reachability method",
-            remaining.as_secs().max(1)
-        )
-    })?;
+    // The coordinator is deliberately inside the tunnel opener rather than in
+    // service wrappers.  That makes startup and elastic-watchdog respawns obey
+    // the same host-wide budget, and prevents launchd/systemd restart storms.
+    let _create_lease = loop {
+        let wait_reason = if let Some(remaining) = quick_tunnel_rate_limit_remaining() {
+            Some((remaining, "Cloudflare rate-limit cooldown"))
+        } else if let Some(remaining) = quick_tunnel_create_gate_remaining() {
+            Some((remaining, "shared Quick Tunnel pacing"))
+        } else {
+            match acquire_quick_tunnel_create_lease() {
+                Ok(lease) => break lease,
+                Err(remaining) => {
+                    Some((remaining, "another local IICP node holds the create lease"))
+                }
+            }
+        };
+
+        let (remaining, reason) =
+            wait_reason.expect("loop either acquires a lease or has a wait reason");
+        if !quick_tunnel_wait_for_capacity() {
+            return Err(format!(
+                "accountless Quick Tunnel creation delayed for {}s by {reason}",
+                remaining.as_secs().max(1)
+            ));
+        }
+        let wait = quick_tunnel_wait_with_jitter(remaining);
+        eprintln!(
+            "[quick-tunnel] waiting {}s for {reason}; shared jitter avoids synchronized retries.",
+            wait.as_secs().max(1)
+        );
+        std::thread::sleep(wait);
+    };
     // Record the attempt before spawning cloudflared. This intentionally spaces
     // both successful and failed creations across local nodes; otherwise a restart
     // storm can hit Cloudflare before a 429/1015 cooldown marker exists.
@@ -1164,6 +1216,8 @@ mod tests {
         let old_cooldown = std::env::var_os("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S");
         let old_create_interval = std::env::var_os("IICP_TUNNEL_CREATE_MIN_INTERVAL_S");
         let old_create_lease = std::env::var_os("IICP_TUNNEL_CREATE_LEASE_S");
+        let old_wait_for_capacity = std::env::var_os("IICP_TUNNEL_WAIT_FOR_CAPACITY");
+        let old_create_jitter = std::env::var_os("IICP_TUNNEL_CREATE_JITTER_MAX_S");
         let path = std::env::temp_dir().join(format!(
             "iicp-quick-tunnel-cooldown-{}.json",
             uuid::Uuid::new_v4()
@@ -1182,6 +1236,8 @@ mod tests {
         std::env::set_var("IICP_TUNNEL_RATE_LIMIT_COOLDOWN_S", "60");
         std::env::set_var("IICP_TUNNEL_CREATE_MIN_INTERVAL_S", "60");
         std::env::set_var("IICP_TUNNEL_CREATE_LEASE_S", "30");
+        std::env::set_var("IICP_TUNNEL_WAIT_FOR_CAPACITY", "0");
+        std::env::set_var("IICP_TUNNEL_CREATE_JITTER_MAX_S", "0");
         *quick_tunnel_rate_limit_store().lock().unwrap() = None;
         clear_persistent_rate_limit_if_safe();
         clear_create_gate_if_safe();
@@ -1216,6 +1272,14 @@ mod tests {
         match old_create_lease {
             Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_LEASE_S", value),
             None => std::env::remove_var("IICP_TUNNEL_CREATE_LEASE_S"),
+        }
+        match old_wait_for_capacity {
+            Some(value) => std::env::set_var("IICP_TUNNEL_WAIT_FOR_CAPACITY", value),
+            None => std::env::remove_var("IICP_TUNNEL_WAIT_FOR_CAPACITY"),
+        }
+        match old_create_jitter {
+            Some(value) => std::env::set_var("IICP_TUNNEL_CREATE_JITTER_MAX_S", value),
+            None => std::env::remove_var("IICP_TUNNEL_CREATE_JITTER_MAX_S"),
         }
 
         match result {
@@ -1315,6 +1379,21 @@ mod tests {
                 acquire_quick_tunnel_create_lease().is_ok(),
                 "lease should release on drop"
             );
+        });
+    }
+
+    #[test]
+    fn shared_creation_wait_never_retries_before_the_deadline() {
+        with_temp_rate_limit_state(|| {
+            let remaining = Duration::from_millis(25);
+            assert_eq!(quick_tunnel_wait_with_jitter(remaining), remaining);
+
+            std::env::set_var("IICP_TUNNEL_CREATE_JITTER_MAX_S", "1");
+            for _ in 0..32 {
+                let wait = quick_tunnel_wait_with_jitter(remaining);
+                assert!(wait >= remaining);
+                assert!(wait <= remaining + Duration::from_secs(1));
+            }
         });
     }
 
