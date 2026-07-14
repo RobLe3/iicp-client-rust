@@ -403,7 +403,7 @@ fn pre_normative_profile_fixture_has_portable_reasons() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../parity/profile-compatibility-v0.json"))
             .expect("profile fixture must be valid JSON");
-    assert_eq!(fixture["fixture_version"], "0.3.0-draft");
+    assert_eq!(fixture["fixture_version"], "0.4.0-draft");
     assert_eq!(fixture["status"], "pre-normative");
     assert_eq!(
         fixture["result_contract"]["unsupported_status"],
@@ -412,7 +412,7 @@ fn pre_normative_profile_fixture_has_portable_reasons() {
     let scenarios = fixture["scenarios"]
         .as_array()
         .expect("scenarios must be an array");
-    assert_eq!(scenarios.len(), 11);
+    assert_eq!(scenarios.len(), 15);
     assert!(scenarios
         .iter()
         .all(|scenario| scenario["expected_reason"].is_string()));
@@ -489,7 +489,7 @@ fn profile_negotiation_fixture_preserves_legacy_and_required_fail_closed_boundar
     assert_eq!(fixture["fixture_version"], "0.2.0-draft");
     assert_eq!(
         fixture["profile_fixture_sha256"],
-        "4137ecf91b4748a2b368cf4428b4604c6947f8879d77402cc7937d11d24b2aaf"
+        "d039eaf52afca6866832779261db7bdd2ffd818a36bc8ba9aea1db0c9c115012"
     );
     for case in fixture["cases"].as_array().unwrap() {
         let requested = case["expected"]["requested"].as_bool().unwrap_or(true);
