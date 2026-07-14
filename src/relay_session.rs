@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ciborium::value::Value as CborVal;
 use serde_json::Value;
@@ -341,15 +341,55 @@ impl RelaySession {
 /// Red-team F5 (2026-06-12): cap concurrent relay sessions so a bind-flood
 /// can't exhaust relay memory / starve legitimate workers.
 pub const MAX_RELAY_SESSIONS: usize = 256;
+pub const DEFAULT_RELAY_BIND_RATE_LIMIT: u32 = 30;
+const RELAY_BIND_RATE_WINDOW: Duration = Duration::from_secs(60);
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct RelaySessionRegistry {
     sessions: Arc<Mutex<HashMap<String, RelaySession>>>,
+    bind_rate_limit: u32,
+    bind_rate_buckets: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
+}
+
+impl Default for RelaySessionRegistry {
+    fn default() -> Self {
+        let bind_rate_limit = std::env::var("IICP_RELAY_BIND_RATE_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(DEFAULT_RELAY_BIND_RATE_LIMIT);
+        Self::with_bind_rate_limit(bind_rate_limit)
+    }
 }
 
 impl RelaySessionRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_bind_rate_limit(bind_rate_limit: u32) -> Self {
+        Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
+            bind_rate_limit,
+            bind_rate_buckets: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Bound bind attempts per transport source without persisting or logging it.
+    pub fn allow_bind(&self, source: &str, rebind: bool, now: Instant) -> bool {
+        if rebind || self.bind_rate_limit == 0 {
+            return true;
+        }
+        let mut buckets = self.bind_rate_buckets.lock().unwrap();
+        let entry = buckets.entry(source.to_string()).or_insert((now, 0));
+        if now.duration_since(entry.0) >= RELAY_BIND_RATE_WINDOW {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        let allowed = entry.1 <= self.bind_rate_limit;
+        if buckets.len() > 4096 {
+            buckets.retain(|_, (start, _)| now.duration_since(*start) < RELAY_BIND_RATE_WINDOW);
+        }
+        allowed
     }
 
     /// True if a NEW worker_id can't be admitted (cap reached). A rebind of an
@@ -533,10 +573,10 @@ async fn handle_relay_connection(
     bind_ticket_public_key_hex: Option<String>,
     relay_node_id: String,
 ) -> Result<(), String> {
-    let peer = stream
+    let source = stream
         .peer_addr()
-        .map(|p| p.to_string())
-        .unwrap_or_else(|_| "?".into());
+        .map(|peer| peer.ip().to_string())
+        .unwrap_or_else(|_| "unknown".into());
     let (mut reader, mut writer) = stream.into_split();
 
     // Step 1: INIT/ACK
@@ -610,10 +650,8 @@ async fn handle_relay_connection(
     if let Some(existing) = registry.get(&worker_id) {
         if existing.is_alive() {
             tracing::warn!(
-                "Relay: rejected RELAY_BIND for worker={} from {}: \
-                 worker_id already bound to an alive session (#510)",
-                worker_id,
-                peer
+                "Relay: rejected RELAY_BIND for worker={}: worker_id already bound to an alive session (#510)",
+                worker_id
             );
             let nack = cbor_encode_int_map(&[
                 (1, CborVal::Text("error".into())),
@@ -629,6 +667,20 @@ async fn handle_relay_connection(
                 .map_err(|e| e.to_string())?;
             return Ok(());
         }
+    }
+
+    let rebind = registry.get(&worker_id).is_some();
+    if !registry.allow_bind(&source, rebind, Instant::now()) {
+        let nack = cbor_encode_int_map(&[
+            (1, CborVal::Text("error".into())),
+            (2, CborVal::Text(worker_id.clone())),
+            (3, CborVal::Text("relay_bind_rate_limited".into())),
+        ]);
+        writer
+            .write_all(&make_frame(MT_RELAY_ACK, &nack))
+            .await
+            .map_err(|e| e.to_string())?;
+        return Ok(());
     }
 
     // Red-team F5: cap concurrent sessions (bind-flood DoS). Rebind exempt.
@@ -739,6 +791,33 @@ async fn relay_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bind_rate_limit_is_per_source_and_recovers() {
+        let registry = RelaySessionRegistry::with_bind_rate_limit(2);
+        let now = Instant::now();
+        assert!(registry.allow_bind("source-a", false, now));
+        assert!(registry.allow_bind("source-a", false, now));
+        assert!(!registry.allow_bind("source-a", false, now));
+        assert!(registry.allow_bind("source-b", false, now));
+        assert!(registry.allow_bind(
+            "source-a",
+            false,
+            now + RELAY_BIND_RATE_WINDOW + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn bind_rate_limit_exempts_recovery_and_can_be_disabled() {
+        let registry = RelaySessionRegistry::with_bind_rate_limit(1);
+        let now = Instant::now();
+        assert!(registry.allow_bind("source-a", false, now));
+        assert!(registry.allow_bind("source-a", true, now));
+        let disabled = RelaySessionRegistry::with_bind_rate_limit(0);
+        for _ in 0..100 {
+            assert!(disabled.allow_bind("source-a", false, now));
+        }
+    }
     use serde_json::json;
 
     #[cfg(feature = "iicp-tcp")]

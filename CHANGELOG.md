@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
+## [Unreleased]
+
+### Added — relay abuse resistance and encrypted responses
+- Relay binds are rate-limited per source principal without logging raw source addresses; recovery of a dead bound session remains exempt.
+- Nodes advertise and negotiate `response_encryption_v1`; direct and relay-routed tasks return authenticated encrypted responses when explicitly negotiated, while downlevel peers retain Tier-1 compatibility.
+
 ## [0.7.89] — 2026-07-14
 
 ### Fixed — coordinated Quick Tunnel recovery

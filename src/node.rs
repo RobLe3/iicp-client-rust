@@ -460,6 +460,8 @@ pub struct TaskRequest {
     pub payload: Value,
     #[serde(default)]
     pub iicp_conf: Option<HashMap<String, Value>>,
+    #[serde(default)]
+    pub cx_response_encryption: Option<String>,
     pub constraints: Option<Value>,
     pub auth: Option<Value>,
     pub nonce: Option<String>,
@@ -496,6 +498,8 @@ pub struct TaskResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iicp_conf_resp: Option<HashMap<String, Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<Value>,
     pub generated_by_ai: bool,
@@ -875,6 +879,27 @@ async fn relay_bind_endpoint(
                 Json(json!({"error":{"code":"IICP-E038","message":"worker_id has an alive relay session — rebind rejected"}})),
             ).into_response());
         }
+    }
+    let rebind = state.relay_sessions.get(worker_id).is_some();
+    // The single-port HTTP splice intentionally hides the original socket
+    // address from axum.  Use the worker principal here; native binds use the
+    // peer IP. Strict bind tickets make this principal directory-authenticated.
+    let source = format!("worker:{worker_id}");
+    if !state
+        .relay_sessions
+        .allow_bind(&source, rebind, Instant::now())
+    {
+        return relay_cors(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error":{
+                    "code":"IICP-E039",
+                    "reason":"relay_bind_rate_limited",
+                    "message":"relay bind rate limit exceeded"
+                }})),
+            )
+                .into_response(),
+        );
     }
     // Red-team F5: reject new binds past the session cap (bind-flood DoS).
     if state.relay_sessions.at_capacity(worker_id) {
@@ -1317,16 +1342,19 @@ async fn task_endpoint(
             .into_response();
     }
 
+    let mut cx_shared_secret: Option<[u8; 32]> = None;
     if req.payload.is_null() {
         if let Some(conf) = req.iicp_conf.as_ref() {
             match state
                 .cx_private_key
                 .as_ref()
                 .ok_or_else(|| IicpError::Node("node has no CX private key".to_string()))
-                .and_then(|private_key| crate::confidentiality::decrypt_payload(conf, private_key))
-            {
-                Ok(payload) => {
+                .and_then(|private_key| {
+                    crate::confidentiality::decrypt_payload_with_context(conf, private_key)
+                }) {
+                Ok((payload, shared_secret)) => {
                     req.payload = payload;
+                    cx_shared_secret = Some(shared_secret);
                 }
                 Err(err) => {
                     state.active_jobs.fetch_sub(1, Ordering::Relaxed);
@@ -1351,6 +1379,20 @@ async fn task_endpoint(
     }
 
     let task_id = req.task_id.clone();
+    let cx_response_encryption_required = req.cx_response_encryption.as_deref() == Some("required");
+    if cx_response_encryption_required && cx_shared_secret.is_none() {
+        state.active_jobs.fetch_sub(1, Ordering::Relaxed);
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "code": "IICP-CX-03",
+                    "message": "encrypted response requested without an encrypted request",
+                }
+            })),
+        )
+            .into_response();
+    }
     // #488: snapshot before req is moved into handler.
     let querying_node_id = req.source_node_id.clone();
     // ADR-014 TRACE-02 — iicp.task.execute span via `tracing` crate.
@@ -1404,13 +1446,55 @@ async fn task_endpoint(
                     querying_node_id,
                 ));
             }
+            let plain_response = json!({
+                "task_id": task_id,
+                "status": "success",
+                "result": value,
+                "generated_by_ai": true
+            });
+            let encrypted_response = if cx_response_encryption_required {
+                cx_shared_secret
+                    .as_ref()
+                    .map(|secret| {
+                        crate::confidentiality::encrypt_response(&plain_response, secret, &task_id)
+                    })
+                    .transpose()
+            } else {
+                Ok(None)
+            };
+            let encrypted_response = match encrypted_response {
+                Ok(value) => value,
+                Err(err) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(TaskResponse {
+                            task_id,
+                            status: "error".into(),
+                            result: None,
+                            iicp_conf_resp: None,
+                            error: Some(json!({"message": err.to_string()})),
+                            generated_by_ai: false,
+                        }),
+                    )
+                        .into_response();
+                }
+            };
             Json(TaskResponse {
                 task_id,
                 // Spec iicp-dir.md §task response: status ∈ {success, failure, timeout};
                 // matches the Python adapter ("success"). Was "completed" — a cross-flavour
                 // drift (spec-violating) surfaced by the first real client-inference test.
-                status: "success".into(),
-                result: Some(value),
+                status: if encrypted_response.is_some() {
+                    "encrypted".into()
+                } else {
+                    "success".into()
+                },
+                result: if encrypted_response.is_some() {
+                    None
+                } else {
+                    Some(value)
+                },
+                iicp_conf_resp: encrypted_response,
                 error: None,
                 generated_by_ai: true,
             })
@@ -1430,6 +1514,7 @@ async fn task_endpoint(
                     task_id,
                     status: "error".into(),
                     result: None,
+                    iicp_conf_resp: None,
                     error: Some(json!({ "message": e.to_string() })),
                     generated_by_ai: false,
                 }),
@@ -2797,11 +2882,13 @@ impl IicpNode {
             let relay_saved_node_name = self.saved_node_name.clone();
             let relay_registered_endpoint = Arc::clone(&self.registered_endpoint);
             let relay_bound_arc = Arc::clone(&self.runtime_relay_bound);
-            let handler_fn: crate::relay_worker_client::RelayHandlerFn =
-                Arc::new(move |task: Value| {
+            let relay_cx_private_key = self.cx_private_key.clone();
+            let handler_fn: crate::relay_worker_client::RelayHandlerFn = Arc::new(
+                move |task: Value| {
                     let h = Arc::clone(&handler_for_relay);
+                    let cx_private_key = relay_cx_private_key.clone();
                     Box::pin(async move {
-                        let req = crate::node::TaskRequest {
+                        let mut req = crate::node::TaskRequest {
                             task_id: task
                                 .get("task_id")
                                 .and_then(|v| v.as_str())
@@ -2816,6 +2903,10 @@ impl IicpNode {
                             iicp_conf: task
                                 .get("iicp_conf")
                                 .and_then(|v| serde_json::from_value(v.clone()).ok()),
+                            cx_response_encryption: task
+                                .get("cx_response_encryption")
+                                .and_then(|value| value.as_str())
+                                .map(str::to_string),
                             constraints: task.get("constraints").cloned(),
                             auth: task.get("auth").cloned(),
                             nonce: None,
@@ -2825,11 +2916,78 @@ impl IicpNode {
                                 .map(|s| s.to_string()),
                             _trace: None,
                         };
-                        h(req)
+                        let mut shared_secret = None;
+                        if req.payload.is_null() {
+                            if let Some(conf) = req.iicp_conf.as_ref() {
+                                match cx_private_key
+                                    .as_ref()
+                                    .ok_or_else(|| {
+                                        IicpError::Node("node has no CX private key".to_string())
+                                    })
+                                    .and_then(|key| {
+                                        crate::confidentiality::decrypt_payload_with_context(
+                                            conf, key,
+                                        )
+                                    }) {
+                                    Ok((payload, secret)) => {
+                                        req.payload = payload;
+                                        shared_secret = Some(secret);
+                                    }
+                                    Err(error) => {
+                                        return json!({
+                                            "error": {
+                                                "code": "IICP-CX-02",
+                                                "message": format!("iicp_conf decrypt failed: {error}"),
+                                            }
+                                        })
+                                    }
+                                }
+                            }
+                        }
+                        let response_required =
+                            req.cx_response_encryption.as_deref() == Some("required");
+                        let task_id = req.task_id.clone();
+                        let result = h(req)
                             .await
-                            .unwrap_or_else(|e| json!({"error": e.to_string()}))
+                            .unwrap_or_else(|e| json!({"error": e.to_string()}));
+                        if response_required {
+                            let Some(secret) = shared_secret else {
+                                return json!({
+                                    "error": {
+                                        "code": "IICP-CX-03",
+                                        "message": "encrypted response requested without an encrypted request",
+                                    }
+                                });
+                            };
+                            let plain_response = json!({
+                                "task_id": task_id.clone(),
+                                "status": "success",
+                                "result": result,
+                                "generated_by_ai": true,
+                            });
+                            match crate::confidentiality::encrypt_response(
+                                &plain_response,
+                                &secret,
+                                &task_id,
+                            ) {
+                                Ok(envelope) => json!({
+                                    "task_id": task_id,
+                                    "status": "encrypted",
+                                    "iicp_conf_resp": envelope,
+                                }),
+                                Err(error) => json!({
+                                    "error": {
+                                        "code": "IICP-CX-04",
+                                        "message": format!("response encryption failed: {error}"),
+                                    }
+                                }),
+                            }
+                        } else {
+                            result
+                        }
                     })
-                });
+                },
+            );
             let (rhost, rport) = {
                 if let Some(pos) = ep.rfind(':') {
                     let port = ep[pos + 1..].parse::<u16>().unwrap_or(9485);
@@ -2934,6 +3092,7 @@ impl IicpNode {
                             intent: t.intent,
                             payload: t.payload,
                             iicp_conf: None,
+                            cx_response_encryption: None,
                             constraints: None,
                             auth: None,
                             nonce: None,
