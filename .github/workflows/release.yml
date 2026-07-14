@@ -1,8 +1,9 @@
 name: Publish release
 
+# Manual-only while the guarded local publisher remains authoritative.
+# Enabling release:published before the CI lane is validated would create
+# two competing publishers for the same immutable version.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       version:
