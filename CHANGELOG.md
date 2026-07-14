@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
 in the main repo).
 
-## Unreleased
+## [0.7.89] — 2026-07-14
 
 ### Fixed — coordinated Quick Tunnel recovery
 - Shared Quick Tunnel capacity is now waited out inside the tunnel opener, with a bounded randomized suffix after each host-wide or provider deadline. Simultaneously waking local nodes no longer convert ordinary capacity pacing into synchronized supervisor restarts.
