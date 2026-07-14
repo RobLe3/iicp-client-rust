@@ -59,6 +59,7 @@ fn public_key_from_raw(pub_bytes: &[u8; 32]) -> CxPublicKey {
         encoding: Some("base64url".to_string()),
         key: b64url_encode(pub_bytes),
         key_id: format!("cx-{}", &hex::encode(digest)[..16]),
+        features: vec!["response_encryption_v1".to_string()],
     }
 }
 
@@ -124,6 +125,17 @@ pub fn encrypt_payload(
     task_id: &str,
     intent: &str,
 ) -> Result<HashMap<String, Value>> {
+    let (envelope, _shared_secret) =
+        encrypt_payload_with_context(payload, cx_public_key, task_id, intent)?;
+    Ok(envelope)
+}
+
+pub fn encrypt_payload_with_context(
+    payload: &Value,
+    cx_public_key: &CxPublicKey,
+    task_id: &str,
+    intent: &str,
+) -> Result<(HashMap<String, Value>, [u8; 32])> {
     if cx_public_key.algorithm != "X25519" {
         return Err(IicpError::Node(format!(
             "Unsupported cx_public_key algorithm: {}",
@@ -146,6 +158,7 @@ pub fn encrypt_payload(
     let ephem_priv = EphemeralSecret::random_from_rng(rand::thread_rng());
     let ephem_pub = PublicKey::from(&ephem_priv);
     let shared_secret = ephem_priv.diffie_hellman(&node_pub);
+    let shared_secret_bytes = shared_secret.to_bytes();
 
     // Generate nonce
     let mut nonce_bytes = [0u8; 12];
@@ -202,7 +215,7 @@ pub fn encrypt_payload(
         "plaintext_size".to_string(),
         Value::Number(plaintext_size.into()),
     );
-    Ok(envelope)
+    Ok((envelope, shared_secret_bytes))
 }
 
 /// Decrypt an iicp_conf envelope (CX-Provider / adapter side, IICP-CX §5).
@@ -210,6 +223,14 @@ pub fn decrypt_payload(
     iicp_conf: &HashMap<String, Value>,
     private_key_bytes: &[u8; 32],
 ) -> Result<Value> {
+    let (payload, _shared_secret) = decrypt_payload_with_context(iicp_conf, private_key_bytes)?;
+    Ok(payload)
+}
+
+pub fn decrypt_payload_with_context(
+    iicp_conf: &HashMap<String, Value>,
+    private_key_bytes: &[u8; 32],
+) -> Result<(Value, [u8; 32])> {
     let static_priv = StaticSecret::from(*private_key_bytes);
 
     let kem_ct = iicp_conf
@@ -227,6 +248,7 @@ pub fn decrypt_payload(
     ephem_pub_arr.copy_from_slice(&ephem_pub_bytes);
     let ephem_pub = PublicKey::from(ephem_pub_arr);
     let shared_secret = static_priv.diffie_hellman(&ephem_pub);
+    let shared_secret_bytes = shared_secret.to_bytes();
 
     let nonce_str = iicp_conf
         .get("nonce")
@@ -277,8 +299,9 @@ pub fn decrypt_payload(
             IicpError::Node("AES-GCM decrypt failed (wrong key or tampered)".to_string())
         })?;
 
-    serde_json::from_slice(&plaintext)
-        .map_err(|e| IicpError::Node(format!("plaintext JSON parse: {e}")))
+    let payload = serde_json::from_slice(&plaintext)
+        .map_err(|e| IicpError::Node(format!("plaintext JSON parse: {e}")))?;
+    Ok((payload, shared_secret_bytes))
 }
 
 // ── Tier-2 §5a.3: bidirectional (response) encryption ────────────────────────
@@ -388,6 +411,7 @@ mod tests {
             encoding: Some("base64url".to_string()),
             key: b64url_encode(pub_bytes),
             key_id,
+            features: vec!["response_encryption_v1".to_string()],
         };
         let priv_bytes: [u8; 32] = *priv_key.as_bytes();
         (cx_public_key, priv_bytes)
@@ -461,6 +485,7 @@ mod tests {
             encoding: Some("base64url".to_string()),
             key: "abc".to_string(),
             key_id: "00000000".to_string(),
+            features: vec![],
         };
         assert!(encrypt_payload(&serde_json::json!({}), &bad_key, "t1", "intent").is_err());
     }
@@ -475,6 +500,32 @@ mod tests {
         assert_eq!(
             decrypt_response(&env, &shared, "task-resp-1").unwrap(),
             resp
+        );
+    }
+
+    #[test]
+    fn request_context_drives_authenticated_response_roundtrip() {
+        let (public_key, private_key) = generate_test_keypair();
+        let (request, consumer_secret) = encrypt_payload_with_context(
+            &serde_json::json!({"secret":"request"}),
+            &public_key,
+            "task-context",
+            "urn:iicp:intent:llm:chat:v1",
+        )
+        .unwrap();
+        let (payload, provider_secret) =
+            decrypt_payload_with_context(&request, &private_key).unwrap();
+        assert_eq!(payload, serde_json::json!({"secret":"request"}));
+        assert_eq!(provider_secret, consumer_secret);
+        let response = encrypt_response(
+            &serde_json::json!({"secret":"response"}),
+            &provider_secret,
+            "task-context",
+        )
+        .unwrap();
+        assert_eq!(
+            decrypt_response(&response, &consumer_secret, "task-context").unwrap(),
+            serde_json::json!({"secret":"response"})
         );
     }
 

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 
 /// Client-side remote-routing profile (#585).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +159,8 @@ pub struct CxPublicKey {
     pub key: String,
     /// Stable provider-key identifier, currently `cx-` plus 16 hex chars.
     pub key_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 /// A single IICP node returned by `/v1/discover`.
@@ -320,6 +323,8 @@ pub struct TaskResponse {
     pub task_id: String,
     pub status: String,
     pub result: Option<serde_json::Value>,
+    #[serde(default)]
+    pub iicp_conf_resp: Option<HashMap<String, serde_json::Value>>,
     pub metrics: Option<TaskMetrics>,
     /// Structured error block on a non-success node response (carries the IICP error
     /// code the proxy surfaces). Defaults to None for success responses / older nodes.

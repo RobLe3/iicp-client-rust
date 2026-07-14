@@ -233,6 +233,36 @@ async fn test_upstream_429_rate_limit_surfaced() {
 }
 
 #[tokio::test]
+async fn test_timeout_is_classified_deterministically() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (_socket, _) = listener.accept().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    });
+    let mut options = opts(format!("http://{addr}"), Some("q"));
+    options.timeout = Duration::from_millis(10);
+    let result = invoke(
+        &options,
+        "urn:iicp:intent:llm:chat:v1",
+        &json!({"messages": []}),
+    )
+    .await;
+    assert_eq!(result["error_code"].as_u64(), Some(408));
+}
+
+#[tokio::test]
+async fn test_connection_refused_is_classified_as_transport_error() {
+    let result = invoke(
+        &opts("http://127.0.0.1:1".to_string(), Some("q")),
+        "urn:iicp:intent:llm:chat:v1",
+        &json!({"messages": []}),
+    )
+    .await;
+    assert_eq!(result["error_code"].as_u64(), Some(502));
+}
+
+#[tokio::test]
 async fn test_api_key_sets_bearer_auth() {
     let mut server = mockito::Server::new_async().await;
     let _m = server

@@ -5,7 +5,7 @@ use std::time::Duration;
 use rand::Rng;
 use regex::Regex;
 
-use crate::confidentiality::encrypt_payload;
+use crate::confidentiality::{decrypt_response, encrypt_payload_with_context};
 use crate::consumer_token::{acquire_consumer_token, ConsumerTokenCache};
 use crate::dispatch_ticket::verify_dispatch_route_ticket;
 use crate::errors::{IicpError, Result};
@@ -611,13 +611,30 @@ impl IicpClient {
             // IICP-CX S.16: encryption is mandatory by default. Always encrypt when
             // the node advertises a cx_public_key. Plaintext fallback is refused unless
             // the caller explicitly sets IICP_CX_ALLOW_PLAINTEXT=1 for transitional debugging.
+            let mut cx_shared_secret: Option<[u8; 32]> = None;
+            let require_encrypted_response = node.cx_public_key.as_ref().is_some_and(|key| {
+                key.features
+                    .iter()
+                    .any(|feature| feature == "response_encryption_v1")
+            });
             let body: serde_json::Value = if let Some(ref cx_key) = node.cx_public_key {
-                let iicp_conf =
-                    encrypt_payload(&request.payload, cx_key, &request.task_id, &request.intent)?;
+                let (iicp_conf, shared_secret) = encrypt_payload_with_context(
+                    &request.payload,
+                    cx_key,
+                    &request.task_id,
+                    &request.intent,
+                )?;
+                cx_shared_secret = Some(shared_secret);
                 let mut body = serde_json::to_value(&request)?;
                 if let Some(obj) = body.as_object_mut() {
                     obj.remove("payload");
                     obj.insert("iicp_conf".to_string(), serde_json::to_value(iicp_conf)?);
+                    if require_encrypted_response {
+                        obj.insert(
+                            "cx_response_encryption".to_string(),
+                            serde_json::Value::String("required".to_string()),
+                        );
+                    }
                 }
                 body
             } else {
@@ -642,6 +659,21 @@ impl IicpClient {
                     .await
                 {
                     Ok(mut resp) => {
+                        if require_encrypted_response {
+                            let envelope = resp.iicp_conf_resp.take().ok_or_else(|| {
+                                IicpError::Node(
+                                    "node advertised response encryption but returned plaintext"
+                                        .to_string(),
+                                )
+                            })?;
+                            let secret = cx_shared_secret.as_ref().ok_or_else(|| {
+                                IicpError::Node("missing CX response context".to_string())
+                            })?;
+                            let opened = decrypt_response(&envelope, secret, &request.task_id)?;
+                            resp = serde_json::from_value(opened).map_err(|err| {
+                                IicpError::Node(format!("encrypted response decode failed: {err}"))
+                            })?;
+                        }
                         resp.generated_by_ai = true;
                         resp.dispatch_ticket_id_prefix = node.dispatch_ticket_id_prefix.clone();
                         resp.routing_receipt = Some(RoutingReceipt {
