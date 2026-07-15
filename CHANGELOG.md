@@ -9,6 +9,8 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.91] — 2026-07-15
+
 ### Fixed — cross-SDK route projection parity
 - Chat model, QoS, region, and reputation requirements now survive ticketed discovery, legacy discovery, and fallback through one canonical route projection.
 - Route-only criteria no longer leak into provider execution constraints; shared transcript fixtures keep Python, TypeScript, and Rust behaviour aligned.
