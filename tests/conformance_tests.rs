@@ -483,6 +483,45 @@ fn weighted_v1_fixture_vectors_are_deterministic() {
 }
 
 #[test]
+fn weighted_v1_distribution_and_top_k_boundary_are_portable() {
+    use iicp_client::selection::weighted_v1_index;
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../parity/selection-v1.json")).unwrap();
+    for vector in fixture["distribution_vectors"].as_array().unwrap() {
+        let nodes = vector["nodes"].as_array().unwrap();
+        let top_k = vector["top_k"].as_u64().unwrap() as usize;
+        let scores = nodes[..top_k]
+            .iter()
+            .map(|node| node["score"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        let loads = nodes[..top_k]
+            .iter()
+            .map(|node| node["load"].as_f64().unwrap())
+            .collect::<Vec<_>>();
+        let samples = vector["sample_count"].as_u64().unwrap() as usize;
+        let mut counts = std::collections::BTreeMap::new();
+        for node in nodes {
+            counts.insert(node["node_id"].as_str().unwrap(), 0_u64);
+        }
+        for index in 0..samples {
+            let random = (index as f64 + 0.5) / samples as f64;
+            let chosen = weighted_v1_index(&scores, &loads, random);
+            *counts
+                .get_mut(nodes[chosen]["node_id"].as_str().unwrap())
+                .unwrap() += 1;
+        }
+        for (node_id, expected) in vector["expected_first_counts"].as_object().unwrap() {
+            assert_eq!(
+                counts[node_id.as_str()],
+                expected.as_u64().unwrap(),
+                "{} / {node_id}",
+                vector["name"]
+            );
+        }
+    }
+}
+
+#[test]
 fn profile_negotiation_fixture_preserves_legacy_and_required_fail_closed_boundary() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../parity/profile-negotiation-v0.json")).unwrap();
