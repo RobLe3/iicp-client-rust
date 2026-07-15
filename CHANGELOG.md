@@ -9,6 +9,8 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.90] — 2026-07-14
+
 ### Added — relay abuse resistance and encrypted responses
 - Relay binds are rate-limited per source principal without logging raw source addresses; recovery of a dead bound session remains exempt.
 - Nodes advertise and negotiate `response_encryption_v1`; direct and relay-routed tasks return authenticated encrypted responses when explicitly negotiated, while downlevel peers retain Tier-1 compatibility.
