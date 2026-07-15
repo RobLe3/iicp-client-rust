@@ -206,6 +206,58 @@ mod tests {
                 vector["id"]
             );
         }
+        for vector in fixture["resolution_attempt_vectors"].as_array().unwrap() {
+            let allow_private = vector["allow_private"].as_bool().unwrap();
+            let actual: Vec<&str> = vector["attempts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|attempt| {
+                    if attempt.as_array().unwrap().iter().all(|address| {
+                        address_allowed(address.as_str().unwrap().parse().unwrap(), allow_private)
+                    }) {
+                        "allow"
+                    } else {
+                        "refuse"
+                    }
+                })
+                .collect();
+            let expected: Vec<&str> = vector["expected"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_str().unwrap())
+                .collect();
+            assert_eq!(actual, expected, "{}", vector["id"]);
+        }
+        for vector in fixture["redirect_vectors"].as_array().unwrap() {
+            let status = vector["status"].as_u64().unwrap();
+            let safe_target =
+                vector["target_addresses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|address| {
+                        address_allowed(
+                            address.as_str().unwrap().parse().unwrap(),
+                            vector["allow_private"].as_bool().unwrap(),
+                        )
+                    });
+            let actual = if matches!(status, 307 | 308)
+                && vector["same_origin"].as_bool().unwrap()
+                && safe_target
+            {
+                "follow_after_revalidation"
+            } else {
+                "refuse"
+            };
+            assert_eq!(
+                actual,
+                vector["expected"].as_str().unwrap(),
+                "{}",
+                vector["id"]
+            );
+        }
     }
 
     #[tokio::test]
