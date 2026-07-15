@@ -480,10 +480,9 @@ pub struct TaskRequest {
 pub fn derive_native_endpoint(endpoint: &str) -> Option<String> {
     let (scheme, rest) = if let Some(r) = endpoint.strip_prefix("http://") {
         ("iicp", r)
-    } else if let Some(r) = endpoint.strip_prefix("https://") {
-        ("iicpsec", r)
     } else {
-        return None;
+        let r = endpoint.strip_prefix("https://")?;
+        ("iicpsec", r)
     };
     let authority = rest.split('/').next().unwrap_or(rest);
     if authority.is_empty() {
@@ -2882,11 +2881,11 @@ impl IicpNode {
             let relay_saved_node_name = self.saved_node_name.clone();
             let relay_registered_endpoint = Arc::clone(&self.registered_endpoint);
             let relay_bound_arc = Arc::clone(&self.runtime_relay_bound);
-            let relay_cx_private_key = self.cx_private_key.clone();
+            let relay_cx_private_key = self.cx_private_key;
             let handler_fn: crate::relay_worker_client::RelayHandlerFn = Arc::new(
                 move |task: Value| {
                     let h = Arc::clone(&handler_for_relay);
-                    let cx_private_key = relay_cx_private_key.clone();
+                    let cx_private_key = relay_cx_private_key;
                     Box::pin(async move {
                         let mut req = crate::node::TaskRequest {
                             task_id: task
