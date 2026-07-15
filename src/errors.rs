@@ -8,6 +8,10 @@ pub enum IicpError {
     #[error("network error: {0}")]
     Http(#[from] reqwest::Error),
 
+    /// A directory-supplied provider endpoint violated local network policy.
+    #[error("endpoint refused: {0}")]
+    EndpointRefused(String),
+
     /// Directory or node returned an IICP error response.
     #[error("[{code}] {message} (HTTP {status})")]
     Protocol {

@@ -716,6 +716,9 @@ impl IicpClient {
                     Err(e) => {
                         last_err = Some(e);
                         let err = last_err.as_ref().unwrap();
+                        if matches!(err, IicpError::EndpointRefused(_)) {
+                            continue 'nodes;
+                        }
                         if !err.is_transient() {
                             return Err(last_err.unwrap()); // hard failure, don't retry
                         }

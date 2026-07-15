@@ -19,6 +19,7 @@ pub fn make_traceparent() -> String {
 pub(crate) struct HttpClient {
     inner: Client,
     token: Option<String>,
+    timeout_ms: u64,
 }
 
 impl HttpClient {
@@ -27,7 +28,11 @@ impl HttpClient {
             .timeout(Duration::from_millis(timeout_ms))
             .use_rustls_tls()
             .build()?;
-        Ok(Self { inner, token })
+        Ok(Self {
+            inner,
+            token,
+            timeout_ms,
+        })
     }
 
     fn auth(&self, rb: RequestBuilder) -> RequestBuilder {
@@ -79,16 +84,66 @@ impl HttpClient {
         let tp = traceparent
             .map(|s| s.to_owned())
             .unwrap_or_else(make_traceparent);
-        let rb = self.inner.post(url).json(body).header("traceparent", &tp);
-        let rb = match auth_override {
-            Some(t) => rb.bearer_auth(t),
-            None => self.auth(rb),
+        let mut current = url.to_string();
+        let mut redirects = 0usize;
+        let resp = loop {
+            let resolved = crate::endpoint_security::resolve_endpoint(&current).await?;
+            let selected = *resolved.addresses.first().ok_or_else(|| {
+                IicpError::EndpointRefused("provider hostname returned no addresses".into())
+            })?;
+            let pinned = Client::builder()
+                .timeout(Duration::from_millis(self.timeout_ms))
+                .use_rustls_tls()
+                .redirect(reqwest::redirect::Policy::none())
+                .resolve(&resolved.host, selected)
+                .build()?;
+            let mut rb = pinned
+                .post(resolved.url)
+                .json(body)
+                .header("traceparent", &tp);
+            rb = match auth_override {
+                Some(t) => rb.bearer_auth(t),
+                None => match &self.token {
+                    Some(t) => rb.bearer_auth(t),
+                    None => rb,
+                },
+            };
+            if let Some(ct) = consumer_token {
+                rb = rb.header("X-IICP-Consumer-Token", ct);
+            }
+            let candidate = rb.send().await?;
+            if matches!(candidate.status().as_u16(), 307 | 308) {
+                if redirects >= 3 {
+                    return Err(IicpError::EndpointRefused(
+                        "provider redirect limit exceeded".into(),
+                    ));
+                }
+                let location = candidate
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| {
+                        IicpError::EndpointRefused("provider redirect omitted Location".into())
+                    })?;
+                let next = candidate.url().join(location).map_err(|_| {
+                    IicpError::EndpointRefused("provider redirect Location is invalid".into())
+                })?;
+                if next.origin() != candidate.url().origin() {
+                    return Err(IicpError::EndpointRefused(
+                        "cross-origin provider redirect is not allowed".into(),
+                    ));
+                }
+                current = next.to_string();
+                redirects += 1;
+                continue;
+            }
+            if candidate.status().is_redirection() {
+                return Err(IicpError::EndpointRefused(
+                    "provider redirect method is not allowed".into(),
+                ));
+            }
+            break candidate;
         };
-        let rb = match consumer_token {
-            Some(ct) => rb.header("X-IICP-Consumer-Token", ct),
-            None => rb,
-        };
-        let resp = rb.send().await?;
         let status = resp.status().as_u16();
         let resp_body: Value = resp.json().await?;
         if status >= 400 {
