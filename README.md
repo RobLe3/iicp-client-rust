@@ -577,6 +577,16 @@ Conformance tier: `iicp:sdk:v1` (spec S.14) · [Request a badge](https://iicp.ne
 
 ---
 
+## Opt-in protocol research APIs
+
+`dispatch_ticket_trust` verifies pre-normative v2 tickets against a
+caller-supplied trust bundle. `service_lifecycle` provides a bounded reference
+store and an explicitly mounted Axum router. Neither module is used by normal
+discovery, submission or node serving. They are unstable research surfaces and
+must not be treated as deployed protocol guarantees.
+
+---
+
 ## Development
 
 ```bash

@@ -169,3 +169,38 @@ async fn replay_window_expires_without_starting_a_second_execution() {
         Err(LifecycleError::ResumeUnavailable { .. })
     ));
 }
+
+#[tokio::test]
+async fn snapshot_restore_and_bounded_replay_are_deterministic() {
+    let store = LifecycleStore::new(3, 60_000);
+    store
+        .submit("restart", "idem-restart", "digest")
+        .await
+        .unwrap();
+    store
+        .transition("restart", "running", serde_json::Value::Null)
+        .await
+        .unwrap();
+    for chunk in 1..=3 {
+        store
+            .transition("restart", "streaming", serde_json::json!({"chunk": chunk}))
+            .await
+            .unwrap();
+    }
+    let restored = LifecycleStore::new(3, 60_000);
+    restored.restore(store.snapshot().await).await.unwrap();
+    assert!(matches!(
+        restored.events_after("restart", 0).await,
+        Err(LifecycleError::ResumeUnavailable { .. })
+    ));
+    assert_eq!(
+        restored
+            .events_after_bounded("restart", 1, 1)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(restored.cancel("restart").await.unwrap().state, "cancelled");
+    assert_eq!(restored.cancel("restart").await.unwrap().state, "cancelled");
+}
