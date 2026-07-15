@@ -81,13 +81,31 @@ impl HttpClient {
         consumer_token: Option<&str>,
         traceparent: Option<&str>,
     ) -> Result<T> {
+        self.post_json_ct_with_policy(url, body, auth_override, consumer_token, traceparent, None)
+            .await
+    }
+
+    async fn post_json_ct_with_policy<B: serde::Serialize, T: DeserializeOwned>(
+        &self,
+        url: &str,
+        body: &B,
+        auth_override: Option<&str>,
+        consumer_token: Option<&str>,
+        traceparent: Option<&str>,
+        allow_private: Option<bool>,
+    ) -> Result<T> {
         let tp = traceparent
             .map(|s| s.to_owned())
             .unwrap_or_else(make_traceparent);
         let mut current = url.to_string();
         let mut redirects = 0usize;
         let resp = loop {
-            let resolved = crate::endpoint_security::resolve_endpoint(&current).await?;
+            let resolved = match allow_private {
+                Some(allow) => {
+                    crate::endpoint_security::resolve_endpoint_with_policy(&current, allow).await?
+                }
+                None => crate::endpoint_security::resolve_endpoint(&current).await?,
+            };
             let selected = *resolved.addresses.first().ok_or_else(|| {
                 IicpError::EndpointRefused("provider hostname returned no addresses".into())
             })?;
@@ -157,5 +175,43 @@ impl HttpClient {
             });
         }
         Ok(serde_json::from_value(resp_body)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::{
+        response::Redirect,
+        routing::{get, post},
+        Json, Router,
+    };
+    use serde_json::{json, Value};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn private_provider_requires_opt_in_and_uses_pinned_transport() {
+        let app = Router::new()
+            .route("/redirect", post(|| async { Redirect::temporary("/task") }))
+            .route("/task", post(|| async { Json(json!({"ok": true})) }))
+            .route("/health", get(|| async { "ok" }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = HttpClient::new(2_000, None).unwrap();
+        let url = format!("http://{address}/redirect");
+
+        let refused = client
+            .post_json_ct_with_policy::<_, Value>(&url, &json!({}), None, None, None, Some(false))
+            .await
+            .unwrap_err();
+        assert!(matches!(refused, IicpError::EndpointRefused(_)));
+
+        let response: Value = client
+            .post_json_ct_with_policy(&url, &json!({}), None, None, None, Some(true))
+            .await
+            .unwrap();
+        assert_eq!(response, json!({"ok": true}));
+        server.abort();
     }
 }
