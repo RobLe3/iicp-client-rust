@@ -33,9 +33,11 @@ fn shared_sdk_request_projection_fixture() {
     let fixture: Value = serde_json::from_slice(&fixture_bytes).unwrap();
 
     for case in fixture["cases"].as_array().unwrap() {
-        let mut config = ClientConfig::default();
-        config.region = case["config"]["region"].as_str().map(str::to_owned);
-        config.profile_request = profile(case["config"].get("profile_request"));
+        let config = ClientConfig {
+            region: case["config"]["region"].as_str().map(str::to_owned),
+            profile_request: profile(case["config"].get("profile_request")),
+            ..ClientConfig::default()
+        };
 
         let raw = &case["task"]["constraints"];
         let constraints = TaskConstraints {
