@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use iicp_client::{
-    make_traceparent, ClientConfig, DiscoverOptions, IicpClient, IicpError, RoutingPolicy,
-    RoutingProfile, TaskRequest,
+    make_traceparent, ClientConfig, DiscoverOptions, IicpClient, IicpError, RouteConstraints,
+    RoutingPolicy, RoutingProfile, TaskConstraints, TaskRequest,
 };
 use std::sync::{Mutex, OnceLock};
 
@@ -158,6 +158,9 @@ async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
         .await;
     let _ticket = server
         .mock("POST", "/v1/dispatch/ticket")
+        .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+            "model": "model-a", "qos": "realtime", "region": "eu-central", "min_reputation": 0.8
+        })))
         .with_status(201)
         .with_header("content-type", "application/json")
         .with_body(
@@ -200,7 +203,23 @@ async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
             task_id: String::new(),
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: serde_json::json!({"messages": []}),
-            constraints: None,
+            constraints: Some(TaskConstraints {
+                timeout_ms: Some(30_000),
+                max_tokens: None,
+                model: Some("model-a".into()),
+                qos: Some("realtime".into()),
+                region: None,
+                min_reputation: None,
+            }),
+            route_constraints: Some(RouteConstraints {
+                region: Some("eu-central".into()),
+                qos: Some("realtime".into()),
+                model: Some("model-a".into()),
+                min_reputation: Some(0.8),
+                limit: Some(10),
+                browser_usable_only: None,
+                profile_request: None,
+            }),
             auth: None,
             source_node_id: None,
             routing_policy: None,
@@ -214,6 +233,59 @@ async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
     );
     assert!(!format!("{response:?}").contains("secret-ticket-token"));
     unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
+}
+
+#[tokio::test]
+async fn required_consumer_auth_refuses_silent_downgrade() {
+    let mut server = mockito::Server::new_async().await;
+    let _discover = server
+        .mock("GET", mockito::Matcher::Regex(r"/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "nodes": [{
+                    "node_id": "node-auth", "endpoint": "https://provider.example.com",
+                    "score": 1.0, "available": true, "region": "eu",
+                    "cx_public_key": {
+                        "algorithm": "X25519", "encoding": "base64url",
+                        "key": "-LKZgrZEnFMr9ctB3uQDKsME07ZzS4Ce-SapFAePul0", "key_id": "cx-auth"
+                    }
+                }], "count": 1
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let _token = server
+        .mock("POST", "/api/v1/consumer-token")
+        .with_status(503)
+        .create_async()
+        .await;
+    let client = IicpClient::new(ClientConfig {
+        directory_url: server.url(),
+        node_token: Some("node-token".into()),
+        consumer_auth_mode: "required".into(),
+        route_discovery_mode: "legacy".into(),
+        ..Default::default()
+    })
+    .unwrap();
+    let err = client
+        .submit(TaskRequest {
+            task_id: String::new(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            payload: serde_json::json!({}),
+            constraints: None,
+            route_constraints: None,
+            auth: None,
+            source_node_id: None,
+            routing_policy: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, IicpError::PolicyRefused { code, .. } if code == "IICP-CONSUMER-AUTH-REQUIRED")
+    );
 }
 
 #[tokio::test]
@@ -245,6 +317,7 @@ async fn ticket_policy_refusal_does_not_downgrade() {
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: serde_json::json!({}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: None,
@@ -481,6 +554,7 @@ async fn submit_skips_keyless_nodes_by_default() {
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: json!({"messages": []}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: None,
@@ -531,6 +605,7 @@ async fn submit_refuses_all_keyless_nodes_by_default() {
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: json!({"messages": []}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: None,
@@ -593,6 +668,7 @@ async fn routing_policy_sensitive_refuses_remote_before_prompt_dispatch() {
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: json!({"messages": [{"role":"user","content":"GDPR_CANARY_PROMPT_DO_NOT_SEND"}]}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: Some(RoutingPolicy {
@@ -668,6 +744,7 @@ async fn routing_policy_eu_restricted_excludes_non_eu_and_routes_to_eu() {
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: json!({"messages": []}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: Some(RoutingPolicy {
@@ -740,6 +817,7 @@ async fn routing_policy_strict_requires_no_payload_retention_manifest() {
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: json!({"messages": []}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: Some(RoutingPolicy {
@@ -810,6 +888,7 @@ async fn routing_policy_strict_requires_signed_policy_manifest() {
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: json!({"messages": []}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: Some(RoutingPolicy {
@@ -882,6 +961,7 @@ async fn routing_policy_requires_operator_bound_manifest_identity_before_dispatc
             intent: "urn:iicp:intent:llm:chat:v1".into(),
             payload: json!({"messages": []}),
             constraints: None,
+            route_constraints: None,
             auth: None,
             source_node_id: None,
             routing_policy: Some(RoutingPolicy {
