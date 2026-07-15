@@ -16,6 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
+    future::Future,
+    pin::Pin,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -61,6 +63,36 @@ pub enum LifecycleError {
     Conflict(String),
     UnknownTask,
     ResumeUnavailable { state: String, latest_sequence: u64 },
+    Storage(String),
+}
+
+pub type LifecycleFuture<'a, T> =
+    Pin<Box<dyn Future<Output = Result<T, LifecycleError>> + Send + 'a>>;
+
+/// Storage port for the opt-in lifecycle profile.
+///
+/// Persistence formats are implementation-specific. Implementations preserve
+/// task/idempotency binding, ordered events, bounded replay and terminal TTL.
+pub trait LifecyclePersistence: Send + Sync {
+    fn submit<'a>(
+        &'a self,
+        task_id: &'a str,
+        idempotency_key: &'a str,
+        request_digest: &'a str,
+    ) -> LifecycleFuture<'a, (LifecycleRecord, bool)>;
+    fn status<'a>(&'a self, task_id: &'a str) -> LifecycleFuture<'a, LifecycleRecord>;
+    fn transition<'a>(
+        &'a self,
+        task_id: &'a str,
+        state: &'a str,
+        detail: Value,
+    ) -> LifecycleFuture<'a, LifecycleEvent>;
+    fn cancel<'a>(&'a self, task_id: &'a str) -> LifecycleFuture<'a, LifecycleRecord>;
+    fn events_after<'a>(
+        &'a self,
+        task_id: &'a str,
+        after_sequence: i64,
+    ) -> LifecycleFuture<'a, Vec<LifecycleEvent>>;
 }
 
 #[derive(Clone)]
@@ -252,21 +284,62 @@ impl LifecycleStore {
     }
 }
 
-fn now_ms() -> u64 {
+impl LifecyclePersistence for LifecycleStore {
+    fn submit<'a>(
+        &'a self,
+        task_id: &'a str,
+        idempotency_key: &'a str,
+        request_digest: &'a str,
+    ) -> LifecycleFuture<'a, (LifecycleRecord, bool)> {
+        Box::pin(LifecycleStore::submit(
+            self,
+            task_id,
+            idempotency_key,
+            request_digest,
+        ))
+    }
+
+    fn status<'a>(&'a self, task_id: &'a str) -> LifecycleFuture<'a, LifecycleRecord> {
+        Box::pin(LifecycleStore::status(self, task_id))
+    }
+
+    fn transition<'a>(
+        &'a self,
+        task_id: &'a str,
+        state: &'a str,
+        detail: Value,
+    ) -> LifecycleFuture<'a, LifecycleEvent> {
+        Box::pin(LifecycleStore::transition(self, task_id, state, detail))
+    }
+
+    fn cancel<'a>(&'a self, task_id: &'a str) -> LifecycleFuture<'a, LifecycleRecord> {
+        Box::pin(LifecycleStore::cancel(self, task_id))
+    }
+
+    fn events_after<'a>(
+        &'a self,
+        task_id: &'a str,
+        after_sequence: i64,
+    ) -> LifecycleFuture<'a, Vec<LifecycleEvent>> {
+        Box::pin(LifecycleStore::events_after(self, task_id, after_sequence))
+    }
+}
+
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
 }
 
-fn terminal(state: &str) -> bool {
+pub(crate) fn terminal(state: &str) -> bool {
     matches!(
         state,
         "rejected" | "completed" | "failed" | "cancelled" | "expired"
     )
 }
 
-fn legal_transition(from: &str, to: &str) -> bool {
+pub(crate) fn legal_transition(from: &str, to: &str) -> bool {
     match from {
         "submitted" => matches!(to, "accepted" | "rejected" | "expired"),
         "accepted" => matches!(
@@ -295,7 +368,7 @@ fn legal_transition(from: &str, to: &str) -> bool {
 
 #[derive(Clone)]
 struct HttpState {
-    store: LifecycleStore,
+    store: Arc<dyn LifecyclePersistence>,
     bearer_token: String,
 }
 
@@ -340,6 +413,10 @@ fn lifecycle_error(error: LifecycleError) -> Response {
         LifecycleError::ResumeUnavailable { state, latest_sequence } => (
             StatusCode::CONFLICT,
             Json(json!({"code": "resume_unavailable", "state": state, "latest_sequence": latest_sequence})),
+        ).into_response(),
+        LifecycleError::Storage(message) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"code": "lifecycle_storage_error", "message": message})),
         ).into_response(),
     }
 }
@@ -427,6 +504,14 @@ async fn cancel_http(
 
 /// Build the draft HTTP binding. Calling this function is the profile opt-in.
 pub fn lifecycle_router(store: LifecycleStore, bearer_token: impl Into<String>) -> Router {
+    lifecycle_router_with_persistence(Arc::new(store), bearer_token)
+}
+
+/// Build the draft HTTP binding with an explicitly selected persistence port.
+pub fn lifecycle_router_with_persistence(
+    store: Arc<dyn LifecyclePersistence>,
+    bearer_token: impl Into<String>,
+) -> Router {
     let state = HttpState {
         store,
         bearer_token: bearer_token.into(),

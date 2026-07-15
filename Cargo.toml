@@ -43,6 +43,9 @@ nat = ["dep:igd-next"]
 # (`iicp-node proxy`). Kept OUT of `default` so a plain library/consumer build stays
 # lean; the `iicp-node` bin enables it. axum + tokio are already deps for the node.
 proxy = []
+# Opt-in single-host transactional persistence for the draft lifecycle profile.
+# Kept out of default builds; the ordinary node does not mount this adapter.
+lifecycle-sqlite = ["dep:rusqlite"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -79,6 +82,7 @@ base64 = "0.22"
 hex = "0.4"
 # Local time-of-day for availability windows (ADR-006). "clock" only — no serde/format.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "sync"] }

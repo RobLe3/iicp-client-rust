@@ -581,9 +581,12 @@ Conformance tier: `iicp:sdk:v1` (spec S.14) · [Request a badge](https://iicp.ne
 
 `dispatch_ticket_trust` verifies pre-normative v2 tickets against a
 caller-supplied trust bundle. `service_lifecycle` provides a bounded reference
-store and an explicitly mounted Axum router. Neither module is used by normal
-discovery, submission or node serving. They are unstable research surfaces and
-must not be treated as deployed protocol guarantees.
+store, a `LifecyclePersistence` storage port, and an explicitly mounted Axum
+router. The non-default `lifecycle-sqlite` feature adds a content-minimized,
+single-host transactional adapter; it is not a distributed store. None of
+these APIs is used by normal discovery, submission or node serving. They are
+unstable research surfaces and must not be treated as deployed protocol
+guarantees.
 
 ---
 
