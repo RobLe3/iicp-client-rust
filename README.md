@@ -24,7 +24,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.90"
+iicp-client = "0.7.91"
 ```
 
 ## One-line test
