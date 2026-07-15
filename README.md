@@ -132,6 +132,19 @@ let reply = client.chat(
 ).await?;
 ```
 
+### Route constraints and consumer authentication
+
+`ChatOptions::model` now constrains both provider discovery and provider
+execution. Region, QoS, reputation, browser access, and profile requirements
+are projected through one route-constraint path for ticketed discovery, legacy
+discovery, and fallback. Route-only fields are skipped when serializing the
+provider task envelope.
+
+Set `ClientConfig::consumer_auth_mode` to `"required"` when a workload must
+not silently fall back to anonymous dispatch if consumer-token acquisition
+fails. The default remains `"optional"`; `"disabled"` skips token
+acquisition.
+
 ## Migrate from existing AI tools
 
 Direct call:

@@ -972,10 +972,14 @@ async fn run_query(args: &[String]) -> Result<(), String> {
                 timeout_ms: None,
                 max_tokens,
                 model,
+                qos: Some("interactive".into()),
+                region: None,
+                min_reputation: None,
             })
         } else {
             None
         },
+        route_constraints: None,
         auth: None,
         source_node_id,
         routing_policy: Some(iicp_client::RoutingPolicy {

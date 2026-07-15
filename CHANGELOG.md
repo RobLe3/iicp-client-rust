@@ -9,6 +9,11 @@ in the main repo).
 
 ## [Unreleased]
 
+### Fixed — cross-SDK route projection parity
+- Chat model, QoS, region, and reputation requirements now survive ticketed discovery, legacy discovery, and fallback through one canonical route projection.
+- Route-only criteria no longer leak into provider execution constraints; shared transcript fixtures keep Python, TypeScript, and Rust behaviour aligned.
+- Consumer authentication can be made fail-closed with `consumer_auth_mode=required` while the adoption-friendly default remains optional.
+
 ## [0.7.90] — 2026-07-14
 
 ### Added — relay abuse resistance and encrypted responses

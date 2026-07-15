@@ -11,6 +11,7 @@ use crate::dispatch_ticket::verify_dispatch_route_ticket;
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
 use crate::policy::ensure_intent_allowed;
+use crate::request_projection::project_route_options;
 use crate::routing_policy::{
     filter_nodes_for_routing_policy, resolved_policy, routing_policy_refusal_message,
     ROUTING_POLICY_REFUSAL_CODE,
@@ -188,6 +189,15 @@ impl IicpClient {
                 "route_discovery_mode must be auto, ticketed, or legacy".into(),
             ));
         }
+        if !matches!(
+            config.consumer_auth_mode.as_str(),
+            "optional" | "required" | "disabled"
+        ) {
+            return Err(IicpError::PolicyRefused {
+                code: "SDK-AUTH-MODE".into(),
+                message: "consumer_auth_mode must be optional, required, or disabled".into(),
+            });
+        }
         let http = HttpClient::new(config.timeout_ms, config.node_token.clone())?;
         Ok(Self {
             config,
@@ -216,6 +226,11 @@ impl IicpClient {
         if let Some(model) = &opts.model {
             if is_safe_query_param(model) {
                 url.push_str(&format!("&model={model}"));
+            }
+        }
+        if let Some(qos) = &opts.qos {
+            if is_safe_query_param(qos) {
+                url.push_str(&format!("&qos={qos}"));
             }
         }
         if let Some(rep) = opts.min_reputation {
@@ -282,6 +297,9 @@ impl IicpClient {
         }
         if let Some(model) = &opts.model {
             request["model"] = serde_json::Value::String(model.clone());
+        }
+        if let Some(qos) = &opts.qos {
+            request["qos"] = serde_json::Value::String(qos.clone());
         }
         if let Some(reputation) = opts.min_reputation {
             request["min_reputation"] = serde_json::json!(reputation);
@@ -399,21 +417,15 @@ impl IicpClient {
         }
 
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
+        let discover_options = project_route_options(&request, &self.config);
         let nodes = if self.config.route_discovery_mode == "legacy"
             || self.config.profile_request.is_some()
         {
-            self.discover(
-                &request.intent,
-                Some(DiscoverOptions {
-                    profile_request: self.config.profile_request.clone(),
-                    ..Default::default()
-                }),
-                Some(&tp),
-            )
-            .await?
+            self.discover(&request.intent, Some(discover_options.clone()), Some(&tp))
+                .await?
         } else {
             match self
-                .ticketed_candidates(&request.intent, &DiscoverOptions::default(), &tp)
+                .ticketed_candidates(&request.intent, &discover_options, &tp)
                 .await
             {
                 Ok(nodes) => NodeList {
@@ -424,7 +436,8 @@ impl IicpClient {
                 Err(TicketRouteError::LegacyRequired)
                     if self.config.route_discovery_mode == "auto" =>
                 {
-                    self.discover(&request.intent, None, Some(&tp)).await?
+                    self.discover(&request.intent, Some(discover_options.clone()), Some(&tp))
+                        .await?
                 }
                 Err(TicketRouteError::LegacyRequired) => {
                     return Err(IicpError::Protocol {
@@ -593,7 +606,9 @@ impl IicpClient {
 
         'nodes: for node in &candidates {
             // Phase 2 (#496): acquire directory-issued consumer token when caller has identity.
-            let consumer_token: Option<String> = if let Some(ref tok) = self.config.node_token {
+            let consumer_token: Option<String> = if self.config.consumer_auth_mode == "disabled" {
+                None
+            } else if let Some(ref tok) = self.config.node_token {
                 acquire_consumer_token(
                     &self.ct_cache,
                     self.http.inner(),
@@ -607,6 +622,12 @@ impl IicpClient {
             } else {
                 None
             };
+            if self.config.consumer_auth_mode == "required" && consumer_token.is_none() {
+                return Err(IicpError::PolicyRefused {
+                    code: "IICP-CONSUMER-AUTH-REQUIRED".into(),
+                    message: "Consumer authentication is required but no directory-issued token is available".into(),
+                });
+            }
 
             // IICP-CX S.16: encryption is mandatory by default. Always encrypt when
             // the node advertises a cx_public_key. Plaintext fallback is refused unless
@@ -731,6 +752,7 @@ impl IicpClient {
         if let Some(temp) = opts.temperature {
             payload["temperature"] = serde_json::json!(temp);
         }
+        let requested_model = opts.model.clone();
         let request = TaskRequest {
             task_id: uuid::Uuid::new_v4().to_string(),
             intent: "urn:iicp:intent:llm:chat:v1".into(),
@@ -738,7 +760,21 @@ impl IicpClient {
             constraints: Some(TaskConstraints {
                 timeout_ms: opts.timeout_ms,
                 max_tokens: opts.max_tokens,
-                model: opts.model,
+                model: requested_model.clone(),
+                qos: opts.qos.clone().or_else(|| Some("interactive".into())),
+                region: None,
+                min_reputation: None,
+            }),
+            route_constraints: opts.route_constraints.or_else(|| {
+                Some(crate::RouteConstraints {
+                    region: opts.region,
+                    qos: opts.qos.or_else(|| Some("interactive".into())),
+                    model: requested_model,
+                    min_reputation: opts.min_reputation,
+                    limit: Some(10),
+                    browser_usable_only: opts.browser_usable_only,
+                    profile_request: opts.profile_request,
+                })
             }),
             auth: None,
             source_node_id: None,

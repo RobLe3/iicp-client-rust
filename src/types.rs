@@ -55,6 +55,8 @@ pub struct ClientConfig {
     pub timeout_ms: u64,
     pub region: Option<String>,
     pub node_token: Option<String>,
+    /// Directory-issued consumer identity policy: optional | required | disabled.
+    pub consumer_auth_mode: String,
     /// IICP-CX S.16: encrypt task payloads when the node advertises cx_public_key. Default: false.
     pub use_confidentiality: bool,
     /// ε-greedy exploration probability for provider selection (R4). Default: 0.05.
@@ -104,6 +106,7 @@ impl Default for ClientConfig {
             timeout_ms: 30_000,
             region: None,
             node_token: None,
+            consumer_auth_mode: "optional".into(),
             use_confidentiality: false,
             routing_epsilon: epsilon,
             routing_strategy: strategy,
@@ -123,12 +126,25 @@ impl Default for ClientConfig {
 #[derive(Debug, Default, Clone)]
 pub struct DiscoverOptions {
     pub region: Option<String>,
+    pub qos: Option<String>,
     pub model: Option<String>,
     pub min_reputation: Option<f64>,
     pub limit: Option<u32>,
     /// Browser-like consumers can keep only HTTPS/loopback endpoints. Native default: false.
     pub browser_usable_only: Option<bool>,
     /// Optional additive directory capability request for a draft profile.
+    pub profile_request: Option<ProfileRequest>,
+}
+
+/// Prompt-free criteria used only for provider discovery and selection.
+#[derive(Debug, Default, Clone)]
+pub struct RouteConstraints {
+    pub region: Option<String>,
+    pub qos: Option<String>,
+    pub model: Option<String>,
+    pub min_reputation: Option<f64>,
+    pub limit: Option<u32>,
+    pub browser_usable_only: Option<bool>,
     pub profile_request: Option<ProfileRequest>,
 }
 
@@ -288,6 +304,9 @@ pub struct TaskRequest {
     pub payload: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub constraints: Option<TaskConstraints>,
+    /// Local-only route criteria. Never serialized to providers.
+    #[serde(skip)]
+    pub route_constraints: Option<RouteConstraints>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth: Option<TaskAuth>,
     /// #488 — querying node identity for self-query neutrality at the directory.
@@ -309,6 +328,14 @@ pub struct TaskConstraints {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qos: Option<String>,
+    /// Compatibility route hint; omitted from provider serialization.
+    #[serde(skip)]
+    pub region: Option<String>,
+    /// Compatibility route hint; omitted from provider serialization.
+    #[serde(skip)]
+    pub min_reputation: Option<f64>,
 }
 
 /// Auth block for a task request.
@@ -372,6 +399,12 @@ pub struct ChatOptions {
     pub timeout_ms: Option<u64>,
     pub temperature: Option<f64>,
     pub routing_policy: Option<RoutingPolicy>,
+    pub region: Option<String>,
+    pub qos: Option<String>,
+    pub min_reputation: Option<f64>,
+    pub browser_usable_only: Option<bool>,
+    pub profile_request: Option<ProfileRequest>,
+    pub route_constraints: Option<RouteConstraints>,
 }
 
 /// OpenAI-compatible chat completion response.

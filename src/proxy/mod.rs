@@ -72,6 +72,7 @@ impl ProxyBackend for IicpClient {
                 intent,
                 payload,
                 constraints: None,
+                route_constraints: None,
                 auth: None,
                 // Proxy gateway has no registered node identity — self-query
                 // neutrality (#488) does not apply to anonymous consumers.
