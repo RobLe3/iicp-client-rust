@@ -20,6 +20,7 @@
 mod client;
 pub mod consumer_token;
 pub mod dispatch_ticket;
+pub mod dispatch_ticket_trust;
 mod endpoint_security;
 mod errors;
 mod http;

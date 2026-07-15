@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 
 pub const PROFILE: &str = "urn:iicp:profile:service-lifecycle:v1";
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LifecycleEvent {
     pub task_id: String,
     pub sequence: u64,
@@ -34,7 +34,7 @@ pub struct LifecycleEvent {
     pub detail: Value,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct LifecycleRecord {
     pub task_id: String,
     pub idempotency_key: String,
@@ -42,6 +42,12 @@ pub struct LifecycleRecord {
     pub state: String,
     pub events: Vec<LifecycleEvent>,
     pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct LifecycleSnapshot {
+    pub profile: String,
+    pub records: Vec<LifecycleRecord>,
 }
 
 impl LifecycleRecord {
@@ -202,6 +208,47 @@ impl LifecycleStore {
             .into_iter()
             .filter(|event| event.sequence as i64 > after_sequence)
             .collect())
+    }
+
+    pub async fn events_after_bounded(
+        &self,
+        task_id: &str,
+        after_sequence: i64,
+        limit: usize,
+    ) -> Result<Vec<LifecycleEvent>, LifecycleError> {
+        let mut events = self.events_after(task_id, after_sequence).await?;
+        events.truncate(limit.max(1));
+        Ok(events)
+    }
+
+    pub async fn snapshot(&self) -> LifecycleSnapshot {
+        LifecycleSnapshot {
+            profile: PROFILE.into(),
+            records: self.records.lock().await.values().cloned().collect(),
+        }
+    }
+
+    pub async fn restore(&self, snapshot: LifecycleSnapshot) -> Result<(), LifecycleError> {
+        if snapshot.profile != PROFILE {
+            return Err(LifecycleError::Conflict(
+                "unsupported lifecycle snapshot profile".into(),
+            ));
+        }
+        let mut restored = HashMap::new();
+        for record in snapshot.records {
+            if record.events.is_empty()
+                || record.events.iter().enumerate().any(|(index, event)| {
+                    event.sequence != record.events[0].sequence + index as u64
+                })
+            {
+                return Err(LifecycleError::Conflict(
+                    "invalid lifecycle snapshot sequence".into(),
+                ));
+            }
+            restored.insert(record.task_id.clone(), record);
+        }
+        *self.records.lock().await = restored;
+        Ok(())
     }
 }
 
