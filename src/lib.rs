@@ -69,6 +69,7 @@ pub mod request_projection;
 pub mod routing_policy;
 pub mod scheduler;
 pub mod selection;
+pub mod service_lifecycle;
 pub mod token_validator;
 pub mod trust_auditor;
 pub mod tunnel;
