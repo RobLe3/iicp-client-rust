@@ -366,10 +366,45 @@ pub(crate) fn legal_transition(from: &str, to: &str) -> bool {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LifecycleOperation {
+    Submit,
+    Status,
+    Observe,
+    Cancel,
+}
+
+#[derive(Clone, Debug)]
+pub struct LifecycleAuthorizationRequest {
+    pub credential: Option<String>,
+    pub operation: LifecycleOperation,
+    pub task_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LifecycleAuthorizationDecision {
+    pub authenticated: bool,
+    pub allowed: bool,
+    pub conceal_task: bool,
+}
+
+impl LifecycleAuthorizationDecision {
+    pub fn allowed() -> Self {
+        Self {
+            authenticated: true,
+            allowed: true,
+            conceal_task: false,
+        }
+    }
+}
+
+pub type LifecycleAuthorizer =
+    Arc<dyn Fn(&LifecycleAuthorizationRequest) -> LifecycleAuthorizationDecision + Send + Sync>;
+
 #[derive(Clone)]
 struct HttpState {
     store: Arc<dyn LifecyclePersistence>,
-    bearer_token: String,
+    authorizer: LifecycleAuthorizer,
 }
 
 #[derive(Deserialize)]
@@ -389,11 +424,30 @@ fn default_after() -> i64 {
     -1
 }
 
-fn authorized(headers: &HeaderMap, state: &HttpState) -> bool {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == format!("Bearer {}", state.bearer_token))
+fn authorize(
+    headers: &HeaderMap,
+    state: &HttpState,
+    operation: LifecycleOperation,
+    task_id: &str,
+) -> Result<(), StatusCode> {
+    let request = LifecycleAuthorizationRequest {
+        credential: headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned),
+        operation,
+        task_id: task_id.to_owned(),
+    };
+    let decision = (state.authorizer)(&request);
+    if decision.allowed && decision.authenticated {
+        Ok(())
+    } else if !decision.authenticated {
+        Err(StatusCode::UNAUTHORIZED)
+    } else if decision.conceal_task {
+        Err(StatusCode::NOT_FOUND)
+    } else {
+        Err(StatusCode::FORBIDDEN)
+    }
 }
 
 fn record_json(record: &LifecycleRecord) -> Value {
@@ -426,8 +480,8 @@ async fn submit_http(
     headers: HeaderMap,
     Json(body): Json<SubmitRequest>,
 ) -> Response {
-    if !authorized(&headers, &state) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = authorize(&headers, &state, LifecycleOperation::Submit, &body.task_id) {
+        return status.into_response();
     }
     match state
         .store
@@ -452,8 +506,8 @@ async fn status_http(
     headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Response {
-    if !authorized(&headers, &state) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = authorize(&headers, &state, LifecycleOperation::Status, &task_id) {
+        return status.into_response();
     }
     match state.store.status(&task_id).await {
         Ok(record) => Json(record_json(&record)).into_response(),
@@ -467,8 +521,8 @@ async fn observe_http(
     Path(task_id): Path<String>,
     Query(query): Query<ObserveQuery>,
 ) -> Response {
-    if !authorized(&headers, &state) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = authorize(&headers, &state, LifecycleOperation::Observe, &task_id) {
+        return status.into_response();
     }
     match state
         .store
@@ -493,8 +547,8 @@ async fn cancel_http(
     headers: HeaderMap,
     Path(task_id): Path<String>,
 ) -> Response {
-    if !authorized(&headers, &state) {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Err(status) = authorize(&headers, &state, LifecycleOperation::Cancel, &task_id) {
+        return status.into_response();
     }
     match state.store.cancel(&task_id).await {
         Ok(record) => Json(record_json(&record)).into_response(),
@@ -502,20 +556,34 @@ async fn cancel_http(
     }
 }
 
-/// Build the draft HTTP binding. Calling this function is the profile opt-in.
+/// Build the draft HTTP binding with the compatibility/test shared token.
 pub fn lifecycle_router(store: LifecycleStore, bearer_token: impl Into<String>) -> Router {
     lifecycle_router_with_persistence(Arc::new(store), bearer_token)
 }
 
-/// Build the draft HTTP binding with an explicitly selected persistence port.
+/// Build the draft HTTP binding with a shared-token compatibility authorizer.
 pub fn lifecycle_router_with_persistence(
     store: Arc<dyn LifecyclePersistence>,
     bearer_token: impl Into<String>,
 ) -> Router {
-    let state = HttpState {
-        store,
-        bearer_token: bearer_token.into(),
-    };
+    let expected = format!("Bearer {}", bearer_token.into());
+    let authorizer: LifecycleAuthorizer = Arc::new(move |request| {
+        let valid = request.credential.as_deref() == Some(expected.as_str());
+        LifecycleAuthorizationDecision {
+            authenticated: valid,
+            allowed: valid,
+            conceal_task: false,
+        }
+    });
+    lifecycle_router_with_authorizer(store, authorizer)
+}
+
+/// Build the explicitly mounted draft binding with operation-level authorization.
+pub fn lifecycle_router_with_authorizer(
+    store: Arc<dyn LifecyclePersistence>,
+    authorizer: LifecycleAuthorizer,
+) -> Router {
+    let state = HttpState { store, authorizer };
     Router::new()
         .route("/v1/tasks", post(submit_http))
         .route("/v1/tasks/:task_id", get(status_http))
