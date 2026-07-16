@@ -18,9 +18,15 @@ use std::time::Duration;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use ed25519_dalek::{Signer, SigningKey};
+use iicp_client::confidentiality::{
+    decrypt_payload_with_context, decrypt_response, encrypt_payload_with_context, encrypt_response,
+};
 use iicp_client::node::{IicpNode, NodeConfig};
 use iicp_client::relay_session::{HttpPollWorkerSession, RelaySession, RelaySessionRegistry};
+use iicp_client::CxPublicKey;
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 const INTENT: &str = "urn:iicp:intent:llm:chat:v1";
 
@@ -331,6 +337,119 @@ async fn full_dispatch_roundtrip_via_relay_for() {
     let resp: Value = dispatch.json().await.unwrap();
     assert_eq!(resp["status"], "completed");
     assert_eq!(resp["result"]["text"], "MESH OK from browser");
+}
+
+#[tokio::test]
+async fn strict_bind_keeps_encrypted_request_and_response_opaque_through_relay() {
+    let worker_id = "w-cx-roundtrip";
+    let task_id = "t-cx-relay-1";
+    let secret_text = "relay must never observe this plaintext";
+    let (bind_ticket, bind_public_key) = signed_ticket(worker_id, "relay-node");
+    let mut cfg = NodeConfig::new("relay-node", "http://relay.local", INTENT);
+    cfg.relay_capable = true;
+    cfg.relay_accept_port = free_port();
+    cfg.relay_bind_ticket_public_key_hex = Some(bind_public_key);
+    cfg.relay_require_bind_ticket = true;
+    let port = spawn_relay_with_config(cfg).await;
+    let client = reqwest::Client::new();
+
+    let private_key = StaticSecret::from([42u8; 32]);
+    let public_key = X25519PublicKey::from(&private_key);
+    let cx_public_key = CxPublicKey {
+        algorithm: "X25519".to_string(),
+        encoding: Some("base64url".to_string()),
+        key: URL_SAFE_NO_PAD.encode(public_key.as_bytes()),
+        key_id: "cx-relay-roundtrip".to_string(),
+        features: vec!["response_encryption_v1".to_string()],
+    };
+    let (request_envelope, consumer_secret) = encrypt_payload_with_context(
+        &json!({"secret": secret_text}),
+        &cx_public_key,
+        task_id,
+        INTENT,
+    )
+    .unwrap();
+
+    let bind = client
+        .post(format!("http://127.0.0.1:{port}/v1/relay/bind"))
+        .json(&json!({
+            "worker_id": worker_id,
+            "intent": INTENT,
+            "models": [],
+            "bind_ticket": bind_ticket,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bind.status(), 200);
+    let bind_body: Value = bind.json().await.unwrap();
+    let session_token = bind_body["session_token"].as_str().unwrap().to_string();
+
+    let worker_client = client.clone();
+    let private_bytes = private_key.to_bytes();
+    let worker = tokio::spawn(async move {
+        let pull = worker_client
+            .get(format!("http://127.0.0.1:{port}/v1/relay/pull"))
+            .bearer_auth(&session_token)
+            .timeout(Duration::from_secs(35))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(pull.status(), 200);
+        let call: Value = pull.json().await.unwrap();
+        let task = call["task"].clone();
+        assert!(task.get("payload").is_none());
+        let envelope: HashMap<String, Value> =
+            serde_json::from_value(task["iicp_conf"].clone()).unwrap();
+        let (opened, worker_secret) =
+            decrypt_payload_with_context(&envelope, &private_bytes).unwrap();
+        assert_eq!(opened, json!({"secret": secret_text}));
+        let plain_response = json!({
+            "task_id": task_id,
+            "status": "success",
+            "result": {"text": "encrypted relay response"},
+        });
+        let response_envelope = encrypt_response(&plain_response, &worker_secret, task_id).unwrap();
+        worker_client
+            .post(format!("http://127.0.0.1:{port}/v1/relay/result"))
+            .bearer_auth(&session_token)
+            .json(&json!({
+                "call_id": call["call_id"],
+                "result": {"iicp_conf_resp": response_envelope},
+            }))
+            .send()
+            .await
+            .unwrap();
+        task.to_string()
+    });
+
+    let dispatch = client
+        .post(format!(
+            "http://127.0.0.1:{port}/v1/relay-for/{worker_id}/v1/task"
+        ))
+        .timeout(Duration::from_secs(40))
+        .json(&json!({
+            "task_id": task_id,
+            "intent": INTENT,
+            "iicp_conf": request_envelope,
+            "cx_response_encryption": "required",
+        }))
+        .send()
+        .await
+        .unwrap();
+    let relay_visible = worker.await.unwrap();
+    assert_eq!(dispatch.status(), 200);
+    let response: Value = dispatch.json().await.unwrap();
+    assert!(response.get("result").is_none());
+    let response_envelope: HashMap<String, Value> =
+        serde_json::from_value(response["iicp_conf_resp"].clone()).unwrap();
+    let opened_response = decrypt_response(&response_envelope, &consumer_secret, task_id).unwrap();
+    assert_eq!(
+        opened_response["result"]["text"],
+        "encrypted relay response"
+    );
+    assert!(!relay_visible.contains(secret_text));
+    assert!(!response.to_string().contains("encrypted relay response"));
 }
 
 #[tokio::test]
