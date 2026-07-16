@@ -58,6 +58,7 @@ pub mod peer_manager;
 pub mod policy;
 pub mod policy_data_handling;
 pub mod policy_manifest;
+pub mod policy_operational_evidence;
 pub mod pricing;
 pub mod profile_compatibility;
 pub mod recovery;
