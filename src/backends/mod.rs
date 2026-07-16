@@ -23,6 +23,7 @@ pub mod vllm;
 
 use serde_json::Value;
 
+use crate::service_lifecycle::BackendCancellationRegistry;
 use openai_compat::OpenAiCompatOptions;
 
 /// Selectable backend engine names (mirrors the Python/TS `BACKEND_TYPES`).
@@ -50,4 +51,51 @@ pub async fn invoke_backend(
             "unknown backend_type {other:?}; choose one of {BACKEND_TYPES:?}"
         )),
     }
+}
+
+/// Opt-in lifecycle bridge for a backend invocation.
+///
+/// Aborting the HTTP future proves only that the transport request was
+/// cancelled. It does not claim that the model runtime stopped execution.
+pub async fn invoke_backend_with_cancellation(
+    task_id: &str,
+    registry: &BackendCancellationRegistry,
+    backend_type: &str,
+    opts: &OpenAiCompatOptions,
+    intent: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    let backend_type_owned = backend_type.to_owned();
+    let opts_owned = opts.clone();
+    let intent_owned = intent.to_owned();
+    let payload_owned = payload.clone();
+    let handle = tokio::spawn(async move {
+        invoke_backend(
+            &backend_type_owned,
+            &opts_owned,
+            &intent_owned,
+            &payload_owned,
+        )
+        .await
+    });
+    let abort = handle.abort_handle();
+    registry.register(task_id, move || {
+        abort.abort();
+        true
+    });
+    let result = match handle.await {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => {
+            registry
+                .report(task_id, "transport_aborted")
+                .expect("known cancellation evidence");
+            Ok(serde_json::json!({
+                "error_code": 499,
+                "error_message": "backend request cancelled"
+            }))
+        }
+        Err(error) => Err(format!("backend task join error: {error}")),
+    };
+    registry.complete(task_id);
+    result
 }
