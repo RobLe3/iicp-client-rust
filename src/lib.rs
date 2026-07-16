@@ -56,6 +56,7 @@ pub mod mcp_policy;
 pub mod operator_crypto;
 pub mod peer_manager;
 pub mod policy;
+pub mod policy_data_handling;
 pub mod policy_manifest;
 pub mod pricing;
 pub mod profile_compatibility;
