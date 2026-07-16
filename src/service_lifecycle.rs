@@ -74,10 +74,19 @@ pub struct ObserverLagged {
 
 type CancelHandler = Arc<dyn Fn() -> bool + Send + Sync>;
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendCancellationEvidence {
+    pub task_id: String,
+    pub outcome: String,
+    pub cleanup_complete: bool,
+}
+
 #[derive(Clone, Default)]
 pub struct BackendCancellationRegistry {
     handlers: Arc<StdMutex<HashMap<String, CancelHandler>>>,
     signalled: Arc<StdMutex<HashSet<String>>>,
+    evidence: Arc<StdMutex<HashMap<String, BackendCancellationEvidence>>>,
+    evidence_order: Arc<StdMutex<VecDeque<String>>>,
 }
 
 impl BackendCancellationRegistry {
@@ -97,6 +106,45 @@ impl BackendCancellationRegistry {
     }
 
     pub fn complete(&self, task_id: &str) {
+        self.complete_with_outcome(task_id, None);
+    }
+
+    pub fn report(
+        &self,
+        task_id: &str,
+        outcome: &str,
+    ) -> Result<BackendCancellationEvidence, String> {
+        if !matches!(
+            outcome,
+            "cancel_requested"
+                | "transport_aborted"
+                | "backend_acknowledged"
+                | "execution_stopped"
+                | "cancel_unsupported"
+                | "already_terminal"
+        ) {
+            return Err(format!("unsupported cancellation evidence: {outcome}"));
+        }
+        let cleanup_complete = self
+            .evidence
+            .lock()
+            .expect("cancellation evidence lock")
+            .get(task_id)
+            .is_some_and(|current| current.cleanup_complete);
+        let evidence = BackendCancellationEvidence {
+            task_id: task_id.into(),
+            outcome: outcome.into(),
+            cleanup_complete,
+        };
+        self.remember(evidence.clone());
+        Ok(evidence)
+    }
+
+    pub fn complete_with_outcome(
+        &self,
+        task_id: &str,
+        outcome: Option<&str>,
+    ) -> BackendCancellationEvidence {
         self.handlers
             .lock()
             .expect("cancellation registry lock")
@@ -105,11 +153,56 @@ impl BackendCancellationRegistry {
             .lock()
             .expect("cancellation signal lock")
             .remove(task_id);
+        let current = self
+            .evidence
+            .lock()
+            .expect("cancellation evidence lock")
+            .get(task_id)
+            .cloned();
+        let had_current = current.is_some();
+        let evidence = BackendCancellationEvidence {
+            task_id: task_id.into(),
+            outcome: outcome
+                .map(str::to_owned)
+                .or_else(|| current.map(|value| value.outcome))
+                .unwrap_or_else(|| "cancel_unsupported".into()),
+            cleanup_complete: true,
+        };
+        if !had_current && outcome.is_none() {
+            return evidence;
+        }
+        self.remember(evidence.clone());
+        evidence
+    }
+
+    pub fn evidence(&self, task_id: &str) -> Option<BackendCancellationEvidence> {
+        self.evidence
+            .lock()
+            .expect("cancellation evidence lock")
+            .get(task_id)
+            .cloned()
+    }
+
+    fn remember(&self, evidence: BackendCancellationEvidence) {
+        let mut values = self.evidence.lock().expect("cancellation evidence lock");
+        let mut order = self
+            .evidence_order
+            .lock()
+            .expect("cancellation evidence order lock");
+        if !values.contains_key(&evidence.task_id) {
+            if order.len() >= 256 {
+                if let Some(oldest) = order.pop_front() {
+                    values.remove(&oldest);
+                }
+            }
+            order.push_back(evidence.task_id.clone());
+        }
+        values.insert(evidence.task_id.clone(), evidence);
     }
 
     pub fn request(&self, task_id: &str, state: &str) -> &'static str {
         if terminal(state) {
-            self.complete(task_id);
+            self.complete_with_outcome(task_id, Some("already_terminal"));
             return "already_terminal";
         }
         if self
@@ -127,15 +220,19 @@ impl BackendCancellationRegistry {
             .get(task_id)
             .cloned();
         let Some(handler) = handler else {
+            self.complete_with_outcome(task_id, Some("cancel_unsupported"));
             return "cancel_unsupported";
         };
         if !handler() {
+            self.complete_with_outcome(task_id, Some("cancel_unsupported"));
             return "cancel_unsupported";
         }
         self.signalled
             .lock()
             .expect("cancellation signal lock")
             .insert(task_id.into());
+        self.report(task_id, "cancel_requested")
+            .expect("known cancellation evidence");
         "cancel_signalled"
     }
 }

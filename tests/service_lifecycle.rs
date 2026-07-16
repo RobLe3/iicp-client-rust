@@ -337,6 +337,24 @@ async fn runtime_control_fixture_cancellation_and_bounded_observation() {
             vector["expected"].as_str().unwrap()
         );
     }
+    for vector in fixture["cancellation_evidence"]["vectors"]
+        .as_array()
+        .unwrap()
+    {
+        let registry = BackendCancellationRegistry::default();
+        let task_id = vector["id"].as_str().unwrap();
+        registry.register(task_id, || true);
+        assert_eq!(registry.request(task_id, "running"), "cancel_signalled");
+        registry
+            .report(task_id, vector["reported"].as_str().unwrap())
+            .unwrap();
+        let evidence = registry.complete_with_outcome(task_id, None);
+        assert_eq!(evidence.outcome, vector["expected"]);
+        assert_eq!(
+            evidence.cleanup_complete,
+            vector["cleanup_complete"].as_bool().unwrap()
+        );
+    }
 
     let observation = &fixture["observation"];
     let buffer = BoundedObserverBuffer::new(observation["capacity"].as_u64().unwrap() as usize, 1);
@@ -407,5 +425,8 @@ async fn cancellation_registry_aborts_active_http_request() {
     });
     assert_eq!(registry.request("active", "running"), "cancel_signalled");
     assert!(request.await.unwrap_err().is_cancelled());
+    let evidence = registry.complete_with_outcome("active", Some("transport_aborted"));
+    assert_eq!(evidence.outcome, "transport_aborted");
+    assert!(evidence.cleanup_complete);
     server.abort();
 }

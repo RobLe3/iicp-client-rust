@@ -5,7 +5,10 @@
 use std::time::Duration;
 
 use iicp_client::backends::openai_compat::{invoke, OpenAiCompatOptions};
-use iicp_client::backends::{invoke_backend, llamacpp, meshllm, vllm, BACKEND_TYPES};
+use iicp_client::backends::{
+    invoke_backend, invoke_backend_with_cancellation, llamacpp, meshllm, vllm, BACKEND_TYPES,
+};
+use iicp_client::service_lifecycle::BackendCancellationRegistry;
 use serde_json::json;
 
 fn opts(base_url: String, model: Option<&str>) -> OpenAiCompatOptions {
@@ -15,6 +18,47 @@ fn opts(base_url: String, model: Option<&str>) -> OpenAiCompatOptions {
         api_key: None,
         timeout: Duration::from_secs(5),
     }
+}
+
+#[tokio::test]
+async fn backend_cancellation_records_transport_abort_and_cleanup() {
+    use axum::{routing::post, Router};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/chat/completions",
+        post(|| async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            axum::Json(json!({"choices":[]}))
+        }),
+    );
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    for backend in ["openai_compat", "vllm", "meshllm"] {
+        let registry = BackendCancellationRegistry::default();
+        let task_id = format!("cancel-{backend}");
+        let options = opts(format!("http://{address}"), Some("m"));
+        let payload = json!({"messages":[]});
+        let pending = invoke_backend_with_cancellation(
+            &task_id,
+            &registry,
+            backend,
+            &options,
+            "urn:iicp:intent:llm:chat:v1",
+            &payload,
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            result = &mut pending => panic!("backend completed before cancellation: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        assert_eq!(registry.request(&task_id, "running"), "cancel_signalled");
+        let result = pending.await.unwrap();
+        assert_eq!(result["error_code"], 499);
+        let evidence = registry.evidence(&task_id).unwrap();
+        assert_eq!(evidence.outcome, "transport_aborted");
+        assert!(evidence.cleanup_complete);
+    }
+    server.abort();
 }
 
 #[tokio::test]
