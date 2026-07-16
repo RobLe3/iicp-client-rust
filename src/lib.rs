@@ -73,6 +73,7 @@ pub mod routing_policy;
 pub mod scheduler;
 pub mod selection;
 pub mod service_lifecycle;
+pub mod service_lifecycle_accounting;
 #[cfg(feature = "lifecycle-sqlite")]
 pub mod service_lifecycle_sqlite;
 pub mod token_validator;
