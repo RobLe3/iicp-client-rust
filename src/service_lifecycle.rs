@@ -15,10 +15,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet, VecDeque},
     future::Future,
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::Mutex;
@@ -64,6 +64,168 @@ pub enum LifecycleError {
     UnknownTask,
     ResumeUnavailable { state: String, latest_sequence: u64 },
     Storage(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObserverLagged {
+    pub earliest_available: u64,
+    pub latest_sequence: u64,
+}
+
+type CancelHandler = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct BackendCancellationRegistry {
+    handlers: Arc<StdMutex<HashMap<String, CancelHandler>>>,
+    signalled: Arc<StdMutex<HashSet<String>>>,
+}
+
+impl BackendCancellationRegistry {
+    pub fn register<F>(&self, task_id: impl Into<String>, handler: F)
+    where
+        F: Fn() -> bool + Send + Sync + 'static,
+    {
+        let task_id = task_id.into();
+        self.handlers
+            .lock()
+            .expect("cancellation registry lock")
+            .insert(task_id.clone(), Arc::new(handler));
+        self.signalled
+            .lock()
+            .expect("cancellation signal lock")
+            .remove(&task_id);
+    }
+
+    pub fn complete(&self, task_id: &str) {
+        self.handlers
+            .lock()
+            .expect("cancellation registry lock")
+            .remove(task_id);
+        self.signalled
+            .lock()
+            .expect("cancellation signal lock")
+            .remove(task_id);
+    }
+
+    pub fn request(&self, task_id: &str, state: &str) -> &'static str {
+        if terminal(state) {
+            self.complete(task_id);
+            return "already_terminal";
+        }
+        if self
+            .signalled
+            .lock()
+            .expect("cancellation signal lock")
+            .contains(task_id)
+        {
+            return "cancel_signalled";
+        }
+        let handler = self
+            .handlers
+            .lock()
+            .expect("cancellation registry lock")
+            .get(task_id)
+            .cloned();
+        let Some(handler) = handler else {
+            return "cancel_unsupported";
+        };
+        if !handler() {
+            return "cancel_unsupported";
+        }
+        self.signalled
+            .lock()
+            .expect("cancellation signal lock")
+            .insert(task_id.into());
+        "cancel_signalled"
+    }
+}
+
+#[derive(Clone)]
+pub struct BoundedObserverBuffer {
+    state: Arc<StdMutex<ObserverState>>,
+    capacity: usize,
+    max_observers: usize,
+}
+
+#[derive(Default)]
+struct ObserverState {
+    events: VecDeque<LifecycleEvent>,
+    observers: HashSet<String>,
+    closed: bool,
+}
+
+impl BoundedObserverBuffer {
+    pub fn new(capacity: usize, max_observers: usize) -> Self {
+        Self {
+            state: Arc::new(StdMutex::new(ObserverState::default())),
+            capacity: capacity.max(1),
+            max_observers: max_observers.max(1),
+        }
+    }
+
+    pub fn subscribe(&self, observer_id: &str) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock().expect("observer lock");
+        if !state.observers.contains(observer_id) && state.observers.len() >= self.max_observers {
+            return Err(LifecycleError::Conflict(
+                "observer capacity exhausted".into(),
+            ));
+        }
+        state.observers.insert(observer_id.into());
+        Ok(())
+    }
+
+    pub fn disconnect(&self, observer_id: &str) {
+        self.state
+            .lock()
+            .expect("observer lock")
+            .observers
+            .remove(observer_id);
+    }
+
+    pub fn publish(&self, event: LifecycleEvent) -> Result<(), LifecycleError> {
+        let mut state = self.state.lock().expect("observer lock");
+        if state
+            .events
+            .back()
+            .is_some_and(|last| event.sequence <= last.sequence)
+        {
+            return Err(LifecycleError::Conflict(
+                "observer sequence must increase".into(),
+            ));
+        }
+        state.closed = event.is_final;
+        state.events.push_back(event);
+        while state.events.len() > self.capacity {
+            state.events.pop_front();
+        }
+        Ok(())
+    }
+
+    pub fn poll(&self, after_sequence: u64) -> Result<Vec<LifecycleEvent>, ObserverLagged> {
+        let state = self.state.lock().expect("observer lock");
+        if let (Some(first), Some(last)) = (state.events.front(), state.events.back()) {
+            if after_sequence.saturating_add(1) < first.sequence {
+                return Err(ObserverLagged {
+                    earliest_available: first.sequence,
+                    latest_sequence: last.sequence,
+                });
+            }
+        }
+        Ok(state
+            .events
+            .iter()
+            .filter(|event| event.sequence > after_sequence)
+            .cloned()
+            .collect())
+    }
+
+    pub fn observer_count(&self) -> usize {
+        self.state.lock().expect("observer lock").observers.len()
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().expect("observer lock").closed
+    }
 }
 
 pub type LifecycleFuture<'a, T> =
