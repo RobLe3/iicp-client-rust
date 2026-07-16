@@ -204,3 +204,117 @@ async fn snapshot_restore_and_bounded_replay_are_deterministic() {
     assert_eq!(restored.cancel("restart").await.unwrap().state, "cancelled");
     assert_eq!(restored.cancel("restart").await.unwrap().state, "cancelled");
 }
+
+#[tokio::test]
+async fn task_scoped_authorizer_conceals_cross_principal_access() {
+    use iicp_client::service_lifecycle::{
+        lifecycle_router_with_authorizer, LifecycleAuthorizationDecision, LifecycleAuthorizer,
+        LifecycleOperation,
+    };
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../parity/service-lifecycle-authorization-v1.json"
+    ))
+    .unwrap();
+    let owners = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+    let auth_owners = owners.clone();
+    let authorizer: LifecycleAuthorizer = Arc::new(move |request| {
+        let token = request.credential.as_deref();
+        if matches!(token, None | Some("Bearer invalid" | "Bearer expired")) {
+            return LifecycleAuthorizationDecision {
+                authenticated: false,
+                allowed: false,
+                conceal_task: false,
+            };
+        }
+        let principal = match token {
+            Some("Bearer owner") => "owner",
+            Some("Bearer other") => "other",
+            Some("Bearer read-only") => "reader",
+            Some("Bearer operator") => "operator",
+            _ => {
+                return LifecycleAuthorizationDecision {
+                    authenticated: false,
+                    allowed: false,
+                    conceal_task: false,
+                }
+            }
+        };
+        if principal == "operator" {
+            return LifecycleAuthorizationDecision::allowed();
+        }
+        if request.operation == LifecycleOperation::Submit {
+            if principal == "owner" {
+                auth_owners
+                    .lock()
+                    .unwrap()
+                    .entry(request.task_id.clone())
+                    .or_insert_with(|| principal.to_owned());
+                return LifecycleAuthorizationDecision::allowed();
+            }
+            return LifecycleAuthorizationDecision {
+                authenticated: true,
+                allowed: false,
+                conceal_task: false,
+            };
+        }
+        let allowed = auth_owners
+            .lock()
+            .unwrap()
+            .get(&request.task_id)
+            .is_some_and(|owner| owner == principal);
+        LifecycleAuthorizationDecision {
+            authenticated: true,
+            allowed,
+            conceal_task: !allowed,
+        }
+    });
+
+    let store = Arc::new(LifecycleStore::new(8, 3_600_000));
+    let app = lifecycle_router_with_authorizer(store, authorizer);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = reqwest::Client::new();
+    let base = format!("http://{address}/v1/tasks");
+    let body = json!({"task_id":"task-a","idempotency_key":"key-a","request_digest":"sha256:a"});
+
+    for case in fixture["cases"].as_array().unwrap() {
+        let mut request = match case["operation"].as_str().unwrap() {
+            "submit" => client.post(&base).json(&if case["task_id"] == "task-a" {
+                body.clone()
+            } else {
+                json!({"task_id":"task-b","idempotency_key":"key-b","request_digest":"sha256:a"})
+            }),
+            "status" => client.get(format!("{base}/{}", case["task_id"].as_str().unwrap())),
+            "observe" => client.get(format!(
+                "{base}/{}/events",
+                case["task_id"].as_str().unwrap()
+            )),
+            "cancel" => client.post(format!(
+                "{base}/{}/cancel",
+                case["task_id"].as_str().unwrap()
+            )),
+            _ => unreachable!(),
+        };
+        if let Some(credential) = case["credential"].as_str() {
+            request = request.header("Authorization", credential);
+        }
+        let response = request.send().await.unwrap();
+        let mut expected = fixture["decision_contract"][case["expected"].as_str().unwrap()]
+            .as_u64()
+            .unwrap() as u16;
+        if case["id"] == "LIFECYCLE-AUTH-03" {
+            expected = 202;
+        }
+        assert_eq!(response.status().as_u16(), expected, "{}", case["id"]);
+        let response_text = response.text().await.unwrap();
+        assert!(!response_text.contains("principal_id"));
+        if let Some(credential) = case["credential"].as_str() {
+            assert!(!response_text.contains(credential));
+        }
+    }
+    server.abort();
+}
