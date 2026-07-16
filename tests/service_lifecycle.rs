@@ -1,4 +1,7 @@
 use iicp_client::service_lifecycle::{lifecycle_router, LifecycleError, LifecycleStore};
+use iicp_client::service_lifecycle::{
+    BackendCancellationRegistry, BoundedObserverBuffer, LifecycleEvent, ObserverLagged,
+};
 use serde_json::{json, Value};
 
 #[tokio::test]
@@ -316,5 +319,93 @@ async fn task_scoped_authorizer_conceals_cross_principal_access() {
             assert!(!response_text.contains(credential));
         }
     }
+    server.abort();
+}
+#[tokio::test]
+async fn runtime_control_fixture_cancellation_and_bounded_observation() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../parity/service-lifecycle-runtime-control-v1.json"
+    ))
+    .unwrap();
+    for vector in fixture["cancellation"].as_array().unwrap() {
+        let registry = BackendCancellationRegistry::default();
+        if vector["handler"] == "registered" {
+            registry.register("task", || true);
+        }
+        assert_eq!(
+            registry.request("task", vector["state"].as_str().unwrap()),
+            vector["expected"].as_str().unwrap()
+        );
+    }
+
+    let observation = &fixture["observation"];
+    let buffer = BoundedObserverBuffer::new(observation["capacity"].as_u64().unwrap() as usize, 1);
+    buffer.subscribe("observer").unwrap();
+    for sequence in observation["published_sequences"].as_array().unwrap() {
+        buffer
+            .publish(LifecycleEvent {
+                task_id: "task".into(),
+                sequence: sequence.as_u64().unwrap(),
+                state: "streaming".into(),
+                is_final: false,
+                observed_at_ms: 1,
+                detail: serde_json::Value::Null,
+            })
+            .unwrap();
+    }
+    assert_eq!(
+        buffer
+            .poll(1)
+            .unwrap()
+            .iter()
+            .map(|event| event.sequence)
+            .collect::<Vec<_>>(),
+        vec![2, 3]
+    );
+    assert_eq!(
+        buffer.poll(0).unwrap_err(),
+        ObserverLagged {
+            earliest_available: 2,
+            latest_sequence: 3,
+        }
+    );
+    buffer
+        .publish(LifecycleEvent {
+            task_id: "task".into(),
+            sequence: 4,
+            state: "completed".into(),
+            is_final: true,
+            observed_at_ms: 2,
+            detail: serde_json::Value::Null,
+        })
+        .unwrap();
+    assert!(buffer.is_closed());
+    buffer.disconnect("observer");
+    assert_eq!(buffer.observer_count(), 0);
+}
+
+#[tokio::test]
+async fn cancellation_registry_aborts_active_http_request() {
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = [0_u8; 1024];
+        let _ = stream.read(&mut request).await;
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    });
+    let request = tokio::spawn(async move { reqwest::get(format!("http://{address}/slow")).await });
+    tokio::task::yield_now().await;
+    let abort = request.abort_handle();
+    let registry = BackendCancellationRegistry::default();
+    registry.register("active", move || {
+        abort.abort();
+        true
+    });
+    assert_eq!(registry.request("active", "running"), "cancel_signalled");
+    assert!(request.await.unwrap_err().is_cancelled());
     server.abort();
 }
