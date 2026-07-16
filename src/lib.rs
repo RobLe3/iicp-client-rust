@@ -75,6 +75,7 @@ pub mod scheduler;
 pub mod selection;
 pub mod service_lifecycle;
 pub mod service_lifecycle_accounting;
+pub mod service_lifecycle_distributed;
 #[cfg(feature = "lifecycle-sqlite")]
 pub mod service_lifecycle_sqlite;
 pub mod token_validator;
