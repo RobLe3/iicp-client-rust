@@ -15,6 +15,8 @@ pub struct DispatchRouteTicketClaims {
     pub intent: String,
     pub iat: i64,
     pub exp: i64,
+    #[serde(default)]
+    pub policy_manifest_sha256: Option<String>,
 }
 pub fn verify_dispatch_route_ticket(
     token: &str,
@@ -42,11 +44,30 @@ pub fn verify_dispatch_route_ticket(
         && claims.intent == intent
         && claims.exp > now_s
         && claims.jti.len() == 24
+        && claims.policy_manifest_sha256.as_ref().is_none_or(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        })
         && claims
             .jti
             .bytes()
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()))
     .then_some(claims)
+}
+
+pub fn policy_manifest_binding_matches(
+    claims: &DispatchRouteTicketClaims,
+    route: &serde_json::Value,
+) -> bool {
+    let Some(expected) = claims.policy_manifest_sha256.as_deref() else {
+        return true;
+    };
+    route
+        .pointer("/node_policy_manifest/verification/canonical_sha256")
+        .and_then(serde_json::Value::as_str)
+        == Some(expected)
 }
 #[cfg(test)]
 mod tests {
@@ -65,6 +86,37 @@ mod tests {
             1_800_000_000
         )
         .is_some());
+    }
+
+    #[test]
+    fn policy_manifest_binding_is_additive_and_fail_closed_when_present() {
+        let claims = DispatchRouteTicketClaims {
+            v: 1,
+            typ: "dispatch-route-ticket".into(),
+            iss: "https://directory.example".into(),
+            aud: AUDIENCE.into(),
+            jti: "0".repeat(24),
+            node_id: "node".into(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            iat: 1,
+            exp: 2,
+            policy_manifest_sha256: Some("a".repeat(64)),
+        };
+        let matching = serde_json::json!({"node_policy_manifest":{"verification":{"canonical_sha256":"a".repeat(64)}}});
+        let altered = serde_json::json!({"node_policy_manifest":{"verification":{"canonical_sha256":"b".repeat(64)}}});
+        assert!(policy_manifest_binding_matches(&claims, &matching));
+        assert!(!policy_manifest_binding_matches(&claims, &altered));
+        assert!(!policy_manifest_binding_matches(
+            &claims,
+            &serde_json::json!({})
+        ));
+        assert!(policy_manifest_binding_matches(
+            &DispatchRouteTicketClaims {
+                policy_manifest_sha256: None,
+                ..claims
+            },
+            &serde_json::json!({})
+        ));
     }
 }
 

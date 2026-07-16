@@ -7,7 +7,7 @@ use regex::Regex;
 
 use crate::confidentiality::{decrypt_response, encrypt_payload_with_context};
 use crate::consumer_token::{acquire_consumer_token, ConsumerTokenCache};
-use crate::dispatch_ticket::verify_dispatch_route_ticket;
+use crate::dispatch_ticket::{policy_manifest_binding_matches, verify_dispatch_route_ticket};
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
 use crate::policy::ensure_intent_allowed;
@@ -352,22 +352,19 @@ impl IicpClient {
                 }
                 let directory_key = self.dispatch_ticket_key.lock().unwrap().clone();
                 let issuer = base.strip_suffix("/api").unwrap_or(base);
-                if body["ticket"]
-                    .as_str()
-                    .and_then(|ticket| {
-                        directory_key.as_deref().and_then(|key| {
-                            verify_dispatch_route_ticket(
-                                ticket,
-                                key,
-                                issuer,
-                                node_id,
-                                intent,
-                                chrono::Utc::now().timestamp(),
-                            )
-                        })
+                let claims = body["ticket"].as_str().and_then(|ticket| {
+                    directory_key.as_deref().and_then(|key| {
+                        verify_dispatch_route_ticket(
+                            ticket,
+                            key,
+                            issuer,
+                            node_id,
+                            intent,
+                            chrono::Utc::now().timestamp(),
+                        )
                     })
-                    .is_none()
-                {
+                });
+                if claims.is_none() {
                     return Err(TicketRouteError::Iicp(IicpError::Protocol {
                         code: "IICP-DISPATCH-TICKET-UNVERIFIED".into(),
                         message: "Directory returned an unverifiable dispatch ticket".into(),
@@ -375,6 +372,13 @@ impl IicpClient {
                     }));
                 }
                 let mut route = body["route"].clone();
+                if !policy_manifest_binding_matches(claims.as_ref().unwrap(), &route) {
+                    return Err(TicketRouteError::Iicp(IicpError::Protocol {
+                        code: "IICP-POLICY-MANIFEST-BINDING-MISMATCH".into(),
+                        message: "Directory ticket does not match the route policy manifest".into(),
+                        status,
+                    }));
+                }
                 if let Some(obj) = route.as_object_mut() {
                     obj.insert("node_id".into(), body["node_id"].clone());
                 }
