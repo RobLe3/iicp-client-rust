@@ -57,6 +57,7 @@ pub mod operator_crypto;
 pub mod peer_manager;
 pub mod policy;
 pub mod policy_data_handling;
+pub mod policy_detail_disclosure;
 pub mod policy_manifest;
 pub mod policy_operational_evidence;
 pub mod pricing;
