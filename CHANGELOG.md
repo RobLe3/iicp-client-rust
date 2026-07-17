@@ -9,6 +9,10 @@ in the main repo).
 
 ## [Unreleased]
 
+### Added — pre-normative receipt interoperability
+- Added full RFC 8785/JCS canonicalization and shared consumer co-signature vectors.
+- Provider configuration may explicitly advertise `consumer_cosignature_v1`; the default remains disabled and has no routing or economic effect.
+
 ## [0.7.93] — 2026-07-17
 
 ### Added — opt-in lifecycle security and policy evidence

@@ -397,6 +397,9 @@ pub struct NodeConfig {
     /// Model IDs a backend may expose for internal or preview routing but that
     /// this node must not publish or use as live-health drift evidence.
     pub excluded_models: Vec<String>,
+    /// Pre-normative receipt profiles explicitly enabled by the operator.
+    /// Unknown values are ignored and an empty list is not advertised.
+    pub supported_receipt_profiles: Vec<String>,
 }
 
 impl NodeConfig {
@@ -448,6 +451,7 @@ impl NodeConfig {
             backend_url: None,
             backend_api_key: None,
             excluded_models: Vec::new(),
+            supported_receipt_profiles: Vec::new(),
         }
     }
 }
@@ -1971,6 +1975,18 @@ impl IicpNode {
         }
         if let Some(e) = &self.cfg.exposure_mode {
             payload["exposure_mode"] = json!(e);
+        }
+        let receipt_profiles: Vec<&str> = self
+            .cfg
+            .supported_receipt_profiles
+            .iter()
+            .map(String::as_str)
+            .filter(|profile| *profile == "consumer_cosignature_v1")
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        if !receipt_profiles.is_empty() {
+            payload["supported_receipt_profiles"] = json!(receipt_profiles);
         }
         payload["sdk_language"] = json!("rust");
         payload["sdk_version"] = json!(env!("CARGO_PKG_VERSION"));
