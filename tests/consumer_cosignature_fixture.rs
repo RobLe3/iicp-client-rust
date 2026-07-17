@@ -1,18 +1,10 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
-use serde_json::{json, Number, Value};
+use iicp_client::jcs::canonicalize_jcs;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 const DOMAIN: &[u8] = b"IICP-CIP-CONSUMER-COSIGNATURE-V1\0";
-
-fn normalize(value: &mut Value) {
-    match value {
-        Value::Number(number) if number.as_f64() == Some(-0.0) => *number = Number::from(0),
-        Value::Array(values) => values.iter_mut().for_each(normalize),
-        Value::Object(values) => values.values_mut().for_each(normalize),
-        _ => {}
-    }
-}
 
 fn pre_signature_refusal(v: &Value) -> Option<Value> {
     let s = |key: &str| v[key].as_str().unwrap();
@@ -87,15 +79,16 @@ fn fixture() -> Value {
 }
 
 fn verify_canonical_vector(vector: &Value) {
-    let mut receipt = vector["receipt"].clone();
-    normalize(&mut receipt);
-    let canonical = serde_json::to_string(&receipt).unwrap();
-    assert_eq!(canonical, vector["canonical_json_utf8"]);
+    let canonical = canonicalize_jcs(&vector["receipt"]).unwrap();
     assert_eq!(
-        format!("{:x}", Sha256::digest(canonical.as_bytes())),
+        String::from_utf8_lossy(&canonical),
+        vector["canonical_json_utf8"].as_str().unwrap()
+    );
+    assert_eq!(
+        format!("{:x}", Sha256::digest(&canonical)),
         vector["canonical_json_sha256"]
     );
-    let digest = Sha256::digest([DOMAIN, canonical.as_bytes()].concat());
+    let digest = Sha256::digest([DOMAIN, canonical.as_slice()].concat());
     assert_eq!(format!("{digest:x}"), vector["receipt_digest_hex"]);
 
     for role in ["provider", "consumer"] {
@@ -171,4 +164,17 @@ fn consumer_cosignature_fixture_is_portable() {
     verify_semantic_cases(&data);
     verify_settlement_cases(&data);
     verify_privacy_contract(&data);
+}
+
+#[test]
+fn full_jcs_vectors_and_unsafe_integers_fail_closed() {
+    let data = fixture();
+    for vector in data["jcs_vectors"].as_array().unwrap() {
+        let canonical = canonicalize_jcs(&vector["input"]).unwrap();
+        assert_eq!(
+            String::from_utf8(canonical).unwrap(),
+            vector["canonical_json_utf8"]
+        );
+    }
+    assert!(canonicalize_jcs(&json!({"invalid": 9_007_199_254_740_992_u64})).is_err());
 }

@@ -83,6 +83,7 @@ hex = "0.4"
 # Local time-of-day for availability windows (ADR-006). "clock" only — no serde/format.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
+serde_jcs = "0.2.0"
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "sync"] }

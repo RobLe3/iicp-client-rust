@@ -41,3 +41,23 @@ fn endpoint_override_changes_register_payload() {
         "https://new-tunnel.example.com"
     );
 }
+
+#[test]
+fn register_payload_advertises_only_enabled_consumer_cosignature_profile() {
+    use iicp_client::{IicpNode, NodeConfig};
+    let mut cfg = NodeConfig::new(
+        "n-receipt",
+        "https://node.example.com".to_string(),
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.supported_receipt_profiles = vec![
+        "unknown_v1".to_string(),
+        "consumer_cosignature_v1".to_string(),
+        "consumer_cosignature_v1".to_string(),
+    ];
+    let payload = IicpNode::new(cfg).register_payload_for_test();
+    assert_eq!(
+        payload["supported_receipt_profiles"],
+        serde_json::json!(["consumer_cosignature_v1"])
+    );
+}
