@@ -14,6 +14,7 @@ in the main repo).
 ### Added — pre-normative receipt interoperability
 - Added full RFC 8785/JCS canonicalization and shared consumer co-signature vectors.
 - Provider configuration may explicitly advertise `consumer_cosignature_v1`; the default remains disabled and has no routing or economic effect.
+- `iicp-node serve` can enable it explicitly with repeatable `--receipt-profile` flags, `IICP_SUPPORTED_RECEIPT_PROFILES`, or a saved-node field; unsupported values fail closed.
 
 ## [0.7.93] — 2026-07-17
 

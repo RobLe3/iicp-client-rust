@@ -3375,6 +3375,7 @@ mod reregister_tests {
             public_endpoint: "http://node.local:8080".to_string(),
             auto_detect_nat: false,
             external_ip_probe_url: String::new(),
+            supported_receipt_profiles: Vec::new(),
             node_token: Some("old-token".to_string()),
             node_hmac_key: Some("old-hmac".to_string()),
             created_at: "2026-07-09T00:00:00Z".to_string(),
