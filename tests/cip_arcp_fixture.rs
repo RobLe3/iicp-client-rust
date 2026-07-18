@@ -202,6 +202,51 @@ fn evaluate(case: &Value) -> Value {
     json!({"passed":passed,"score":(score * 1_000_000.0_f64).round() / 1_000_000.0})
 }
 
+fn coordinator_transcript(case: &Value) -> Value {
+    use std::collections::BTreeSet;
+    let mut dispatched = BTreeSet::new();
+    let mut results = BTreeSet::new();
+    let mut terminal = "running";
+    let mut settlement = "release_unspent";
+    let mut duplicates = 0_u64;
+    for event in case["events"].as_array().unwrap() {
+        let kind = event["type"].as_str().unwrap();
+        let worker = event["worker"].as_str().unwrap_or("");
+        match kind {
+            "dispatch" if terminal == "running" => {
+                dispatched.insert(worker);
+            }
+            "duplicate_result" => duplicates += 1,
+            "result"
+                if terminal == "running"
+                    && dispatched.contains(worker)
+                    && !results.contains(worker) =>
+            {
+                if event["attribution"] == "same_operator" {
+                    settlement = "exclude_self_dealing";
+                    continue;
+                }
+                results.insert(worker);
+                if results.len() as u64 >= case["quorum"].as_u64().unwrap() {
+                    terminal = "completed";
+                    settlement = "settle_contributors";
+                }
+            }
+            "cancel" if terminal == "running" => terminal = "cancelled",
+            "timeout" if terminal == "running" => {
+                terminal = if case["strict_replicas"] == true {
+                    "local_fallback"
+                } else {
+                    "failed"
+                };
+            }
+            "coordinator_failure" if terminal == "running" => terminal = "failed",
+            _ => {}
+        }
+    }
+    json!({"terminal":terminal,"counted_results":results.len(),"duplicates_ignored":duplicates,"settlement":settlement})
+}
+
 #[test]
 fn cip_fixture_is_portable() {
     let data: Value =
@@ -231,5 +276,22 @@ fn evaluator_fixture_is_portable() {
         serde_json::from_str(include_str!("../parity/arcp-evaluator-v0.json")).unwrap();
     for case in data["cases"].as_array().unwrap() {
         assert_eq!(evaluate(case), case["expected"], "{}", case["name"]);
+    }
+}
+
+#[test]
+fn coordinator_transcript_fixture_is_portable() {
+    let data: Value = serde_json::from_str(include_str!(
+        "../parity/arcp-coordinator-transcript-v0.json"
+    ))
+    .unwrap();
+    assert_eq!(data["status"], "pre-normative");
+    for case in data["cases"].as_array().unwrap() {
+        assert_eq!(
+            coordinator_transcript(case),
+            case["expected"],
+            "{}",
+            case["name"]
+        );
     }
 }
