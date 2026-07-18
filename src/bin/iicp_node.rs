@@ -244,6 +244,29 @@ struct ServeOpts {
     with_proxy: bool,
     /// #588 — local JSON policy document signed with the operator identity at startup.
     policy_manifest: String,
+    /// Explicit operator receipt-profile opt-in; None allows saved-node fallback.
+    receipt_profiles: Option<Vec<String>>,
+}
+
+fn resolve_receipt_profiles(values: &[String]) -> Result<Vec<String>, String> {
+    let mut profiles = Vec::new();
+    for raw in values {
+        for value in raw
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if value != "consumer_cosignature_v1" {
+                return Err(format!(
+                    "unsupported receipt profile: {value}. Supported: consumer_cosignature_v1"
+                ));
+            }
+            if !profiles.iter().any(|profile| profile == value) {
+                profiles.push(value.to_string());
+            }
+        }
+    }
+    Ok(profiles)
 }
 
 fn print_help() {
@@ -285,6 +308,7 @@ fn print_help() {
          \x20 --force                    IICP_FORCE — take over the single-instance lock for this node_id\n\
          \x20 --backend-api-key KEY      IICP_BACKEND_API_KEY — Bearer key for an auth'd backend (LM Studio, hosted)\n\
          \x20 --experimental             IICP_EXPERIMENTAL — enable an explicitly selected preview backend feature\n\
+         \x20 --receipt-profile PROFILE IICP_SUPPORTED_RECEIPT_PROFILES — repeatable; supported: consumer_cosignature_v1\n\
          \x20 --auto-detect-nat          IICP_AUTO_DETECT_NAT — run NAT detection at startup (default on)\n\
          \x20 --no-auto-detect-nat       disable NAT detection (overrides IICP_AUTO_DETECT_NAT)\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
@@ -1676,6 +1700,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         backend_api_key: env_or("IICP_BACKEND_API_KEY", Some("")).unwrap(),
         with_proxy: env_bool("IICP_WITH_PROXY"),
         policy_manifest: env_or("IICP_POLICY_MANIFEST_FILE", None).unwrap_or_default(),
+        receipt_profiles: match std::env::var("IICP_SUPPORTED_RECEIPT_PROFILES") {
+            Ok(value) => Some(resolve_receipt_profiles(&[value])?),
+            Err(_) => None,
+        },
     };
 
     let mut i = 0;
@@ -1752,6 +1780,11 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     }
                     "--log-dir" => opts.log_dir = Some(v),
                     "--policy-manifest" => opts.policy_manifest = v,
+                    "--receipt-profile" => {
+                        let profiles = opts.receipt_profiles.get_or_insert_with(Vec::new);
+                        profiles.extend(resolve_receipt_profiles(&[v])?);
+                        profiles.dedup();
+                    }
                     _ => return Err(format!("unknown flag: {arg}")),
                 }
                 i += 2;
@@ -2070,6 +2103,9 @@ fn apply_saved_node(opts: &mut ServeOpts, saved: &NodeIdentity) {
     }
     if opts.external_ip_probe_url.is_empty() {
         opts.external_ip_probe_url = saved.external_ip_probe_url.clone();
+    }
+    if opts.receipt_profiles.is_none() {
+        opts.receipt_profiles = Some(saved.supported_receipt_profiles.clone());
     }
 }
 
@@ -2576,6 +2612,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             }
         }
     }
+    if let Some(values) = &opts.receipt_profiles {
+        opts.receipt_profiles = Some(resolve_receipt_profiles(values)?);
+    }
 
     // #410 — built-in fallback applied LAST (after flag/env/saved-config), so the default
     // never shadows a saved-node backend_url. #414/C1 (parity with Python) — an `anthropic`
@@ -2707,6 +2746,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let discovered_models = probe_backend_models(&opts.backend_url, &opts.backend_api_key).await;
 
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
+    cfg.supported_receipt_profiles = opts.receipt_profiles.clone().unwrap_or_default();
     cfg.model = Some(opts.model.clone());
     // Detect the backend server flavor (ollama/lmstudio/vllm/llamacpp/anthropic/custom)
     // so it surfaces in the directory node detail.
@@ -5771,4 +5811,38 @@ mod tests {
         let _ = fs::remove_dir_all(&home);
         std::env::remove_var("IICP_HOME");
     }
+}
+#[cfg(test)]
+#[test]
+fn receipt_profiles_are_allowlisted_and_deduplicated() {
+    assert_eq!(
+        resolve_receipt_profiles(&["consumer_cosignature_v1, consumer_cosignature_v1".to_string()])
+            .unwrap(),
+        vec!["consumer_cosignature_v1".to_string()]
+    );
+    assert!(resolve_receipt_profiles(&["unknown_v1".to_string()])
+        .unwrap_err()
+        .contains("unsupported receipt profile"));
+}
+
+#[cfg(test)]
+#[test]
+fn saved_receipt_profile_applies_only_without_override() {
+    let saved = NodeIdentity {
+        supported_receipt_profiles: vec!["consumer_cosignature_v1".to_string()],
+        ..Default::default()
+    };
+    let mut inherited = ServeOpts::default();
+    apply_saved_node(&mut inherited, &saved);
+    assert_eq!(
+        inherited.receipt_profiles,
+        Some(saved.supported_receipt_profiles.clone())
+    );
+
+    let mut explicit_empty = ServeOpts {
+        receipt_profiles: Some(Vec::new()),
+        ..Default::default()
+    };
+    apply_saved_node(&mut explicit_empty, &saved);
+    assert_eq!(explicit_empty.receipt_profiles, Some(Vec::new()));
 }

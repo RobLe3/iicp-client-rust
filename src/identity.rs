@@ -292,6 +292,9 @@ pub struct NodeIdentity {
     pub auto_detect_nat: bool,
     #[serde(default)]
     pub external_ip_probe_url: String,
+    /// Pre-normative receipt profiles explicitly enabled by the operator.
+    #[serde(default)]
+    pub supported_receipt_profiles: Vec<String>,
     /// #456 — node_token cached after register so read-only commands (`iicp-node credits`)
     /// can authenticate without re-registering. Bearer credential, not a secret key;
     /// stored in the chmod-600 config alongside the operator identity. Absent until the
@@ -437,6 +440,7 @@ pub fn generate_node(
         public_endpoint: public_endpoint.to_string(),
         auto_detect_nat,
         external_ip_probe_url: external_ip_probe_url.to_string(),
+        supported_receipt_profiles: Vec::new(),
         node_token: None,    // cached on first register (#456)
         node_hmac_key: None, // cached on first register (TC-9c)
         created_at: now_iso(),
