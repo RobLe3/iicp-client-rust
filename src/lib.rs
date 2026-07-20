@@ -19,6 +19,7 @@
 
 mod client;
 pub mod consumer_token;
+pub mod dispatch_admission;
 pub mod dispatch_ticket;
 pub mod dispatch_ticket_trust;
 mod endpoint_security;
@@ -49,6 +50,8 @@ pub mod concurrency;
 pub mod confidentiality;
 pub mod conformance;
 pub mod delegation;
+#[cfg(feature = "dispatch-admission-sqlite")]
+pub mod dispatch_admission_sqlite;
 pub mod idempotency;
 pub mod identity;
 pub mod instance_lock;

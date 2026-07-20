@@ -46,6 +46,9 @@ proxy = []
 # Opt-in single-host transactional persistence for the draft lifecycle profile.
 # Kept out of default builds; the ordinary node does not mount this adapter.
 lifecycle-sqlite = ["dep:rusqlite"]
+# Opt-in provider-local durable admission for the pre-normative dispatch-v2 profile.
+# This does not mount an endpoint or alter ordinary node dispatch.
+dispatch-admission-sqlite = ["dep:rusqlite"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
