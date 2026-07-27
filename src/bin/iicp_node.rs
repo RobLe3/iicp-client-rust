@@ -2630,7 +2630,11 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // Onboarding: if no --model given, auto-select the first model the backend advertises
     // (Ollama /api/tags or OpenAI /v1/models) so a bare `iicp-node serve` just works.
     if opts.model.is_empty() && !opts.backend_url.is_empty() {
-        let models = probe_backend_models(&opts.backend_url, &opts.backend_api_key).await;
+        let models = iicp_client::node::filter_public_backend_models(
+            probe_backend_models(&opts.backend_url, &opts.backend_api_key).await,
+            &[],
+            Some(&opts.backend_type),
+        );
         if opts.backend_type == "meshllm" && models.len() > 1 {
             return Err(format!(
                 "MeshLLM advertises multiple models; select one with --model: {}",
@@ -2743,7 +2747,11 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     // GAP-6: probe backend for all available models so the directory registration
     // advertises the full model list — not just the single configured model.
-    let discovered_models = probe_backend_models(&opts.backend_url, &opts.backend_api_key).await;
+    let discovered_models = iicp_client::node::filter_public_backend_models(
+        probe_backend_models(&opts.backend_url, &opts.backend_api_key).await,
+        &[],
+        Some(&opts.backend_type),
+    );
 
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
     cfg.supported_receipt_profiles = opts.receipt_profiles.clone().unwrap_or_default();
