@@ -37,14 +37,17 @@ const NONCE_TTL_SECS: u64 = 300;
 /// Keep operator-disabled pseudo-models out of health evidence and every
 /// model-drift re-registration path. A backend inventory may include routing
 /// aliases that are not safe to advertise as ordinary IICP capabilities.
-fn filter_excluded_models(mut models: Vec<String>, excluded: &[String]) -> Vec<String> {
-    if excluded.is_empty() {
-        return models;
-    }
+#[doc(hidden)]
+pub fn filter_public_backend_models(
+    mut models: Vec<String>,
+    excluded: &[String],
+    backend: Option<&str>,
+) -> Vec<String> {
     models.retain(|model| {
         !excluded
             .iter()
             .any(|excluded_model| excluded_model == model)
+            && !(backend == Some("meshllm") && model.starts_with("local-gguf/sha256-"))
     });
     models
 }
@@ -67,6 +70,7 @@ async fn probe_health_models_bg(
     backend_url: &str,
     api_key: &Option<String>,
     excluded_models: &[String],
+    backend: Option<&str>,
 ) -> Option<Vec<String>> {
     let base = backend_url.trim_end_matches('/');
     if base.is_empty() {
@@ -92,7 +96,11 @@ async fn probe_health_models_bg(
                         .into_iter()
                         .collect();
                     names.sort();
-                    return Some(filter_excluded_models(names, excluded_models));
+                    return Some(filter_public_backend_models(
+                        names,
+                        excluded_models,
+                        backend,
+                    ));
                 }
             }
         }
@@ -109,11 +117,12 @@ async fn probe_health_models_bg(
         if resp.status().is_success() {
             if let Ok(data) = resp.json::<Value>().await {
                 if let Some(arr) = data["data"].as_array() {
-                    return Some(filter_excluded_models(
+                    return Some(filter_public_backend_models(
                         arr.iter()
                             .filter_map(|m| m["id"].as_str().map(str::to_string))
                             .collect(),
                         excluded_models,
+                        backend,
                     ));
                 }
             }
@@ -1942,6 +1951,11 @@ impl IicpNode {
                 models.push(cap.clone());
             }
         }
+        let models = filter_public_backend_models(
+            models,
+            &self.cfg.excluded_models,
+            self.cfg.backend.as_deref(),
+        );
         let region = self
             .cfg
             .region
@@ -2108,6 +2122,11 @@ impl IicpNode {
                     models.push(cap.clone());
                 }
             }
+            let models = filter_public_backend_models(
+                models,
+                &self.cfg.excluded_models,
+                self.cfg.backend.as_deref(),
+            );
             *self.registered_models.write().expect("poisoned") = models;
         }
         // #527 — record the endpoint we just registered, so the heartbeat-loop
@@ -2126,6 +2145,7 @@ impl IicpNode {
             base,
             &self.cfg.backend_api_key,
             &self.cfg.excluded_models,
+            self.cfg.backend.as_deref(),
         )
         .await
     }
@@ -2252,6 +2272,11 @@ impl IicpNode {
                 all_models.push(cap.clone());
             }
         }
+        let all_models = filter_public_backend_models(
+            all_models,
+            &self.cfg.excluded_models,
+            self.cfg.backend.as_deref(),
+        );
         let state = Arc::new(AppState {
             handler,
             node_id: self.cfg.node_id.clone(),
@@ -2491,8 +2516,14 @@ impl IicpNode {
                     };
                     // #494 — probe the backend for the current model list before heartbeat.
                     let live_models = if let Some(ref bu) = hb_backend_url {
-                        probe_health_models_bg(&http, bu, &hb_backend_api_key, &hb_excluded_models)
-                            .await
+                        probe_health_models_bg(
+                            &http,
+                            bu,
+                            &hb_backend_api_key,
+                            &hb_excluded_models,
+                            hb_backend.as_deref(),
+                        )
+                        .await
                     } else {
                         None
                     };
@@ -3229,7 +3260,7 @@ mod task_rate_tests {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::{build_capabilities, filter_excluded_models};
+    use super::{build_capabilities, filter_public_backend_models, IicpNode, NodeConfig};
 
     const CHAT: &str = "urn:iicp:intent:llm:chat:v1";
     const EMBED: &str = "urn:iicp:intent:llm:embedding:v1";
@@ -3238,8 +3269,46 @@ mod capability_tests {
     fn excluded_backend_alias_is_not_used_as_health_or_registration_evidence() {
         let models = vec!["stable-model".to_string(), "mesh".to_string()];
         assert_eq!(
-            filter_excluded_models(models, &["mesh".to_string()]),
+            filter_public_backend_models(models, &["mesh".to_string()], Some("meshllm")),
             vec!["stable-model".to_string()]
+        );
+    }
+
+    #[test]
+    fn meshllm_internal_route_aliases_are_never_public_models() {
+        let models = vec![
+            "stable-model".to_string(),
+            "local-gguf/sha256-efd83af156f84ca7".to_string(),
+            "local-gguf/sha256-deadbeef".to_string(),
+        ];
+        assert_eq!(
+            filter_public_backend_models(models, &[], Some("meshllm")),
+            vec!["stable-model".to_string()]
+        );
+    }
+
+    #[test]
+    fn local_gguf_named_model_is_not_hidden_for_other_backends() {
+        let model = "local-gguf/sha256-user-model".to_string();
+        assert_eq!(
+            filter_public_backend_models(vec![model.clone()], &[], Some("openai_compat")),
+            vec![model]
+        );
+    }
+
+    #[test]
+    fn register_payload_applies_meshllm_public_inventory_boundary() {
+        let mut cfg = NodeConfig::new("mesh-node", "https://node.test", CHAT);
+        cfg.backend = Some("meshllm".to_string());
+        cfg.model = Some("stable-model".to_string());
+        cfg.capabilities = vec![
+            "local-gguf/sha256-efd83af156f84ca7".to_string(),
+            "stable-model-2".to_string(),
+        ];
+        let payload = IicpNode::new(cfg).register_payload_for_test();
+        assert_eq!(
+            payload["capabilities"][0]["models"],
+            serde_json::json!(["stable-model", "stable-model-2"])
         );
     }
 
@@ -3430,6 +3499,36 @@ mod reregister_tests {
             &format!("{}/v1", server.url()),
             &None,
             &["mesh".to_string()],
+            Some("meshllm"),
+        )
+        .await;
+        assert_eq!(observed, Some(vec!["stable-model".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn health_inventory_hides_meshllm_internal_route_aliases() {
+        let mut server = mockito::Server::new_async().await;
+        let _models = server
+            .mock("GET", "/v1/models")
+            .with_status(200)
+            .with_body(
+                json!({
+                    "data": [
+                        {"id": "stable-model"},
+                        {"id": "local-gguf/sha256-efd83af156f84ca7"}
+                    ]
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let observed = probe_health_models_bg(
+            &reqwest::Client::new(),
+            &format!("{}/v1", server.url()),
+            &None,
+            &[],
+            Some("meshllm"),
         )
         .await;
         assert_eq!(observed, Some(vec!["stable-model".to_string()]));
