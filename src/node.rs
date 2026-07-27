@@ -153,6 +153,16 @@ async fn reregister(
     })
 }
 
+fn attach_current_node_token(payload: &mut serde_json::Value, token: &str) {
+    if !token.is_empty() {
+        // Always overwrite a token captured in an earlier payload. Long-running
+        // providers rotate credentials after endpoint recovery/re-registration,
+        // so reusing the captured value can make later model-drift recovery fail
+        // ownership checks indefinitely.
+        payload["current_node_token"] = json!(token);
+    }
+}
+
 fn update_saved_identity_credentials(
     identity: &mut crate::identity::NodeIdentity,
     token: &str,
@@ -2577,6 +2587,7 @@ impl IicpNode {
                                         registered.into_iter().collect();
                                     if live_set != reg_set {
                                         let mut new_payload = hb_register_payload.clone();
+                                        attach_current_node_token(&mut new_payload, &token);
                                         let new_caps =
                                             build_capabilities(&live, &hb_intent, hb_max_tokens);
                                         new_payload["capabilities"] =
@@ -3329,7 +3340,10 @@ mod capability_tests {
 
 #[cfg(test)]
 mod reregister_tests {
-    use super::{probe_health_models_bg, reregister, update_saved_identity_credentials};
+    use super::{
+        attach_current_node_token, probe_health_models_bg, reregister,
+        update_saved_identity_credentials,
+    };
     use serde_json::json;
 
     // #404 — the re-register seam used by the self-healing heartbeat loop:
@@ -3419,6 +3433,13 @@ mod reregister_tests {
         )
         .await;
         assert_eq!(observed, Some(vec!["stable-model".to_string()]));
+    }
+
+    #[test]
+    fn current_token_overwrites_a_captured_reregister_token() {
+        let mut payload = json!({"current_node_token": "tok-stale"});
+        attach_current_node_token(&mut payload, "tok-current");
+        assert_eq!(payload["current_node_token"], "tok-current");
     }
 }
 

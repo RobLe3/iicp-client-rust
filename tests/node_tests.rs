@@ -922,7 +922,7 @@ async fn test_heartbeat_omits_health_models_when_no_backend_url() {
 /// This test verifies the register call fires when live ≠ registered.
 #[tokio::test]
 async fn test_model_drift_triggers_reregister() {
-    use mockito::Server;
+    use mockito::{Matcher, Server};
     let mut dir = Server::new_async().await;
     let mut backend = mockito::Server::new_async().await;
 
@@ -938,6 +938,9 @@ async fn test_model_drift_triggers_reregister() {
     // Directory register — must be called once for drift re-registration
     let _m_reg = dir
         .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "current_node_token": "tok-current-rs"
+        })))
         .with_status(200)
         .with_header("content-type", "application/json")
         .with_body(json!({"node_token": "tok-drift-rs"}).to_string())
@@ -955,6 +958,7 @@ async fn test_model_drift_triggers_reregister() {
     cfg.model = Some("phi3:mini".into());
     cfg.capabilities = vec!["llama3.2:1b".into()];
     let node = IicpNode::new(cfg);
+    node.seed_token("tok-current-rs");
     // Simulate a prior registration: registered phi3:mini + llama3.2:1b
     {
         let mut g = node.registered_models().write().expect("poisoned");
