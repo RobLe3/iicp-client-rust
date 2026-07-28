@@ -9,6 +9,24 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.97] — 2026-07-28
+
+### Fixed — public MeshLLM model inventory
+- Kept internal MeshLLM `local-gguf/sha256-*` route aliases out of public
+  registration and health model inventories.
+
+## [0.7.96] — 2026-07-27
+
+### Fixed — model drift ownership
+- Refreshed node ownership proof before model drift changes a directory
+  registration.
+
+## [0.7.95] — 2026-07-27
+
+### Added — dispatch admission parity
+- Added the opt-in durable dispatch-admission prototype and shared
+  ARCP/co-signature transcript fixtures without changing default routing.
+
 ## [0.7.94] — 2026-07-18
 
 ### Added — pre-normative receipt interoperability
