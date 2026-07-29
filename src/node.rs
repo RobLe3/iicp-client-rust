@@ -540,9 +540,9 @@ struct AppState {
     node_id: String,
     region: String,
     intent: String,
-    model: String,
-    /// All models served by this node (primary model + capabilities), mirroring registration.
-    models: Vec<String>,
+    /// Last successfully registered public model projection. Shared with the
+    /// drift-recovery task so health never retains a startup-only snapshot.
+    public_models: Arc<std::sync::RwLock<Vec<String>>>,
     active_jobs: Arc<AtomicUsize>,
     /// TC-9c: directory URL for background CIPWorkerReceipt posting after task completion.
     directory_url: String,
@@ -626,6 +626,8 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
     let eff_max = state
         .availability
         .effective_max_concurrent(state.max_concurrent);
+    let models = state.public_models.read().expect("poisoned").clone();
+    let model = models.first().cloned().unwrap_or_default();
     Json(json!({
         "status": "ok",
         "node_id": state.node_id,
@@ -635,8 +637,8 @@ async fn health_endpoint(State(state): State<Arc<AppState>>) -> impl IntoRespons
         "max_concurrent": state.max_concurrent,
         "effective_max_concurrent": eff_max,
         "available": active < eff_max,
-        "model": state.model,
-        "models": state.models,
+        "model": model,
+        "models": models,
         "intent": state.intent,
         "pinhole_state": pinhole_state,
         "backend_stability": state.backend_stability.read().expect("poisoned").public_json(),
@@ -1574,6 +1576,10 @@ pub struct IicpNode {
     /// #494 — model set registered at last register(); compared each heartbeat tick for drift.
     /// Arc so the background heartbeat task can read and update it.
     registered_models: Arc<std::sync::RwLock<Vec<String>>>,
+    /// Model projection exposed by `/iicp/health`. It changes only after the
+    /// directory accepts the same projection, so public health and discovery
+    /// cannot diverge after a failed drift re-registration.
+    public_models: Arc<std::sync::RwLock<Vec<String>>>,
     /// #527 — endpoint override set by the tunnel watchdog when a Quick Tunnel
     /// URL rotates (the watchdog runs on a sync thread with only an Arc handle).
     /// `None` = use `cfg.endpoint`. `build_register_payload` reads the effective
@@ -1618,6 +1624,20 @@ impl IicpNode {
                     (None, None)
                 }
             };
+        let mut initial_public_models = match &cfg.model {
+            Some(model) => vec![model.clone()],
+            None => Vec::new(),
+        };
+        for capability in &cfg.capabilities {
+            if !initial_public_models.contains(capability) {
+                initial_public_models.push(capability.clone());
+            }
+        }
+        let initial_public_models = filter_public_backend_models(
+            initial_public_models,
+            &cfg.excluded_models,
+            cfg.backend.as_deref(),
+        );
         Self {
             cfg,
             http,
@@ -1627,6 +1647,7 @@ impl IicpNode {
             pinhole_lease_seconds: std::sync::RwLock::new(3600),
             liveness_challenge: Arc::new(std::sync::RwLock::new(None)),
             registered_models: Arc::new(std::sync::RwLock::new(Vec::new())),
+            public_models: Arc::new(std::sync::RwLock::new(initial_public_models)),
             endpoint_override: Arc::new(std::sync::RwLock::new(None)),
             runtime_available: Arc::new(AtomicBool::new(true)),
             runtime_relay_bound: Arc::new(AtomicBool::new(false)),
@@ -1699,6 +1720,11 @@ impl IicpNode {
     }
 
     #[doc(hidden)]
+    pub fn public_models(&self) -> &Arc<std::sync::RwLock<Vec<String>>> {
+        &self.public_models
+    }
+
+    #[doc(hidden)]
     pub fn set_backend_stability_for_test(&self, observation: BackendStabilityObservation) {
         *self.backend_stability.write().expect("poisoned") = observation;
     }
@@ -1768,7 +1794,8 @@ impl IicpNode {
         );
         if let Some(credentials) = reregister(&self.http, &url, &new_payload).await {
             if models_changed {
-                *self.registered_models.write().expect("poisoned") = live;
+                *self.registered_models.write().expect("poisoned") = live.clone();
+                *self.public_models.write().expect("poisoned") = live;
             }
             *self.registered_endpoint.write().expect("poisoned") = self.effective_endpoint();
             apply_runtime_credentials(
@@ -2127,7 +2154,8 @@ impl IicpNode {
                 &self.cfg.excluded_models,
                 self.cfg.backend.as_deref(),
             );
-            *self.registered_models.write().expect("poisoned") = models;
+            *self.registered_models.write().expect("poisoned") = models.clone();
+            *self.public_models.write().expect("poisoned") = models;
         }
         // #527 — record the endpoint we just registered, so the heartbeat-loop
         // drift check re-registers when a tunnel rotation changes it.
@@ -2263,27 +2291,12 @@ impl IicpNode {
         let tasks_success = Arc::new(AtomicUsize::new(0));
         let tasks_failed = Arc::new(AtomicUsize::new(0));
         let tasks_latency_total_ms = Arc::new(AtomicUsize::new(0));
-        let mut all_models: Vec<String> = match &self.cfg.model {
-            Some(m) => vec![m.clone()],
-            None => Vec::new(),
-        };
-        for cap in &self.cfg.capabilities {
-            if !all_models.contains(cap) {
-                all_models.push(cap.clone());
-            }
-        }
-        let all_models = filter_public_backend_models(
-            all_models,
-            &self.cfg.excluded_models,
-            self.cfg.backend.as_deref(),
-        );
         let state = Arc::new(AppState {
             handler,
             node_id: self.cfg.node_id.clone(),
             region: self.cfg.region.clone().unwrap_or_else(|| "unknown".into()),
             intent: self.cfg.intent.clone(),
-            model: self.cfg.model.clone().unwrap_or_default(),
-            models: all_models,
+            public_models: Arc::clone(&self.public_models),
             active_jobs,
             directory_url: self.cfg.directory_url.clone(),
             node_token: Arc::clone(&self.runtime_token),
@@ -2478,6 +2491,7 @@ impl IicpNode {
             let hb_intent = self.cfg.intent.clone();
             let hb_max_tokens = self.cfg.max_tokens;
             let hb_registered_models = Arc::clone(&self.registered_models);
+            let hb_public_models = Arc::clone(&self.public_models);
             // #527 — endpoint rotation (Quick Tunnel URL): the watchdog publishes
             // the new URL into endpoint_override; the loop re-registers on drift.
             let hb_endpoint_override = self.endpoint_override_handle();
@@ -2627,6 +2641,8 @@ impl IicpNode {
                                             reregister(&http, &hb_register_url, &new_payload).await
                                         {
                                             *hb_registered_models.write().expect("poisoned") =
+                                                live.clone();
+                                            *hb_public_models.write().expect("poisoned") =
                                                 live.clone();
                                             token = apply_runtime_credentials(
                                                 &hb_token_arc,
