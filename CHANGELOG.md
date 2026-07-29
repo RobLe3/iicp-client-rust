@@ -9,6 +9,27 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.98] — 2026-07-29
+
+### Fixed — transactional model-health recovery
+- Model drift becomes public only after the directory accepts the re-registration; failed or empty probes retain the last accepted health projection.
+- Registration, heartbeat model evidence, and `/iicp/health` now follow the same filtered public model set across the official SDKs.
+
+## [0.7.97] — 2026-07-27
+
+### Fixed — MeshLLM public model boundary
+- MeshLLM-only route aliases and explicitly excluded models no longer enter registration, heartbeat health evidence, or drift recovery.
+
+## [0.7.96] — 2026-07-27
+
+### Fixed — authenticated drift recovery
+- Model and endpoint drift re-registration reuses the current node token and persists refreshed credentials for supervised saved nodes.
+
+## [0.7.95] — 2026-07-27
+
+### Added — dispatch admission parity
+- Added shared dispatch-admission fixtures and fail-closed ticket trust behavior across the official SDKs.
+
 ## [0.7.94] — 2026-07-18
 
 ### Added — pre-normative receipt interoperability
