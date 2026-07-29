@@ -968,6 +968,55 @@ async fn test_model_drift_triggers_reregister() {
     node.check_model_drift_and_reregister().await;
 
     _m_reg.assert_async().await;
+    assert_eq!(
+        node.public_models().read().expect("poisoned").as_slice(),
+        ["phi3:mini"],
+        "health projection must follow the successfully re-registered model set"
+    );
+}
+
+/// A rejected drift re-registration must not make `/iicp/health` claim a
+/// model projection that the directory did not accept.
+#[tokio::test]
+async fn test_failed_model_drift_reregister_preserves_public_models() {
+    use mockito::Server;
+    let mut dir = Server::new_async().await;
+    let mut backend = mockito::Server::new_async().await;
+
+    let _m_tags = backend
+        .mock("GET", "/api/tags")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"models": [{"name": "new-model"}]}).to_string())
+        .create_async()
+        .await;
+    let _m_reg = dir
+        .mock("POST", "/v1/register")
+        .with_status(503)
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "drift-rs-failed",
+        "http://node.local:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = dir.url();
+    cfg.backend_url = Some(backend.url());
+    cfg.model = Some("old-model".into());
+    let node = IicpNode::new(cfg);
+    node.seed_token("tok-current-rs");
+    *node.registered_models().write().expect("poisoned") = vec!["old-model".into()];
+
+    node.check_model_drift_and_reregister().await;
+
+    _m_reg.assert_async().await;
+    assert_eq!(
+        node.public_models().read().expect("poisoned").as_slice(),
+        ["old-model"],
+        "failed re-registration must retain the last accepted health projection"
+    );
 }
 
 /// When backend returns empty model list, no re-registration should occur
@@ -1010,6 +1059,11 @@ async fn test_no_reregister_on_empty_backend_models() {
     node.check_model_drift_and_reregister().await;
 
     _m_reg.assert_async().await; // expect 0 calls
+    assert_eq!(
+        node.public_models().read().expect("poisoned").as_slice(),
+        ["phi3:mini"],
+        "an empty probe must not erase the health projection"
+    );
 }
 
 #[tokio::test]
