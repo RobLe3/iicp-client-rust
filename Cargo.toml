@@ -60,7 +60,7 @@ uuid = { version = "1.0", features = ["v4"] }
 thiserror = "1.0"
 axum = "0.7"
 tracing = "0.1"
-prometheus = { version = "0.13", optional = true }
+prometheus = { version = "0.14", optional = true }
 ciborium = { version = "0.2", optional = true }
 igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
 # ADR-019 pricing-block HMAC-SHA256. Pulled in unconditionally — operators
