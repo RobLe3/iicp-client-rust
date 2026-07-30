@@ -75,7 +75,7 @@ impl ConcurrencyGate {
         // Use a guard so we release even on panic (catch_unwind isn't async-friendly,
         // but a Drop guard suffices).
         struct ReleaseOnDrop<'a>(&'a ConcurrencyGate);
-        impl<'a> Drop for ReleaseOnDrop<'a> {
+        impl Drop for ReleaseOnDrop<'_> {
             fn drop(&mut self) {
                 self.0.release();
             }

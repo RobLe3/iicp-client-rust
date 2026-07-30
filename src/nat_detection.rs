@@ -16,8 +16,6 @@
 //! the rest of the SDK builds for HTTP-only consumers without pulling in
 //! SSDP discovery + XML parsing.
 
-#![cfg(feature = "nat")]
-
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 

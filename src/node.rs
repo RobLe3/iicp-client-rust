@@ -44,10 +44,10 @@ pub fn filter_public_backend_models(
     backend: Option<&str>,
 ) -> Vec<String> {
     models.retain(|model| {
-        !excluded
+        !(excluded
             .iter()
             .any(|excluded_model| excluded_model == model)
-            && !(backend == Some("meshllm") && model.starts_with("local-gguf/sha256-"))
+            || backend == Some("meshllm") && model.starts_with("local-gguf/sha256-"))
     });
     models
 }

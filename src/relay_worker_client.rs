@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-// Only compiled when the iicp-tcp feature is enabled (requires ciborium).
-#![cfg(feature = "iicp-tcp")]
 //! Relay worker client — ADR-041 tier-3, Part 3 R2 (#341).
 //!
 //! Rust port of `relay_worker_client.py` / `relay_worker_client.ts`.
