@@ -9,6 +9,12 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.99] — 2026-07-31
+
+### Security — dependency maintenance
+- Updated the Prometheus dependency to remove the affected legacy protobuf dependency reported by RustSec.
+- Preserved compatibility with the declared Rust 1.86 minimum toolchain. The IICP wire contract is unchanged.
+
 ## [0.7.98] — 2026-07-29
 
 ### Fixed — transactional model-health recovery
