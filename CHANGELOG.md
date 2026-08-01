@@ -9,6 +9,10 @@ in the main repo).
 
 ## [Unreleased]
 
+### Added
+- Discovery results expose optional health, latency, trust, SDK-release and
+  aggregate diversity evidence while remaining compatible with older directories.
+
 ## [0.7.99] — 2026-07-31
 
 ### Security — dependency maintenance
