@@ -206,6 +206,12 @@ pub struct Node {
     pub route_evidence: Option<String>,
     pub routing_hint: Option<String>,
     pub browser_usable: Option<bool>,
+    /// Additive, versioned directory evidence. Values remain opaque to preserve
+    /// forward compatibility while callers adopt the contract incrementally.
+    pub latency_evidence: Option<Value>,
+    pub health_reasons: Option<Vec<Value>>,
+    pub trust_progress: Option<Value>,
+    pub sdk_release: Option<Value>,
     /// Phase-1 compliance: public, self-attested node policy manifest.
     pub node_policy_manifest: Option<Value>,
     pub dispatch_ticket_id_prefix: Option<String>,
@@ -241,6 +247,14 @@ struct NodeWire {
     #[serde(default)]
     pub browser_usable: Option<bool>,
     #[serde(default)]
+    pub latency_evidence: Option<Value>,
+    #[serde(default)]
+    pub health_reasons: Option<Vec<Value>>,
+    #[serde(default)]
+    pub trust_progress: Option<Value>,
+    #[serde(default)]
+    pub sdk_release: Option<Value>,
+    #[serde(default)]
     pub node_policy_manifest: Option<Value>,
 }
 
@@ -266,6 +280,10 @@ impl From<NodeWire> for Node {
             route_evidence: wire.route_evidence,
             routing_hint: wire.routing_hint,
             browser_usable: wire.browser_usable,
+            latency_evidence: wire.latency_evidence,
+            health_reasons: wire.health_reasons,
+            trust_progress: wire.trust_progress,
+            sdk_release: wire.sdk_release,
             node_policy_manifest: wire.node_policy_manifest,
             dispatch_ticket_id_prefix: None,
         }
@@ -294,6 +312,8 @@ pub struct NodeList {
     pub count: u32,
     #[serde(default)]
     pub profile_negotiation: Option<ProfileNegotiation>,
+    #[serde(default)]
+    pub diversity_evidence: Option<Value>,
 }
 
 /// IICP task request body.
@@ -460,6 +480,33 @@ mod tests {
         let n: Node = serde_json::from_str(json).unwrap();
         assert!(n.health_label.is_none());
         assert!(n.exposure_mode.is_none());
+        assert!(n.health_reasons.is_none());
+        assert!(n.sdk_release.is_none());
+    }
+
+    #[test]
+    fn node_exposes_additive_directory_evidence() {
+        let json = r#"{
+            "node_id":"n1","endpoint":"https://x","score":0.9,"available":true,"region":"eu",
+            "latency_evidence":{"estimate_ms":143,"basis":"multi_proxy_ema"},
+            "health_reasons":[{"dimension":"backend","state":"ok","reason":"ok","evidence":"self_reported"}],
+            "trust_progress":{"gold_task_threshold_met":true,"remaining_gold_requirements":[]},
+            "sdk_release":{"compatibility":"current","relation":"latest_known"}
+        }"#;
+        let n: Node = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            n.latency_evidence.as_ref().unwrap()["basis"],
+            "multi_proxy_ema"
+        );
+        assert_eq!(
+            n.health_reasons.as_ref().unwrap()[0]["dimension"],
+            "backend"
+        );
+        assert_eq!(
+            n.trust_progress.as_ref().unwrap()["gold_task_threshold_met"],
+            true
+        );
+        assert_eq!(n.sdk_release.as_ref().unwrap()["relation"], "latest_known");
     }
 
     #[test]

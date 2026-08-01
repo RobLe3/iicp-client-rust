@@ -436,6 +436,7 @@ impl IicpClient {
                     count: nodes.len() as u32,
                     nodes,
                     profile_negotiation: None,
+                    diversity_evidence: None,
                 },
                 Err(TicketRouteError::LegacyRequired)
                     if self.config.route_discovery_mode == "auto" =>
