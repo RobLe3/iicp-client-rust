@@ -9,6 +9,8 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.101] — 2026-08-01
+
 ### Added — MCP revision compatibility
 - The MCP gateway keeps the established `2025-11-25` path as its default and
   adds an explicit, fail-closed `2026-07-28` stateless request mode with
