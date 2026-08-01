@@ -9,7 +9,9 @@ in the main repo).
 
 ## [Unreleased]
 
-### Added
+## [0.7.100] — 2026-08-01
+
+### Added — discovery evidence
 - Discovery results expose optional health, latency, trust, SDK-release and
   aggregate diversity evidence while remaining compatible with older directories.
 
