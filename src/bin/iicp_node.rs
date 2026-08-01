@@ -4481,7 +4481,10 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
              \x20 --allow-dangerous-tools  IICP_MCP_ALLOW_DANGEROUS_TOOLS (requires all controls below)\n\
              \x20 --authz-policy ID    IICP_MCP_AUTHZ_POLICY\n\
              \x20 --sandbox PROFILE    IICP_MCP_SANDBOX (strict/container/sandbox)\n\
-             \x20 --audit-redaction    IICP_MCP_AUDIT_REDACTION\n"
+             \x20 --audit-redaction    IICP_MCP_AUDIT_REDACTION\n\
+             \x20 --mcp-revision REV   IICP_MCP_REVISION (legacy default; modern is opt-in)\n\
+             \x20 --mcp-server-name N  IICP_MCP_SERVER_NAME (required for modern MCP)\n\
+             \x20 --mcp-extensions X   IICP_MCP_EXTENSIONS (tasks,skills,apps)\n"
         );
         return Ok(());
     }
@@ -4521,6 +4524,10 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         sandbox_profile: env::var("IICP_MCP_SANDBOX").unwrap_or_default(),
         audit_redaction: env_bool("IICP_MCP_AUDIT_REDACTION"),
     };
+    let mut mcp_revision = env::var("IICP_MCP_REVISION")
+        .unwrap_or_else(|_| iicp_client::mcp_negotiation::LEGACY_MCP_REVISION.to_string());
+    let mut mcp_server_name = env::var("IICP_MCP_SERVER_NAME").unwrap_or_default();
+    let mut mcp_extensions = env::var("IICP_MCP_EXTENSIONS").unwrap_or_default();
 
     let mut i = 0;
     while i < args.len() {
@@ -4578,10 +4585,42 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                     args.get(i).cloned().ok_or("--sandbox needs a value")?;
             }
             "--audit-redaction" => tool_policy.audit_redaction = true,
+            "--mcp-revision" => {
+                i += 1;
+                mcp_revision = args.get(i).cloned().ok_or("--mcp-revision needs a value")?;
+            }
+            "--mcp-server-name" => {
+                i += 1;
+                mcp_server_name = args
+                    .get(i)
+                    .cloned()
+                    .ok_or("--mcp-server-name needs a value")?;
+            }
+            "--mcp-extensions" => {
+                i += 1;
+                mcp_extensions = args
+                    .get(i)
+                    .cloned()
+                    .ok_or("--mcp-extensions needs a value")?;
+            }
             other => return Err(format!("unknown mcp-gateway flag: {other}")),
         }
         i += 1;
     }
+    if !iicp_client::mcp_negotiation::SUPPORTED_MCP_REVISIONS.contains(&mcp_revision.as_str()) {
+        return Err(format!("unsupported MCP revision: {mcp_revision}"));
+    }
+    if mcp_revision == iicp_client::mcp_negotiation::MODERN_MCP_REVISION
+        && mcp_server_name.trim().is_empty()
+    {
+        return Err("--mcp-server-name is required with MCP 2026-07-28".into());
+    }
+    let mcp_extensions: Vec<String> = mcp_extensions
+        .split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase)
+        .collect();
 
     let parsed_tools: Vec<String> = raw_tools
         .split(',')
@@ -4720,6 +4759,9 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         mcp_client: reqwest::Client,
         mcp_rpc_id: Arc<Mutex<u64>>,
         tool_policy: McpToolPolicy,
+        mcp_revision: String,
+        mcp_server_name: String,
+        mcp_extensions: Vec<String>,
     }
 
     let state = GwState {
@@ -4730,6 +4772,9 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         mcp_client: http_client.clone(),
         mcp_rpc_id: Arc::new(Mutex::new(0)),
         tool_policy: tool_policy.clone(),
+        mcp_revision: mcp_revision.clone(),
+        mcp_server_name: mcp_server_name.clone(),
+        mcp_extensions: mcp_extensions.clone(),
     };
 
     async fn health_handler(State(s): State<GwState>) -> Json<Value> {
@@ -4827,10 +4872,32 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
             *g += 1;
             *g
         };
-        let rpc = json!({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call","params":{"name":tool_name,"arguments":arguments}});
-        match s
-            .mcp_client
-            .post(format!("{}/mcp", s.mcp_url))
+        let mut params = serde_json::Map::new();
+        params.insert("name".into(), json!(tool_name));
+        params.insert("arguments".into(), arguments);
+        let (modern_headers, rpc) =
+            if s.mcp_revision == iicp_client::mcp_negotiation::MODERN_MCP_REVISION {
+                match iicp_client::mcp_negotiation::build_modern_mcp_request(
+                    rpc_id,
+                    "tools/call",
+                    &tool_name,
+                    &params,
+                    &s.mcp_extensions,
+                ) {
+                    Ok(value) => value,
+                    Err(reason) => return (StatusCode::BAD_REQUEST, Json(json!({"error":reason}))),
+                }
+            } else {
+                (
+                    Vec::new(),
+                    json!({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call","params":params}),
+                )
+            };
+        let mut mcp_request = s.mcp_client.post(format!("{}/mcp", s.mcp_url));
+        for (name, value) in modern_headers {
+            mcp_request = mcp_request.header(name, value);
+        }
+        match mcp_request
             .json(&rpc)
             .timeout(std::time::Duration::from_secs(30))
             .send()
@@ -4846,6 +4913,16 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                     Json(json!({"error":"invalid MCP response"})),
                 ),
                 Ok(data) => {
+                    if s.mcp_revision == iicp_client::mcp_negotiation::MODERN_MCP_REVISION {
+                        if let Err(reason) =
+                            iicp_client::mcp_negotiation::validate_modern_mcp_response(
+                                &data,
+                                &s.mcp_server_name,
+                            )
+                        {
+                            return (StatusCode::BAD_GATEWAY, Json(json!({"error":reason})));
+                        }
+                    }
                     if data.get("error").is_some() {
                         return (
                             StatusCode::UNPROCESSABLE_ENTITY,

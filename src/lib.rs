@@ -56,6 +56,7 @@ pub mod idempotency;
 pub mod identity;
 pub mod instance_lock;
 pub mod jcs;
+pub mod mcp_negotiation;
 pub mod mcp_policy;
 pub mod operator_crypto;
 pub mod peer_manager;
