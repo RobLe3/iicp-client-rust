@@ -23,12 +23,13 @@ jobs:
     runs-on: ubuntu-latest
     environment: crates-io
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.version && format('v{0}', inputs.version) || github.event.release.tag_name }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.86.0
+      - uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866 # 1.86.0
         with:
+          toolchain: 1.86.0
           components: rustfmt, clippy
       - name: Verify, test and package
         shell: bash
@@ -39,12 +40,12 @@ jobs:
           actual=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
           test "$actual" = "$expected"
           cargo fmt --check
-          cargo clippy --all-targets --all-features -- -D warnings
-          cargo test --all-targets
-          cargo package
+          cargo clippy --locked --all-targets --all-features -- -D warnings
+          cargo test --locked --all-targets --all-features
+          cargo package --locked
       - name: Clean-install smoke
         run: |
-          cargo install --path . --features nat --root /tmp/iicp-release-smoke
+          cargo install --locked --path . --features nat --root /tmp/iicp-release-smoke
           /tmp/iicp-release-smoke/bin/iicp-node --version
       - name: Publish to crates.io
         env:
