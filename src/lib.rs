@@ -59,6 +59,7 @@ pub mod jcs;
 pub mod mcp_negotiation;
 pub mod mcp_policy;
 pub mod operator_crypto;
+pub mod operator_profile;
 pub mod peer_manager;
 pub mod policy;
 pub mod policy_data_handling;
