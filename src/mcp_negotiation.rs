@@ -13,6 +13,19 @@ fn supported_extension(value: &str) -> bool {
 }
 
 pub fn evaluate_mcp_era(input: &Value) -> Value {
+    for (field, reason) in [
+        ("oauth_issuer_matches", "oauth_issuer_mismatch"),
+        ("oauth_audience_matches", "oauth_audience_mismatch"),
+        ("resource_indicator_present", "missing_resource_indicator"),
+        ("protected_resource_metadata_valid", "invalid_protected_resource_metadata"),
+        ("pkce_valid", "pkce_required"),
+        ("consent_granted", "consent_required"),
+        ("audit_output_redacted", "audit_redaction_required"),
+    ] {
+        if input[field] == false {
+            return json!({"accepted":false,"reason":reason});
+        }
+    }
     if input["downstream_credential_source"] == "caller" {
         return json!({"accepted":false,"reason":"credential_passthrough_prohibited"});
     }
