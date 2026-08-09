@@ -4,7 +4,14 @@ Use this repository for **iicp-client-rust** bugs, documentation fixes, tests an
 requests:
 
 - Issues: https://github.com/RobLe3/iicp-client-rust/issues
-- Main website/control-plane/protocol tracker: https://github.com/RobLe3/iicp.network/issues
+- Protocol and cross-component proposals: https://github.com/RobLe3/IICP/issues/new?template=protocol-proposal.yml
+- Community discussion: https://iicp.network/forum/
+- Private vulnerability reports: https://github.com/RobLe3/iicp-client-rust/security/advisories/new
+
+Do not include credentials, private topology, production records, task
+payloads or personal data in public issues. Participation does not confer
+protocol authority; public proposal decisions remain recorded in the owning
+issue or pull request under the current founder-led governance process.
 
 Please include the client version, operating mode (`serve`, `relay`, Docker,
 launchd/systemd, library use), relevant logs without secrets, and the command or
