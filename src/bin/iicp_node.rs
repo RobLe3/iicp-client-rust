@@ -2553,8 +2553,63 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         });
     }
 
-    // ADR-050 2-C: co-host the compat proxy on loopback alongside the node, supervised
-    // so a proxy failure logs but never drops the network-facing node. Forced to 127.0.0.1.
+    // Did the operator name a saved node? (--node, or IICP_NODE_NAME env). Captured before
+    // apply_saved_node so the model-required guard below can tell "load from disk" apart from
+    // "serve a one-off node from flags".
+    let node_supplied = !opts.node.is_empty();
+
+    // Load persisted node config if --node was provided.
+    // Phase 2 (#529/#55) — capture any cached node_token to prove ownership on
+    // re-registration (IICP-E050 token path).
+    let mut saved_node_token: Option<String> = None;
+    if node_supplied {
+        match load_node(&opts.node).map_err(|e| e.to_string())? {
+            Some(saved) => {
+                saved_node_token = saved.node_token.clone();
+                apply_saved_node(&mut opts, &saved);
+            }
+            None => {
+                return Err(format!(
+                    "no saved config at ~/.iicp/nodes/{}.json. Run `iicp-node init` first.",
+                    opts.node
+                ));
+            }
+        }
+    }
+    if let Some(values) = &opts.receipt_profiles {
+        opts.receipt_profiles = Some(resolve_receipt_profiles(values)?);
+    }
+
+    let managed_operator = load_operator().ok().flatten();
+    let managed_decision = iicp_client::operator_profile::evaluate_managed_operator(
+        &iicp_client::operator_profile::ManagedOperatorInput {
+            mode: std::env::var("IICP_OPERATOR_PROFILE")
+                .unwrap_or_else(|_| "convenience".into())
+                .trim()
+                .to_lowercase(),
+            authentication_configured: managed_operator
+                .as_ref()
+                .is_some_and(|operator| operator.is_key_backed()),
+            identity_storage_protected: managed_operator
+                .as_ref()
+                .is_some_and(|operator| operator.is_key_backed() && operator.is_encrypted()),
+            auto_update_requested: iicp_client::updater::auto_update_enabled(),
+            update_authenticated: env_bool("IICP_MANAGED_UPDATE_AUTHENTICATED"),
+            rollback_verified: env_bool("IICP_MANAGED_ROLLBACK_VERIFIED"),
+            upnp_requested: opts.auto_detect_nat && !env_bool("IICP_SKIP_UPNP"),
+            tunnel_requested: opts.tunnel.unwrap_or(true),
+            upnp_approved: env_bool("IICP_MANAGED_UPNP_APPROVED"),
+            tunnel_approved: env_bool("IICP_MANAGED_TUNNEL_APPROVED"),
+        },
+    );
+    if !managed_decision.0 {
+        return Err(format!(
+            "managed operator startup rejected: {}",
+            managed_decision.1
+        ));
+    }
+
+    // Start the optional co-hosted listener only after the operator profile passes.
     if opts.with_proxy {
         #[cfg(feature = "proxy")]
         {
@@ -2587,33 +2642,6 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             "[iicp-node] --with-proxy ignored: built without the proxy gateway. \
              Reinstall with: cargo install iicp-client --features proxy"
         );
-    }
-
-    // Did the operator name a saved node? (--node, or IICP_NODE_NAME env). Captured before
-    // apply_saved_node so the model-required guard below can tell "load from disk" apart from
-    // "serve a one-off node from flags".
-    let node_supplied = !opts.node.is_empty();
-
-    // Load persisted node config if --node was provided.
-    // Phase 2 (#529/#55) — capture any cached node_token to prove ownership on
-    // re-registration (IICP-E050 token path).
-    let mut saved_node_token: Option<String> = None;
-    if node_supplied {
-        match load_node(&opts.node).map_err(|e| e.to_string())? {
-            Some(saved) => {
-                saved_node_token = saved.node_token.clone();
-                apply_saved_node(&mut opts, &saved);
-            }
-            None => {
-                return Err(format!(
-                    "no saved config at ~/.iicp/nodes/{}.json. Run `iicp-node init` first.",
-                    opts.node
-                ));
-            }
-        }
-    }
-    if let Some(values) = &opts.receipt_profiles {
-        opts.receipt_profiles = Some(resolve_receipt_profiles(values)?);
     }
 
     // #410 — built-in fallback applied LAST (after flag/env/saved-config), so the default
@@ -2781,7 +2809,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // delegation (operator_pub == operator_id) and records the operator. Never sends secret/contact.
     // #503 — without a key-backed identity the node registers anonymously and accrues NO
     // founder/recognition standing; warn loudly instead of staying silent. Non-fatal.
-    let loaded_op = load_operator().ok().flatten();
+    let loaded_op = managed_operator;
     if let Some(notice) = iicp_client::identity::no_identity_notice(loaded_op.as_ref()) {
         eprintln!("{notice}");
     } else if let Some(op) = &loaded_op {
