@@ -58,6 +58,7 @@ pub mod instance_lock;
 pub mod jcs;
 pub mod mcp_negotiation;
 pub mod mcp_policy;
+pub mod native_response_sequence;
 pub mod operator_crypto;
 pub mod operator_profile;
 pub mod peer_manager;
