@@ -4758,6 +4758,7 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         node_token: Arc<Mutex<String>>,
         mcp_client: reqwest::Client,
         mcp_rpc_id: Arc<Mutex<u64>>,
+        mcp_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
         tool_policy: McpToolPolicy,
         mcp_revision: String,
         mcp_server_name: String,
@@ -4771,6 +4772,7 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
         node_token: hb_token,
         mcp_client: http_client.clone(),
         mcp_rpc_id: Arc::new(Mutex::new(0)),
+        mcp_session_id: Arc::new(tokio::sync::Mutex::new(None)),
         tool_policy: tool_policy.clone(),
         mcp_revision: mcp_revision.clone(),
         mcp_server_name: mcp_server_name.clone(),
@@ -4893,6 +4895,220 @@ async fn run_mcp_gateway(args: &[String]) -> Result<(), String> {
                     json!({"jsonrpc":"2.0","id":rpc_id,"method":"tools/call","params":params}),
                 )
             };
+        async fn response_json(response: reqwest::Response) -> Result<Value, String> {
+            let is_event_stream = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"));
+            if is_event_stream {
+                let body = response.text().await.map_err(|_| "invalid MCP response")?;
+                let event = body
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .next_back()
+                    .ok_or("invalid MCP response")?;
+                serde_json::from_str(event).map_err(|_| "invalid MCP response".to_string())
+            } else {
+                response
+                    .json::<Value>()
+                    .await
+                    .map_err(|_| "invalid MCP response".to_string())
+            }
+        }
+
+        async fn initialize_legacy_session(s: &GwState) -> Result<String, String> {
+            let rpc_id = {
+                let mut guard = s
+                    .mcp_rpc_id
+                    .lock()
+                    .map_err(|_| "MCP gateway state unavailable")?;
+                *guard += 1;
+                *guard
+            };
+            let headers = [
+                (
+                    "MCP-Protocol-Version",
+                    iicp_client::mcp_negotiation::LEGACY_MCP_REVISION,
+                ),
+                ("Accept", "application/json, text/event-stream"),
+            ];
+            let initialize = json!({
+                "jsonrpc": "2.0",
+                "id": rpc_id,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": iicp_client::mcp_negotiation::LEGACY_MCP_REVISION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "iicp-mcp-gateway", "version": env!("CARGO_PKG_VERSION")},
+                },
+            });
+            let response = s
+                .mcp_client
+                .post(format!("{}/mcp", s.mcp_url))
+                .headers(
+                    headers
+                        .iter()
+                        .map(|(name, value)| {
+                            (
+                                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                                reqwest::header::HeaderValue::from_static(value),
+                            )
+                        })
+                        .collect(),
+                )
+                .json(&initialize)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|_| "MCP server unreachable".to_string())?;
+            if !response.status().is_success() {
+                return Err("MCP server rejected legacy initialization".to_string());
+            }
+            let session_id = response
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    "MCP server did not return a legacy session identifier".to_string()
+                })?;
+            let data = response_json(response).await?;
+            if data.get("error").is_some() {
+                return Err("MCP server rejected legacy initialization".to_string());
+            }
+            let initialized =
+                json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}});
+            let notification = s
+                .mcp_client
+                .post(format!("{}/mcp", s.mcp_url))
+                .header(
+                    "MCP-Protocol-Version",
+                    iicp_client::mcp_negotiation::LEGACY_MCP_REVISION,
+                )
+                .header("Mcp-Session-Id", &session_id)
+                .header("Accept", "application/json, text/event-stream")
+                .json(&initialized)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|_| "MCP server unreachable".to_string())?;
+            if !notification.status().is_success() {
+                return Err("MCP server rejected initialized notification".to_string());
+            }
+            Ok(session_id)
+        }
+
+        enum LegacyCallError {
+            Expired,
+            Failed(String),
+        }
+
+        async fn send_legacy_call(
+            s: &GwState,
+            session_id: &str,
+            rpc: &Value,
+        ) -> Result<Value, LegacyCallError> {
+            let response = s
+                .mcp_client
+                .post(format!("{}/mcp", s.mcp_url))
+                .header(
+                    "MCP-Protocol-Version",
+                    iicp_client::mcp_negotiation::LEGACY_MCP_REVISION,
+                )
+                .header("Mcp-Session-Id", session_id)
+                .header("Accept", "application/json, text/event-stream")
+                .json(rpc)
+                .timeout(std::time::Duration::from_secs(30))
+                .send()
+                .await
+                .map_err(|_| LegacyCallError::Failed("MCP server unreachable".to_string()))?;
+            if matches!(
+                response.status(),
+                StatusCode::UNAUTHORIZED | StatusCode::NOT_FOUND
+            ) {
+                return Err(LegacyCallError::Expired);
+            }
+            if !response.status().is_success() {
+                return Err(LegacyCallError::Failed(
+                    "MCP server rejected tool call".to_string(),
+                ));
+            }
+            response_json(response)
+                .await
+                .map_err(LegacyCallError::Failed)
+        }
+
+        if s.mcp_revision == iicp_client::mcp_negotiation::LEGACY_MCP_REVISION {
+            let replay_safe = payload
+                .get("mcp_replay_safe")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut session = s.mcp_session_id.lock().await;
+            if session.is_none() {
+                match initialize_legacy_session(&s).await {
+                    Ok(value) => *session = Some(value),
+                    Err(reason) => {
+                        return (StatusCode::BAD_GATEWAY, Json(json!({"error": reason})))
+                    }
+                }
+            }
+            let first_session = session.as_deref().unwrap_or_default().to_string();
+            let data = match send_legacy_call(&s, &first_session, &rpc).await {
+                Ok(data) => data,
+                Err(LegacyCallError::Failed(reason)) => {
+                    return (StatusCode::BAD_GATEWAY, Json(json!({"error": reason})))
+                }
+                Err(LegacyCallError::Expired) if !replay_safe => {
+                    *session = None;
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(
+                            json!({"error":"mcp_session_expired_retry_required","retryable":true}),
+                        ),
+                    );
+                }
+                Err(LegacyCallError::Expired) => {
+                    let replacement = match initialize_legacy_session(&s).await {
+                        Ok(value) => value,
+                        Err(reason) => {
+                            *session = None;
+                            return (StatusCode::BAD_GATEWAY, Json(json!({"error": reason})));
+                        }
+                    };
+                    *session = Some(replacement.clone());
+                    match send_legacy_call(&s, &replacement, &rpc).await {
+                        Ok(data) => data,
+                        Err(_) => {
+                            *session = None;
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                Json(
+                                    json!({"error":"MCP legacy session expired after one reinitialization"}),
+                                ),
+                            );
+                        }
+                    }
+                }
+            };
+            if data.get("error").is_some() {
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({"error": "MCP tool returned an error"})),
+                );
+            }
+            let result = data.get("result").cloned().unwrap_or(Value::Null);
+            return (
+                StatusCode::OK,
+                Json(json!({
+                    "task_id": task_id, "status": "completed", "result": result,
+                    "policy_receipt": s.tool_policy.receipt(&tool_name, "allowed", argument_count),
+                })),
+            );
+        }
+
         let mut mcp_request = s.mcp_client.post(format!("{}/mcp", s.mcp_url));
         for (name, value) in modern_headers {
             mcp_request = mcp_request.header(name, value);
