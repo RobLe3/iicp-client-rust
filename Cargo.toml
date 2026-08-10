@@ -52,6 +52,9 @@ dispatch-admission-sqlite = ["dep:rusqlite"]
 # Optional Linux service-manager notifications. Runtime health remains
 # platform-neutral and ordinary builds retain Type=simple behavior.
 systemd-notify = ["dep:sd-notify"]
+# Development/evidence-only deterministic health-state injection. Never part
+# of the default build and not wired to CLI, HTTP or environment input.
+runtime-health-fault-injection = []
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
