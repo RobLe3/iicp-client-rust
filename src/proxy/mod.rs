@@ -330,7 +330,7 @@ async fn ollama_chat(State(b): State<Backend>, Json(body): Json<Value>) -> Respo
                 ai_generated(build(
                     StatusCode::OK,
                     "application/x-ndjson",
-                    format!("{}\n", payload).into_bytes(),
+                    format!("{payload}\n").into_bytes(),
                 ))
             } else {
                 ai_generated(json_response(StatusCode::OK, payload))
@@ -358,7 +358,7 @@ async fn ollama_generate(State(b): State<Backend>, Json(body): Json<Value>) -> R
                 ai_generated(build(
                     StatusCode::OK,
                     "application/x-ndjson",
-                    format!("{}\n", payload).into_bytes(),
+                    format!("{payload}\n").into_bytes(),
                 ))
             } else {
                 ai_generated(json_response(StatusCode::OK, payload))
