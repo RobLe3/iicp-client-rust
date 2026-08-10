@@ -24,6 +24,13 @@ async fn main() {
         .nth(1)
         .unwrap_or_else(|| "stall-once".to_string());
     let argument = std::env::args().nth(2).map(PathBuf::from);
+    if mode == "crash-once" {
+        let marker = argument.clone().expect("crash-once requires a marker path");
+        if !marker.exists() {
+            std::fs::write(marker, b"crashed\n").expect("write crash marker");
+            std::process::exit(1);
+        }
+    }
     let should_stall = match mode.as_str() {
         "always-stall" => true,
         "stall-once" => {
@@ -35,8 +42,8 @@ async fn main() {
                 true
             }
         }
-        "healthy" | "measure" => false,
-        _ => panic!("mode must be healthy, measure, stall-once, or always-stall"),
+        "healthy" | "measure" | "crash-once" => false,
+        _ => panic!("mode must be healthy, measure, crash-once, stall-once, or always-stall"),
     };
 
     let health = RuntimeHealth::new(true);

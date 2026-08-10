@@ -212,4 +212,34 @@ mod tests {
         std::env::remove_var("WATCHDOG_PID");
         let _ = std::fs::remove_file(socket_path);
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_socket_reports_orderly_stopping() {
+        use std::os::unix::net::UnixDatagram;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "iicp-notify-stop-{}-{}.sock",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let socket = UnixDatagram::bind(&socket_path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        std::env::set_var(OPT_IN_ENV, "1");
+        std::env::set_var("NOTIFY_SOCKET", &socket_path);
+
+        notify_stopping();
+
+        let mut buf = [0_u8; 512];
+        let size = socket.recv(&mut buf).unwrap();
+        let notification = String::from_utf8_lossy(&buf[..size]);
+        assert!(notification.contains("STOPPING=1"));
+        assert!(notification.contains("STATUS=Stopping"));
+
+        std::env::remove_var(OPT_IN_ENV);
+        std::env::remove_var("NOTIFY_SOCKET");
+        let _ = std::fs::remove_file(socket_path);
+    }
 }

@@ -22,9 +22,10 @@ manager lane:
 ./scripts/validate_systemd_watchdog.sh /tmp/systemd-watchdog-evidence.json
 ```
 
-It creates two temporary transient units. One stalls once and must recover to
-a healthy second process; the other stalls on every start and must reach the
-configured start limit. A third uses the node's five-second runtime progress
+It creates four temporary transient units. One stalls once and must recover to
+a healthy second process; one exits unsuccessfully once and must recover through
+ordinary process supervision; another stalls on every start and must reach the
+configured start limit. The fourth uses the node's five-second runtime progress
 cadence under bounded CPU and synchronous-storage pressure and must remain live
 without a restart or crossing the existing 30-second stale threshold. A trap
 stops and resets all units and load generators. Set
