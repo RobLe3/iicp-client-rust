@@ -1286,7 +1286,7 @@ async fn run_query(args: &[String]) -> Result<(), String> {
         }),
     };
 
-    eprintln!("[iicp-node] Discovering nodes for {}...", intent);
+    eprintln!("[iicp-node] Discovering nodes for {intent}...");
     if iicp_client::RoutingProfile::from_cli(&routing_profile)
         != iicp_client::RoutingProfile::Sensitive
     {
@@ -3346,8 +3346,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                             opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
                             node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
                             eprintln!(
-                                "[iicp-node] auto-elected relay (last resort): {}:{}",
-                                relay_host, relay_port
+                                "[iicp-node] auto-elected relay (last resort): {relay_host}:{relay_port}"
                             );
                             break;
                         }
@@ -3433,8 +3432,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                         opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
                         node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
                         eprintln!(
-                            "[iicp-node] auto-elected relay (last resort): {}:{}",
-                            relay_host, relay_port
+                            "[iicp-node] auto-elected relay (last resort): {relay_host}:{relay_port}"
                         );
                     }
                 } else {
