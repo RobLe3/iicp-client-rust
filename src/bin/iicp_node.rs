@@ -807,6 +807,12 @@ fn render_systemd_service(
     name: Option<&str>,
     executable: &str,
 ) -> Result<ServiceUnit, String> {
+    let notify_requested = env_bool("IICP_SYSTEMD_NOTIFY");
+    if notify_requested && !cfg!(all(target_os = "linux", feature = "systemd-notify")) {
+        return Err(
+            "IICP_SYSTEMD_NOTIFY=1 requires a Linux build with --features systemd-notify".into(),
+        );
+    }
     let label = service_label(node, name)?;
     let home = home_dir();
     let unit_path = home
@@ -821,7 +827,7 @@ fn render_systemd_service(
             .to_string_lossy()
             .to_string(),
     ));
-    let envs = [
+    let mut envs = vec![
         ("IICP_NODE_NAME", node.to_string()),
         (
             "IICP_AUTO_UPDATE",
@@ -841,13 +847,37 @@ fn render_systemd_service(
         ),
         ("IICP_LOG_DIR", log_dir.to_string_lossy().to_string()),
     ];
+    if notify_requested {
+        envs.push(("IICP_SYSTEMD_NOTIFY", "1".to_string()));
+    }
     let env_lines = envs
         .iter()
         .map(|(k, v)| format!("Environment={k}={}", shell_quote(v)))
         .collect::<Vec<_>>()
         .join("\n");
+    let service_type = if notify_requested {
+        "notify\nNotifyAccess=main"
+    } else {
+        "simple"
+    };
+    let watchdog_line = if notify_requested {
+        match std::env::var("IICP_SYSTEMD_WATCHDOG_SEC") {
+            Ok(raw) => {
+                let seconds = raw.parse::<u64>().map_err(|_| {
+                    "IICP_SYSTEMD_WATCHDOG_SEC must be an integer derived from measured cadence"
+                })?;
+                if !(1..=3600).contains(&seconds) {
+                    return Err("IICP_SYSTEMD_WATCHDOG_SEC must be between 1 and 3600".into());
+                }
+                format!("\nWatchdogSec={seconds}")
+            }
+            Err(_) => String::new(),
+        }
+    } else {
+        String::new()
+    };
     let content = format!(
-        "[Unit]\nDescription=IICP node {node}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart={executable} serve --node {}\n{env_lines}\nRestart=on-failure\nRestartSec=30\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
+        "[Unit]\nDescription=IICP node {node}\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType={service_type}{watchdog_line}\nExecStart={executable} serve --node {}\n{env_lines}\nRestart=on-failure\nRestartSec=30\nWorkingDirectory={}\n\n[Install]\nWantedBy=default.target\n",
         shell_quote(node),
         shell_quote(&home.to_string_lossy()),
     );
@@ -3148,6 +3178,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
     let mut node = IicpNode::new(cfg);
     let runtime_health = node.runtime_health();
+    #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
+    let systemd_notifier = iicp_client::systemd_notify::spawn_if_enabled(runtime_health.clone());
     if !opts.node.is_empty() {
         node.set_saved_node_name(opts.node.clone());
         let health_path = runtime_health_path(&opts.node)?;
@@ -3715,6 +3747,13 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     };
 
     runtime_health.mark_stopping();
+    #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
+    {
+        iicp_client::systemd_notify::notify_stopping();
+        if let Some(handle) = systemd_notifier {
+            handle.abort();
+        }
+    }
     if let Some(t) = &tunnel {
         t.close(); // #520 — tear the Quick Tunnel down with the node
     }
@@ -5846,6 +5885,7 @@ mod tests {
     fn systemd_service_runs_foreground_serve_with_hourly_auto_update() {
         env::remove_var("IICP_AUTO_UPDATE");
         env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+        env::remove_var("IICP_SYSTEMD_NOTIFY");
         let unit = render_systemd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert_eq!(unit.platform, "systemd");
         assert!(unit
@@ -5865,6 +5905,17 @@ mod tests {
             .contains("Environment=IICP_TUNNEL_DEAD_POLICY=auto"));
         assert!(unit.content.contains("Restart=on-failure"));
         assert!(!unit.content.contains("--daemon"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
+    #[test]
+    fn systemd_notify_is_explicit_and_does_not_guess_a_watchdog_timeout() {
+        env::set_var("IICP_SYSTEMD_NOTIFY", "1");
+        let unit = render_systemd_service("notify-node", None, "/tmp/iicp-node").unwrap();
+        env::remove_var("IICP_SYSTEMD_NOTIFY");
+        assert!(unit.content.contains("Type=notify\nNotifyAccess=main"));
+        assert!(unit.content.contains("Environment=IICP_SYSTEMD_NOTIFY=1"));
+        assert!(!unit.content.contains("WatchdogSec="));
     }
 
     #[test]

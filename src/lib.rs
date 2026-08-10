@@ -88,6 +88,8 @@ pub mod service_lifecycle_distributed;
 pub mod service_lifecycle_identity;
 #[cfg(feature = "lifecycle-sqlite")]
 pub mod service_lifecycle_sqlite;
+#[cfg(feature = "systemd-notify")]
+pub mod systemd_notify;
 pub mod token_validator;
 pub mod trust_auditor;
 pub mod tunnel;
