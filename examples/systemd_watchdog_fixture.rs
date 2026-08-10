@@ -4,7 +4,18 @@
 #[cfg(target_os = "linux")]
 use iicp_client::runtime_health::{RuntimeHealth, RuntimeHealthFault};
 #[cfg(target_os = "linux")]
+use serde::Serialize;
+#[cfg(target_os = "linux")]
 use std::{path::PathBuf, time::Duration};
+
+#[cfg(target_os = "linux")]
+#[derive(Serialize)]
+struct CadenceEvidence {
+    content_free: bool,
+    configured_interval_ms: u128,
+    max_observed_interval_ms: u128,
+    samples: usize,
+}
 
 #[cfg(target_os = "linux")]
 #[tokio::main]
@@ -12,11 +23,11 @@ async fn main() {
     let mode = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "stall-once".to_string());
-    let marker = std::env::args().nth(2).map(PathBuf::from);
+    let argument = std::env::args().nth(2).map(PathBuf::from);
     let should_stall = match mode.as_str() {
         "always-stall" => true,
         "stall-once" => {
-            let marker = marker.expect("stall-once requires a marker path");
+            let marker = argument.clone().expect("stall-once requires a marker path");
             if marker.exists() {
                 false
             } else {
@@ -24,8 +35,8 @@ async fn main() {
                 true
             }
         }
-        "healthy" => false,
-        _ => panic!("mode must be healthy, stall-once, or always-stall"),
+        "healthy" | "measure" => false,
+        _ => panic!("mode must be healthy, measure, stall-once, or always-stall"),
     };
 
     let health = RuntimeHealth::new(true);
@@ -35,9 +46,21 @@ async fn main() {
     let _notifier = iicp_client::systemd_notify::spawn_if_enabled(health.clone())
         .expect("systemd notification must be enabled by the evidence unit");
 
+    let cadence = if mode == "measure" {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_millis(100)
+    };
+    let measurement_path =
+        (mode == "measure").then(|| argument.expect("measure requires an output path"));
+    let mut intervals = Vec::new();
+    let mut previous = std::time::Instant::now();
     let mut cycles = 0_u64;
     loop {
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(cadence).await;
+        let now = std::time::Instant::now();
+        intervals.push(now.duration_since(previous).as_millis());
+        previous = now;
         cycles += 1;
         if should_stall && cycles == 5 {
             health.inject_fault(RuntimeHealthFault::RuntimeProgressStale);
@@ -46,6 +69,18 @@ async fn main() {
         if !should_stall {
             health.advance_runtime();
             health.advance_supervisor();
+        }
+        if let Some(path) = &measurement_path {
+            if cycles == 6 {
+                let evidence = CadenceEvidence {
+                    content_free: true,
+                    configured_interval_ms: cadence.as_millis(),
+                    max_observed_interval_ms: *intervals.iter().max().unwrap_or(&0),
+                    samples: intervals.len(),
+                };
+                std::fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap())
+                    .expect("write cadence evidence");
+            }
         }
     }
 }

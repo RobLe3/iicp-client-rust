@@ -24,7 +24,10 @@ manager lane:
 
 It creates two temporary transient units. One stalls once and must recover to
 a healthy second process; the other stalls on every start and must reach the
-configured start limit. A trap stops and resets both units. Set
+configured start limit. A third uses the node's five-second runtime progress
+cadence under bounded CPU and synchronous-storage pressure and must remain live
+without a restart or crossing the existing 30-second stale threshold. A trap
+stops and resets all units and load generators. Set
 `IICP_SYSTEMD_EVIDENCE_SCOPE=system` only in an already isolated test host where
 the invoking user is authorized to control the system manager; user scope is
 the default. The two-second watchdog is specific to the deterministic fixture
@@ -34,6 +37,13 @@ The ordinary quality job runs this lane against the active system manager on
 its isolated Linux x86-64 runner and prints only the content-free result. ARM64
 evidence must still be collected separately on an isolated ARM host or systemd
 container; an emulated architecture must be labeled as such.
+
+The loaded lane records the maximum observed interval rather than treating a
+single pass/fail pulse as timing evidence. It uses the node's current
+five-second progress cadence, two bounded CPU workers and repeated 32 MiB
+synchronous writes. This is scheduler and storage-pressure evidence for the
+health loop, not an inference-performance benchmark or a production watchdog
+timeout selection.
 
 Before issue #66 can close, a maintainer must additionally record on x86-64
 Linux and Raspberry Pi OS or Debian ARM64:
