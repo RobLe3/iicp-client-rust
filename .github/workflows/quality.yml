@@ -24,3 +24,12 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - run: cargo test --locked --all-features
+      - name: Validate isolated systemd watchdog recovery
+        run: |
+          sudo env "PATH=$PATH" \
+            "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
+            "RUSTUP_HOME=$(rustup show home)" \
+            IICP_SYSTEMD_EVIDENCE_SCOPE=system \
+            ./scripts/validate_systemd_watchdog.sh \
+            "$RUNNER_TEMP/systemd-watchdog-evidence.json"
+          cat "$RUNNER_TEMP/systemd-watchdog-evidence.json"
