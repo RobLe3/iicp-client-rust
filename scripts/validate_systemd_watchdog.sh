@@ -24,11 +24,17 @@ started="$(date -u +%FT%TZ)"
 work="$(mktemp -d)"
 unit="iicp-health-evidence-$RANDOM"
 storm="${unit}-storm"
+load="${unit}-load"
 marker="$work/stalled-once"
+cadence="$work/cadence.json"
+load_pids=()
 
 cleanup() {
-  "${manager[@]}" stop "$unit.service" "$storm.service" >/dev/null 2>&1 || true
-  "${manager[@]}" reset-failed "$unit.service" "$storm.service" >/dev/null 2>&1 || true
+  if [[ "${#load_pids[@]}" -gt 0 ]]; then
+    kill "${load_pids[@]}" >/dev/null 2>&1 || true
+  fi
+  "${manager[@]}" stop "$unit.service" "$storm.service" "$load.service" >/dev/null 2>&1 || true
+  "${manager[@]}" reset-failed "$unit.service" "$storm.service" "$load.service" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -85,15 +91,61 @@ done
   exit 1
 }
 
+"${runner[@]}" --unit="$load" \
+  --property=Type=notify --property=NotifyAccess=main \
+  --property=WatchdogSec=20s --property=Restart=on-failure \
+  --property=RestartSec=1s --setenv=IICP_SYSTEMD_NOTIFY=1 \
+  "$fixture" measure "$cadence" >/dev/null
+
+for _ in 1 2; do
+  yes >/dev/null &
+  load_pids+=("$!")
+done
+(
+  while :; do
+    dd if=/dev/zero of="$work/storage-load" bs=1M count=32 conv=fsync status=none
+    rm -f "$work/storage-load"
+  done
+) &
+load_pids+=("$!")
+
+for _ in $(seq 1 90); do
+  [[ -s "$cadence" ]] && break
+  sleep 0.5
+done
+for pid in "${load_pids[@]}"; do
+  kill -0 "$pid" >/dev/null 2>&1 || {
+    echo "ERROR: a bounded load generator exited before cadence measurement completed" >&2
+    exit 1
+  }
+done
+kill "${load_pids[@]}" >/dev/null 2>&1 || true
+load_pids=()
+[[ -s "$cadence" ]] || {
+  echo "ERROR: loaded cadence evidence was not produced" >&2
+  exit 1
+}
+load_restarts="$("${manager[@]}" show "$load.service" -p NRestarts --value)"
+load_active="$("${manager[@]}" show "$load.service" -p ActiveState --value)"
+[[ "$load_restarts" -eq 0 && "$load_active" == "active" ]] || {
+  echo "ERROR: legitimate load caused a watchdog restart" >&2
+  exit 1
+}
+max_interval="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["max_observed_interval_ms"])' "$cadence")"
+[[ "$max_interval" -lt 30000 ]] || {
+  echo "ERROR: runtime progress exceeded the existing 30-second stale threshold" >&2
+  exit 1
+}
+
 completed="$(date -u +%FT%TZ)"
 arch="$(uname -m)"
 systemd_version="$(systemctl --version | awk 'NR==1 {print $2}')"
-python3 - "$output" "$started" "$completed" "$scope" "$arch" "$systemd_version" <<'PY'
+python3 - "$output" "$started" "$completed" "$scope" "$arch" "$systemd_version" "$max_interval" <<'PY'
 import json
 import pathlib
 import sys
 
-path, started, completed, scope, arch, systemd = sys.argv[1:]
+path, started, completed, scope, arch, systemd, max_interval = sys.argv[1:]
 record = {
     "schema": "iicp.runtime_health_systemd_evidence.v1",
     "content_free": True,
@@ -104,8 +156,15 @@ record = {
         "pid_alive_stall_watchdog_recovery": "pass",
         "post_restart_healthy_instance": "pass",
         "restart_storm_limit": "pass",
+        "loaded_runtime_cadence": "pass",
     },
-    "watchdog_seconds": 2,
+    "recovery_watchdog_seconds": 2,
+    "loaded_watchdog_seconds": 20,
+    "loaded_cadence": {
+        "configured_interval_ms": 5000,
+        "max_observed_interval_ms": int(max_interval),
+        "stale_threshold_ms": 30000,
+    },
     "limitations": [
         "temporary_fixture_process_not_a_registered_iicp_provider",
         "does_not_classify_the_original_raspberry_pi_incident",
