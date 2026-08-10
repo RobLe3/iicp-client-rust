@@ -147,4 +147,69 @@ mod tests {
             }
         );
     }
+
+    #[cfg(all(target_os = "linux", feature = "runtime-health-fault-injection"))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_socket_pulses_live_runtime_then_withholds_after_stall() {
+        use crate::runtime_health::{RuntimeHealth, RuntimeHealthFault};
+        use std::os::unix::net::UnixDatagram;
+
+        let socket_path = std::env::temp_dir().join(format!(
+            "iicp-notify-{}-{}.sock",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let socket = UnixDatagram::bind(&socket_path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        std::env::set_var(OPT_IN_ENV, "1");
+        std::env::set_var("NOTIFY_SOCKET", &socket_path);
+        std::env::set_var("WATCHDOG_USEC", "200000");
+        std::env::set_var("WATCHDOG_PID", std::process::id().to_string());
+
+        let health = RuntimeHealth::new(false);
+        health.mark_running();
+        health.advance_runtime();
+        let handle = spawn_if_enabled(health.clone()).expect("notifier enabled");
+
+        let mut initial = String::new();
+        for _ in 0..4 {
+            let mut buf = [0_u8; 512];
+            if let Ok(size) = socket.recv(&mut buf) {
+                initial.push_str(&String::from_utf8_lossy(&buf[..size]));
+            }
+            if initial.contains("READY=1") && initial.contains("WATCHDOG=1") {
+                break;
+            }
+        }
+        assert!(initial.contains("READY=1"));
+        assert!(initial.contains("WATCHDOG=1"));
+
+        socket.set_nonblocking(true).unwrap();
+        let mut drain = [0_u8; 512];
+        while socket.recv(&mut drain).is_ok() {}
+        health.inject_fault(RuntimeHealthFault::RuntimeProgressStale);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        socket.set_nonblocking(false).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        let mut after_stall = String::new();
+        for _ in 0..2 {
+            let mut buf = [0_u8; 512];
+            if let Ok(size) = socket.recv(&mut buf) {
+                after_stall.push_str(&String::from_utf8_lossy(&buf[..size]));
+            }
+        }
+        assert!(after_stall.contains("liveness=notlive"));
+        assert!(!after_stall.contains("WATCHDOG=1"));
+
+        handle.abort();
+        std::env::remove_var(OPT_IN_ENV);
+        std::env::remove_var("NOTIFY_SOCKET");
+        std::env::remove_var("WATCHDOG_USEC");
+        std::env::remove_var("WATCHDOG_PID");
+        let _ = std::fs::remove_file(socket_path);
+    }
 }

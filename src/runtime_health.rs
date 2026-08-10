@@ -211,6 +211,19 @@ pub struct RuntimeHealth {
     state: Arc<Mutex<State>>,
 }
 
+#[cfg(feature = "runtime-health-fault-injection")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RuntimeHealthFault {
+    RuntimeProgressStale,
+    SupervisorProgressStale,
+    DirectoryUnavailable,
+    DnsUnavailable,
+    InternetUnavailable,
+    TunnelRecovering,
+    ProviderUnavailable,
+    Clear,
+}
+
 impl RuntimeHealth {
     pub fn new(supervisor_required: bool) -> Self {
         let now = Instant::now();
@@ -276,6 +289,58 @@ impl RuntimeHealth {
             .unwrap()
             .external
             .insert(name.into(), value);
+    }
+    /// Deterministic development/test hook for supervision evidence.
+    ///
+    /// This API exists only in explicit fault-injection builds and has no CLI,
+    /// HTTP or environment-variable activation path.
+    #[cfg(feature = "runtime-health-fault-injection")]
+    pub fn inject_fault(&self, fault: RuntimeHealthFault) {
+        let now = Instant::now();
+        let mut s = self.state.lock().unwrap();
+        match fault {
+            RuntimeHealthFault::RuntimeProgressStale => {
+                s.last_runtime = now - RUNTIME_STALE_AFTER - Duration::from_millis(1);
+            }
+            RuntimeHealthFault::SupervisorProgressStale => {
+                s.supervisor_required = true;
+                s.last_supervisor = now - SUPERVISOR_STALE_AFTER - Duration::from_millis(1);
+            }
+            RuntimeHealthFault::DirectoryUnavailable => {
+                s.external
+                    .insert("directory".into(), SubsystemState::Unavailable);
+            }
+            RuntimeHealthFault::DnsUnavailable => {
+                s.external.insert("dns".into(), SubsystemState::Unavailable);
+            }
+            RuntimeHealthFault::InternetUnavailable => {
+                s.external
+                    .insert("internet".into(), SubsystemState::Unavailable);
+            }
+            RuntimeHealthFault::TunnelRecovering => {
+                s.subsystems
+                    .insert("tunnel".into(), SubsystemState::Recovering);
+            }
+            RuntimeHealthFault::ProviderUnavailable => {
+                s.subsystems
+                    .insert("provider".into(), SubsystemState::Unavailable);
+                s.capacity_available = false;
+            }
+            RuntimeHealthFault::Clear => {
+                s.last_runtime = now;
+                s.last_supervisor = now;
+                s.capacity_available = true;
+                s.subsystems
+                    .insert("provider".into(), SubsystemState::Healthy);
+                s.subsystems
+                    .insert("routing".into(), SubsystemState::Healthy);
+                s.subsystems
+                    .insert("tunnel".into(), SubsystemState::Healthy);
+                for name in ["directory", "dns", "internet"] {
+                    s.external.insert(name.into(), SubsystemState::Healthy);
+                }
+            }
+        }
     }
     pub fn snapshot(&self) -> HealthSnapshot {
         let now = Instant::now();
