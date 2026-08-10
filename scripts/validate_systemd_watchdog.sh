@@ -25,7 +25,9 @@ work="$(mktemp -d)"
 unit="iicp-health-evidence-$RANDOM"
 storm="${unit}-storm"
 load="${unit}-load"
+crash="${unit}-crash"
 marker="$work/stalled-once"
+crash_marker="$work/crashed-once"
 cadence="$work/cadence.json"
 load_pids=()
 
@@ -33,8 +35,8 @@ cleanup() {
   if [[ "${#load_pids[@]}" -gt 0 ]]; then
     kill "${load_pids[@]}" >/dev/null 2>&1 || true
   fi
-  "${manager[@]}" stop "$unit.service" "$storm.service" "$load.service" >/dev/null 2>&1 || true
-  "${manager[@]}" reset-failed "$unit.service" "$storm.service" "$load.service" >/dev/null 2>&1 || true
+  "${manager[@]}" stop "$unit.service" "$storm.service" "$load.service" "$crash.service" >/dev/null 2>&1 || true
+  "${manager[@]}" reset-failed "$unit.service" "$storm.service" "$load.service" "$crash.service" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -68,6 +70,25 @@ for _ in $(seq 1 80); do
 done
 [[ "$recovered" -eq 1 ]] || {
   echo "ERROR: systemd did not recover the one-time PID-alive stall" >&2
+  exit 1
+}
+
+"${runner[@]}" --unit="$crash" "${common[@]}" \
+  --property=StartLimitIntervalSec=20s --property=StartLimitBurst=4 \
+  "$fixture" crash-once "$crash_marker" >/dev/null || true
+
+crash_recovered=0
+for _ in $(seq 1 80); do
+  restarts="$("${manager[@]}" show "$crash.service" -p NRestarts --value)"
+  active="$("${manager[@]}" show "$crash.service" -p ActiveState --value)"
+  if [[ "$restarts" -ge 1 && "$active" == "active" ]]; then
+    crash_recovered=1
+    break
+  fi
+  sleep 0.25
+done
+[[ "$crash_recovered" -eq 1 ]] || {
+  echo "ERROR: systemd did not recover the one-time process crash" >&2
   exit 1
 }
 
@@ -154,6 +175,7 @@ record = {
     "platform": {"os": "linux", "arch": arch, "systemd": systemd, "scope": scope},
     "checks": {
         "pid_alive_stall_watchdog_recovery": "pass",
+        "process_crash_recovery": "pass",
         "post_restart_healthy_instance": "pass",
         "restart_storm_limit": "pass",
         "loaded_runtime_cadence": "pass",
