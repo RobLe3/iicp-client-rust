@@ -49,6 +49,9 @@ lifecycle-sqlite = ["dep:rusqlite"]
 # Opt-in provider-local durable admission for the pre-normative dispatch-v2 profile.
 # This does not mount an endpoint or alter ordinary node dispatch.
 dispatch-admission-sqlite = ["dep:rusqlite"]
+# Optional Linux service-manager notifications. Runtime health remains
+# platform-neutral and ordinary builds retain Type=simple behavior.
+systemd-notify = ["dep:sd-notify"]
 
 [dependencies]
 reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
@@ -63,6 +66,7 @@ tracing = "0.1"
 prometheus = { version = "0.14", optional = true }
 ciborium = { version = "0.2", optional = true }
 igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
+
 # ADR-019 pricing-block HMAC-SHA256. Pulled in unconditionally — operators
 # who don't use pricing pay only ~30KB in binary size.
 hmac = "0.12"
@@ -87,6 +91,9 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde_jcs = "0.2.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+sd-notify = { version = "0.5", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "time", "sync"] }
