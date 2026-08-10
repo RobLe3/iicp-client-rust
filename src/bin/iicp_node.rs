@@ -525,7 +525,6 @@ struct ServiceUnit {
     content: String,
     status_hint: String,
     restart_hint: String,
-    uninstall_hint: String,
     log_hint: String,
 }
 
@@ -795,11 +794,6 @@ fn render_launchd_service(
         content,
         status_hint: format!("launchctl print gui/$(id -u)/{label}"),
         restart_hint: format!("launchctl kickstart -k gui/$(id -u)/{label}"),
-        uninstall_hint: format!(
-            "launchctl bootout gui/$(id -u) {}; rm -f {}",
-            shell_quote(&plist.to_string_lossy()),
-            shell_quote(&plist.to_string_lossy())
-        ),
         log_hint: format!(
             "tail -f {} {}",
             shell_quote(&out_log.to_string_lossy()),
@@ -864,10 +858,6 @@ fn render_systemd_service(
         content,
         status_hint: format!("systemctl --user status {label}.service"),
         restart_hint: format!("systemctl --user restart {label}.service"),
-        uninstall_hint: format!(
-            "systemctl --user disable --now {label}.service; rm -f {}; systemctl --user daemon-reload",
-            shell_quote(&unit_path.to_string_lossy())
-        ),
         log_hint: format!("journalctl --user -u {label}.service -f"),
     })
 }
@@ -913,7 +903,8 @@ fn run_service(args: &[String]) -> Result<(), String> {
              \x20 --node NAME        Saved node name to serve (required)\n\
              \x20 --name NAME        Override service label/unit name\n\
              \x20 --platform KIND    auto | launchd | systemd (default auto)\n\
-             \x20 --dry-run          For install: print the generated unit without writing files"
+             \x20 --no-start         Install and enable without starting now\n\
+             \x20 --dry-run          Print filesystem and manager actions without changing state"
         );
         return if subcmd.is_empty() {
             Err("service requires a subcommand".to_string())
@@ -928,6 +919,7 @@ fn run_service(args: &[String]) -> Result<(), String> {
     let mut name: Option<String> = None;
     let mut platform = "auto".to_string();
     let mut dry_run = false;
+    let mut no_start = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -944,6 +936,7 @@ fn run_service(args: &[String]) -> Result<(), String> {
                 platform = args.get(i).cloned().ok_or("--platform requires a value")?;
             }
             "--dry-run" => dry_run = true,
+            "--no-start" => no_start = true,
             "--help" | "-h" => return run_service(&["help".to_string()]),
             other => return Err(format!("unknown service option '{other}'")),
         }
@@ -956,6 +949,36 @@ fn run_service(args: &[String]) -> Result<(), String> {
     let managed_binary = supervised_executable_path();
     let executable = managed_binary.to_string_lossy().to_string();
     let unit = render_service_unit(&node, name.as_deref(), &platform, &executable)?;
+    let execute =
+        |program: &str, command_args: &[&str], tolerate_failure: bool| -> Result<(), String> {
+            println!("manager:  {} {}", program, command_args.join(" "));
+            if dry_run {
+                return Ok(());
+            }
+            let status = std::process::Command::new(program)
+                .args(command_args)
+                .status()
+                .map_err(|e| format!("{program}: {e}"))?;
+            if !status.success() && !tolerate_failure {
+                return Err(format!(
+                    "{program} {} failed with {status}",
+                    command_args.join(" ")
+                ));
+            }
+            Ok(())
+        };
+    let systemd_name = format!("{}.service", unit.name);
+    let unit_path = unit.path.to_string_lossy().to_string();
+    let uid = || -> Result<String, String> {
+        let output = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err("id -u failed".into());
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    };
     match subcmd {
         "install" => {
             if dry_run {
@@ -977,14 +1000,125 @@ fn run_service(args: &[String]) -> Result<(), String> {
                     unit.path.display()
                 );
             }
+            if unit.platform == "systemd" {
+                execute("systemctl", &["--user", "daemon-reload"], false)?;
+                execute("systemctl", &["--user", "enable", &systemd_name], false)?;
+                if !no_start {
+                    execute("systemctl", &["--user", "start", &systemd_name], false)?;
+                }
+                execute(
+                    "systemctl",
+                    &[
+                        "--user",
+                        "show",
+                        &systemd_name,
+                        "-p",
+                        "LoadState",
+                        "-p",
+                        "ActiveState",
+                        "-p",
+                        "SubState",
+                        "-p",
+                        "UnitFileState",
+                        "-p",
+                        "Restart",
+                        "-p",
+                        "RestartUSec",
+                        "-p",
+                        "Type",
+                        "-p",
+                        "WatchdogUSec",
+                        "-p",
+                        "NotifyAccess",
+                    ],
+                    false,
+                )?;
+                let user = env::var("USER").unwrap_or_default();
+                if !user.is_empty() {
+                    execute(
+                        "loginctl",
+                        &["show-user", &user, "-p", "Linger", "--value"],
+                        true,
+                    )?;
+                }
+            } else {
+                let domain = format!("gui/{}", uid()?);
+                let target = format!("{domain}/{}", unit.name);
+                execute("launchctl", &["enable", &target], false)?;
+                if !no_start {
+                    execute("launchctl", &["bootout", &target], true)?;
+                    execute("launchctl", &["bootstrap", &domain, &unit_path], false)?;
+                    execute("launchctl", &["kickstart", "-k", &target], false)?;
+                    execute("launchctl", &["print", &target], false)?;
+                }
+            }
             println!("status:   {}", unit.status_hint);
             println!("restart:  {}", unit.restart_hint);
             println!("logs:     {}", unit.log_hint);
             println!("Note: no classic --daemon fork is used; the OS supervisor runs foreground `iicp-node serve`.");
         }
-        "status" => println!("{}", unit.status_hint),
-        "restart" => println!("{}", unit.restart_hint),
-        "uninstall" => println!("{}", unit.uninstall_hint),
+        "status" => {
+            if unit.platform == "systemd" {
+                execute(
+                    "systemctl",
+                    &[
+                        "--user",
+                        "show",
+                        &systemd_name,
+                        "-p",
+                        "LoadState",
+                        "-p",
+                        "ActiveState",
+                        "-p",
+                        "SubState",
+                        "-p",
+                        "UnitFileState",
+                        "-p",
+                        "Restart",
+                        "-p",
+                        "RestartUSec",
+                        "-p",
+                        "Type",
+                        "-p",
+                        "WatchdogUSec",
+                        "-p",
+                        "NotifyAccess",
+                    ],
+                    false,
+                )?;
+            } else {
+                let target = format!("gui/{}/{}", uid()?, unit.name);
+                execute("launchctl", &["print", &target], false)?;
+            }
+        }
+        "restart" => {
+            if unit.platform == "systemd" {
+                execute("systemctl", &["--user", "restart", &systemd_name], false)?;
+            } else {
+                let target = format!("gui/{}/{}", uid()?, unit.name);
+                execute("launchctl", &["kickstart", "-k", &target], false)?;
+            }
+        }
+        "uninstall" => {
+            if unit.platform == "systemd" {
+                execute(
+                    "systemctl",
+                    &["--user", "disable", "--now", &systemd_name],
+                    true,
+                )?;
+                if !dry_run {
+                    let _ = fs::remove_file(&unit.path);
+                }
+                execute("systemctl", &["--user", "daemon-reload"], false)?;
+            } else {
+                let target = format!("gui/{}/{}", uid()?, unit.name);
+                execute("launchctl", &["bootout", &target], true)?;
+                execute("launchctl", &["disable", &target], true)?;
+                if !dry_run {
+                    let _ = fs::remove_file(&unit.path);
+                }
+            }
+        }
         _ => unreachable!(),
     }
     Ok(())
