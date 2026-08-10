@@ -277,6 +277,7 @@ fn print_help() {
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
          \x20 serve                      Register and serve a node\n\
          \x20 doctor                     Check local health, directory presence, and recovery action\n\
+         \x20 healthcheck                Check local runtime liveness/readiness snapshot\n\
          \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\
          \x20 credits                    Show your operator wallet plus this node's credit ledger\n\
          \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\
@@ -585,6 +586,104 @@ fn home_dir() -> PathBuf {
     env::var("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn runtime_health_path(node: &str) -> Result<PathBuf, String> {
+    if node.is_empty()
+        || !node
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(
+            "healthcheck node name must contain only letters, digits, '.', '-' or '_'".into(),
+        );
+    }
+    Ok(home_dir()
+        .join(".iicp")
+        .join("run")
+        .join(node)
+        .join("health-v1.json"))
+}
+
+fn run_healthcheck(args: &[String]) -> Result<i32, String> {
+    let mut node = env::var("IICP_NODE_NAME").unwrap_or_default();
+    let mut json_output = false;
+    let mut check_ready = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--node" => {
+                i += 1;
+                node = args.get(i).cloned().ok_or("--node requires a value")?;
+            }
+            "--json" => json_output = true,
+            "--ready" => check_ready = true,
+            "--help" | "-h" => {
+                println!("usage: iicp-node healthcheck --node NAME [--json] [--ready]");
+                return Ok(0);
+            }
+            other => return Err(format!("unknown healthcheck option: {other}")),
+        }
+        i += 1;
+    }
+    if node.is_empty() {
+        return Err("healthcheck requires --node NAME".into());
+    }
+    let path = runtime_health_path(&node)?;
+    let raw = match fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("INDETERMINATE: no runtime-health snapshot for node {node}");
+            return Ok(2);
+        }
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let snapshot: iicp_client::runtime_health::HealthSnapshot = match serde_json::from_slice(&raw) {
+        Ok(snapshot) => snapshot,
+        Err(e) => {
+            eprintln!("INDETERMINATE: invalid runtime-health snapshot: {e}");
+            return Ok(2);
+        }
+    };
+    let file_age = fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .and_then(|t| t.elapsed().map_err(std::io::Error::other));
+    let stale = match file_age {
+        Ok(age) => age.as_millis() > u128::from(snapshot.progress.runtime.stale_after_ms),
+        Err(_) => {
+            eprintln!("INDETERMINATE: snapshot freshness could not be established");
+            return Ok(2);
+        }
+    };
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot).map_err(|e| e.to_string())?
+        );
+    } else {
+        let reasons = snapshot
+            .reason_codes
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("IICP node health — {node}\n  liveness   {:?}\n  readiness  {:?}\n  reasons    {reasons}", snapshot.liveness, snapshot.readiness);
+    }
+    if stale {
+        return Ok(1);
+    }
+    if check_ready {
+        Ok(match snapshot.readiness {
+            iicp_client::runtime_health::Readiness::Ready => 0,
+            _ => 1,
+        })
+    } else {
+        Ok(match snapshot.liveness {
+            iicp_client::runtime_health::Liveness::Live => 0,
+            iicp_client::runtime_health::Liveness::NotLive => 1,
+            _ => 2,
+        })
+    }
 }
 
 fn env_value(key: &str, default: String) -> String {
@@ -2914,8 +3013,24 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let resolved_log_dir = cfg.log_dir.clone();
     #[cfg_attr(not(feature = "nat"), allow(unused_mut))]
     let mut node = IicpNode::new(cfg);
+    let runtime_health = node.runtime_health();
     if !opts.node.is_empty() {
         node.set_saved_node_name(opts.node.clone());
+        let health_path = runtime_health_path(&opts.node)?;
+        let publisher_health = runtime_health.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                publisher_health.advance_runtime();
+                let snapshot = publisher_health.snapshot();
+                if let Err(error) =
+                    iicp_client::runtime_health::write_snapshot_atomic(&health_path, &snapshot)
+                {
+                    eprintln!("[iicp-node] runtime-health snapshot write failed: {error}");
+                }
+            }
+        });
     }
     // Phase 2 (#529/#55) — seed the cached node_token so a re-registration (e.g.
     // after a tunnel-URL rotation) proves ownership via current_node_token.
@@ -3465,6 +3580,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         }
     };
 
+    runtime_health.mark_stopping();
     if let Some(t) = &tunnel {
         t.close(); // #520 — tear the Quick Tunnel down with the node
     }
@@ -5249,6 +5365,15 @@ async fn main() {
             process::exit(1);
         }
         return;
+    }
+    if cmd == "healthcheck" {
+        match run_healthcheck(&args[2..]) {
+            Ok(code) => process::exit(code),
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                process::exit(2);
+            }
+        }
     }
     if cmd == "operator" {
         if let Err(e) = run_operator(&args[2..]).await {

@@ -1604,6 +1604,9 @@ pub struct IicpNode {
     /// When present, refreshed registration credentials are persisted so
     /// read-only commands such as `credits` do not drift behind the running node.
     saved_node_name: Option<String>,
+    /// Local operational health. It is intentionally not projected into the
+    /// public `/iicp/health` wire surface.
+    runtime_health: crate::runtime_health::RuntimeHealth,
 }
 
 impl IicpNode {
@@ -1658,7 +1661,12 @@ impl IicpNode {
                 BackendStabilityObservation::default(),
             )),
             saved_node_name: None,
+            runtime_health: crate::runtime_health::RuntimeHealth::new(false),
         }
+    }
+
+    pub fn runtime_health(&self) -> crate::runtime_health::RuntimeHealth {
+        self.runtime_health.clone()
     }
 
     /// Persist refreshed directory credentials into this saved node identity.
@@ -2456,8 +2464,10 @@ impl IicpNode {
         };
 
         tracing::info!("IICP node {} listening on {}", self.cfg.node_id, addr);
+        self.runtime_health.mark_running();
 
         if let Some(token) = node_token {
+            self.runtime_health.set_supervisor_required(true);
             let node_id = self.cfg.node_id.clone();
             let dir = self.cfg.directory_url.clone();
             let http = self.http.clone();
@@ -2503,12 +2513,14 @@ impl IicpNode {
             let hb_recovery_grace = crate::recovery::env_grace_checks();
             let hb_recovery_check_every = crate::recovery::env_check_every_heartbeats();
             let hb_recovery_supervised = crate::recovery::supervised_recovery_enabled();
+            let hb_runtime_health = self.runtime_health();
             tokio::spawn(async move {
                 let mut token = token;
                 let mut seq: u64 = 0;
                 let mut recovery_failures: u32 = 0;
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+                    hb_runtime_health.advance_supervisor();
                     seq += 1;
                     // Drain incremental task counters so the directory receives
                     // the delta since the last heartbeat (ReputationService::upsert
@@ -2604,6 +2616,11 @@ impl IicpNode {
                         .await
                     {
                         Ok(resp) if resp.status().is_success() => {
+                            hb_runtime_health.set_external(
+                                "directory",
+                                crate::runtime_health::SubsystemState::Healthy,
+                            );
+                            hb_runtime_health.advance_supervisor();
                             if let Some(ref log) = hb_log {
                                 log.write("heartbeat_ok", &hb_node_id, &format!("seq={seq}"));
                             }
@@ -2867,6 +2884,11 @@ impl IicpNode {
                             }
                         }
                         Ok(resp) => {
+                            hb_runtime_health.set_external(
+                                "directory",
+                                crate::runtime_health::SubsystemState::Unavailable,
+                            );
+                            hb_runtime_health.advance_supervisor();
                             if let Some(ref log) = hb_log {
                                 log.write(
                                     "heartbeat_fail",
@@ -2876,6 +2898,11 @@ impl IicpNode {
                             }
                         }
                         Err(e) => {
+                            hb_runtime_health.set_external(
+                                "directory",
+                                crate::runtime_health::SubsystemState::Unavailable,
+                            );
+                            hb_runtime_health.advance_supervisor();
                             tracing::warn!("heartbeat failed: {e}");
                             if let Some(ref log) = hb_log {
                                 log.write(
