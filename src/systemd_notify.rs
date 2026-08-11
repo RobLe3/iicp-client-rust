@@ -93,6 +93,14 @@ pub fn notify_stopping() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use tokio::sync::Mutex;
+
+    // Native notification tests mutate process-global systemd environment.
+    // Serialize them so parallel test execution cannot redirect or remove a
+    // peer test's NOTIFY_SOCKET while its notifier task is still running.
+    #[cfg(target_os = "linux")]
+    static NOTIFY_ENV_LOCK: Mutex<()> = Mutex::const_new(());
 
     #[test]
     fn ready_and_watchdog_require_meaningful_live_runtime_progress() {
@@ -153,6 +161,8 @@ mod tests {
     async fn native_socket_pulses_live_runtime_then_withholds_after_stall() {
         use crate::runtime_health::{RuntimeHealth, RuntimeHealthFault};
         use std::os::unix::net::UnixDatagram;
+
+        let _env_guard = NOTIFY_ENV_LOCK.lock().await;
 
         let socket_path = std::env::temp_dir().join(format!(
             "iicp-notify-{}-{}.sock",
@@ -217,6 +227,8 @@ mod tests {
     #[test]
     fn native_socket_reports_orderly_stopping() {
         use std::os::unix::net::UnixDatagram;
+
+        let _env_guard = NOTIFY_ENV_LOCK.blocking_lock();
 
         let socket_path = std::env::temp_dir().join(format!(
             "iicp-notify-stop-{}-{}.sock",
