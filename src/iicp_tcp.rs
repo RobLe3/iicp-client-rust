@@ -203,6 +203,97 @@ pub fn encode_response(
     encode_cbor(&CborValue::Map(entries))
 }
 
+fn encode_lifecycle_response(
+    session_id: &str,
+    call_id: &str,
+    task_id: &str,
+    sequence: u64,
+    event: &TcpStreamEvent,
+) -> Vec<u8> {
+    let is_final = event.status != "partial";
+    let event_name = event
+        .event
+        .as_deref()
+        .unwrap_or(match event.status.as_str() {
+            "partial" => "partial",
+            "success" => "completed",
+            "timeout" => "timed_out",
+            _ => "failed",
+        });
+    let mut entries = vec![
+        (
+            CborValue::Integer(1.into()),
+            CborValue::Integer(FRAMING_VERSION.into()),
+        ),
+        (
+            CborValue::Integer(2.into()),
+            CborValue::Text(session_id.into()),
+        ),
+        (
+            CborValue::Integer(3.into()),
+            CborValue::Text(call_id.into()),
+        ),
+        (
+            CborValue::Integer(4.into()),
+            CborValue::Text(event.status.clone()),
+        ),
+        (CborValue::Integer(12.into()), CborValue::Bool(is_final)),
+        (
+            CborValue::Integer(13.into()),
+            CborValue::Map(vec![
+                (
+                    CborValue::Integer(1.into()),
+                    CborValue::Text(task_id.into()),
+                ),
+                (
+                    CborValue::Integer(2.into()),
+                    CborValue::Integer(sequence.into()),
+                ),
+                (
+                    CborValue::Integer(3.into()),
+                    CborValue::Text(event_name.into()),
+                ),
+                (CborValue::Integer(4.into()), CborValue::Bool(is_final)),
+            ]),
+        ),
+    ];
+    if let Some(result) = &event.result {
+        entries.push((CborValue::Integer(5.into()), json_to_cbor(result)));
+    }
+    if event.error_code.is_some() || event.error_message.is_some() {
+        entries.push((
+            CborValue::Integer(6.into()),
+            CborValue::Map(vec![
+                (
+                    CborValue::Integer(1.into()),
+                    CborValue::Text(
+                        event
+                            .error_code
+                            .clone()
+                            .unwrap_or_else(|| "stream_error".into()),
+                    ),
+                ),
+                (
+                    CborValue::Integer(2.into()),
+                    CborValue::Text(
+                        event
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "stream failed".into()),
+                    ),
+                ),
+            ]),
+        ));
+    }
+    if let Some(tokens) = event.tokens_used {
+        entries.push((
+            CborValue::Integer(7.into()),
+            CborValue::Integer(tokens.into()),
+        ));
+    }
+    encode_cbor(&CborValue::Map(entries))
+}
+
 pub fn encode_discover_response(session_id: &str, intent: &str, nodes: &[CborValue]) -> Vec<u8> {
     encode_cbor(&CborValue::Map(vec![
         (
@@ -300,8 +391,14 @@ fn decode_lifecycle_response(body: &CborValue) -> Result<NativeResponseFrame, Ii
             .map(cbor_to_json)
             .unwrap_or(serde_json::Value::Null),
         error: cbor_map_get(body, 6)
-            .map(cbor_to_json)
+            .map(|error| {
+                serde_json::json!({
+                    "code": cbor_map_get(error, 1).and_then(cbor_to_str),
+                    "message": cbor_map_get(error, 2).and_then(cbor_to_str),
+                })
+            })
             .unwrap_or(serde_json::Value::Null),
+        tokens_used: cbor_map_get(body, 7).and_then(cbor_to_u64),
     })
 }
 
@@ -324,6 +421,32 @@ pub type TcpTaskHandler = Arc<
         + Sync,
 >;
 
+#[derive(Clone, Debug)]
+pub struct TcpStreamEvent {
+    pub status: String,
+    pub result: Option<serde_json::Value>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub tokens_used: Option<u64>,
+    pub event: Option<String>,
+}
+
+pub type TcpStreamingHandler = Arc<
+    dyn Fn(TcpTask) -> Pin<Box<dyn Stream<Item = Result<TcpStreamEvent, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+struct ConcurrencyGateLease(Option<Arc<crate::concurrency::ConcurrencyGate>>);
+
+impl Drop for ConcurrencyGateLease {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.release();
+        }
+    }
+}
+
 /// Discover lookup callback — given an intent URN, return a CBOR Array of node
 /// descriptors. Typically delegated to the IicpClient's discover() call.
 pub type DiscoverLookup = Arc<
@@ -338,6 +461,7 @@ pub struct IicpTcpServer {
     port: u16,
     node_id: Option<String>,
     handler: Option<TcpTaskHandler>,
+    streaming_handler: Option<TcpStreamingHandler>,
     discover_lookup: Option<DiscoverLookup>,
     /// Optional ConcurrencyGate; when set, every CALL acquires a slot
     /// first. CapacityExceededError → RESPONSE error_code=429 IICP-E021.
@@ -351,6 +475,7 @@ impl IicpTcpServer {
             port,
             node_id: None,
             handler: None,
+            streaming_handler: None,
             discover_lookup: None,
             concurrency_gate: None,
         }
@@ -363,6 +488,11 @@ impl IicpTcpServer {
 
     pub fn with_handler(mut self, h: TcpTaskHandler) -> Self {
         self.handler = Some(h);
+        self
+    }
+
+    pub fn with_streaming_handler(mut self, h: TcpStreamingHandler) -> Self {
+        self.streaming_handler = Some(h);
         self
     }
 
@@ -566,6 +696,7 @@ impl IicpTcpServer {
         let mut session_id = "unknown".to_string();
         let mut call_id: Option<String> = None;
         let mut intent = String::new();
+        let mut task_id: Option<String> = None;
         let mut payload_json = serde_json::Value::Object(Default::default());
 
         if let Ok(body) = decode_cbor(&frame.payload) {
@@ -583,6 +714,9 @@ impl IicpTcpServer {
                 if let Some(s) = cbor_to_str(v) {
                     call_id = Some(s);
                 }
+            }
+            if let Some(v) = cbor_map_get(&body, 24) {
+                task_id = cbor_to_str(v);
             }
             if let Some(v) = cbor_map_get(&body, 5) {
                 // Mirror the call_pipeline contract: key 5 is the task body as
@@ -611,6 +745,19 @@ impl IicpTcpServer {
                     payload_json = serde_json::Value::Object(obj);
                 }
             }
+        }
+
+        if let (Some(task_id), Some(_)) = (task_id, &self.streaming_handler) {
+            return self
+                .on_stream_call(
+                    socket,
+                    &session_id,
+                    call_id.as_deref().unwrap_or(""),
+                    &task_id,
+                    &intent,
+                    payload_json,
+                )
+                .await;
         }
 
         let mut result_bytes: Option<Vec<u8>> = None;
@@ -691,6 +838,104 @@ impl IicpTcpServer {
         );
         let out = encode_frame(MsgType::Response as u8, &resp, 0);
         socket.write_all(&out).await?;
+        Ok(true)
+    }
+
+    async fn on_stream_call(
+        &self,
+        socket: &mut TcpStream,
+        session_id: &str,
+        call_id: &str,
+        task_id: &str,
+        intent: &str,
+        payload: serde_json::Value,
+    ) -> std::io::Result<bool> {
+        use futures_util::StreamExt;
+
+        let handler = self
+            .streaming_handler
+            .as_ref()
+            .expect("stream handler checked before dispatch");
+        let task = TcpTask {
+            task_id: task_id.into(),
+            intent: intent.into(),
+            payload,
+        };
+        let mut sequence = 0_u64;
+        let mut terminal_sent = false;
+        let mut events = handler(task);
+        let gate = self.concurrency_gate.clone();
+        let acquired = match &gate {
+            Some(g) => g.acquire().is_ok(),
+            None => true,
+        };
+        if !acquired {
+            let event = TcpStreamEvent {
+                status: "error".into(),
+                result: None,
+                error_code: Some("capacity_exceeded".into()),
+                error_message: Some("node concurrency capacity reached".into()),
+                tokens_used: None,
+                event: None,
+            };
+            let payload = encode_lifecycle_response(session_id, call_id, task_id, sequence, &event);
+            socket
+                .write_all(&encode_frame(MsgType::Response as u8, &payload, 0))
+                .await?;
+            return Ok(true);
+        }
+        let _gate_lease = ConcurrencyGateLease(gate);
+        while let Some(item) = events.next().await {
+            let event = match item {
+                Ok(event)
+                    if matches!(
+                        event.status.as_str(),
+                        "partial" | "success" | "error" | "timeout"
+                    ) =>
+                {
+                    event
+                }
+                Ok(_) => TcpStreamEvent {
+                    status: "error".into(),
+                    result: None,
+                    error_code: Some("invalid_stream_status".into()),
+                    error_message: Some("streaming handler emitted an invalid status".into()),
+                    tokens_used: None,
+                    event: None,
+                },
+                Err(_) => TcpStreamEvent {
+                    status: "error".into(),
+                    result: None,
+                    error_code: Some("backend_error".into()),
+                    error_message: Some("streaming handler raised exception".into()),
+                    tokens_used: None,
+                    event: None,
+                },
+            };
+            let payload = encode_lifecycle_response(session_id, call_id, task_id, sequence, &event);
+            socket
+                .write_all(&encode_frame(MsgType::Response as u8, &payload, 0))
+                .await?;
+            sequence += 1;
+            terminal_sent = event.status != "partial";
+            if terminal_sent {
+                break;
+            }
+        }
+        if !terminal_sent {
+            let event = TcpStreamEvent {
+                status: "error".into(),
+                result: None,
+                error_code: Some("stream_incomplete".into()),
+                error_message: Some("stream ended without a terminal response".into()),
+                tokens_used: None,
+                event: None,
+            };
+            let payload = encode_lifecycle_response(session_id, call_id, task_id, sequence, &event);
+            socket
+                .write_all(&encode_frame(MsgType::Response as u8, &payload, 0))
+                .await?;
+        }
         Ok(true)
     }
 }
