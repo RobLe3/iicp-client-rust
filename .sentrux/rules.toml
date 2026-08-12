@@ -1,0 +1,18 @@
+# IICP Rust SDK — structural quality rules.
+# The baseline was established from the clean pre-ranker v0.7.102 main commit.
+
+[constraints]
+max_cycles = 0
+max_coupling = "B"
+# Existing CLI/runtime orchestration reaches cc=158. New work must not exceed it.
+max_cc = 158
+no_god_files = true
+min_quality_signal = 6000
+
+[[notes]]
+path = "src/confidentiality.rs"
+note = "Security-critical IICP-CX implementation."
+
+[[notes]]
+path = "src/selection.rs"
+note = "Selection must remain downstream of eligibility and policy filtering."
