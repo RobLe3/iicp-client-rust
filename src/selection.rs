@@ -477,4 +477,99 @@ mod tests {
             }
         }
     }
+
+    struct ReplayRanker {
+        candidate_ref: String,
+    }
+
+    impl CandidateRanker for ReplayRanker {
+        fn rank(
+            &self,
+            _request: &RankerRequest<'_>,
+            candidates: &[CandidateEvidenceV0],
+        ) -> std::result::Result<Option<RankerDecision>, String> {
+            assert!(candidates
+                .iter()
+                .any(|candidate| candidate.candidate_ref == self.candidate_ref));
+            Ok(Some(RankerDecision {
+                candidate_ref: self.candidate_ref.clone(),
+                policy_id: "metaharness-iicp-local-v1".into(),
+                mode: RankerMode::Normal,
+            }))
+        }
+    }
+
+    #[test]
+    fn iicp_heterogeneous_benchmark_decisions_replay() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/candidate-ranker-benchmark-replay-v1.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            fixture["schema"],
+            "iicp.candidate-ranker-benchmark-replay.v1"
+        );
+        let definitions = fixture["nodes"].as_array().unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let eligible: Vec<_> = case["eligible_node_ids"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|node_id| {
+                    let raw = definitions
+                        .iter()
+                        .find(|raw| raw["node_id"] == *node_id)
+                        .unwrap();
+                    let mut candidate = node(
+                        raw["node_id"].as_str().unwrap(),
+                        "https://benchmark.invalid",
+                        1.0,
+                    );
+                    candidate.models = Some(
+                        raw["models"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|model| model.as_str().unwrap().to_string())
+                            .collect(),
+                    );
+                    assert_eq!(
+                        candidate_evidence_v0(&candidate).candidate_ref,
+                        raw["candidate_ref"].as_str().unwrap()
+                    );
+                    candidate
+                })
+                .collect();
+            let request = TaskRequest {
+                task_id: case["task_id"].as_str().unwrap().into(),
+                intent: "urn:iicp:intent:llm:chat:v1".into(),
+                payload: serde_json::json!({"task": case["task_id"]}),
+                constraints: None,
+                route_constraints: None,
+                auth: None,
+                source_node_id: None,
+                routing_policy: Some(RoutingPolicy::default()),
+            };
+            let ranker = ReplayRanker {
+                candidate_ref: case["selected_candidate_ref"].as_str().unwrap().into(),
+            };
+            let applied =
+                apply_candidate_ranker(&ranker, &request, &eligible, eligible.clone(), 3).unwrap();
+            assert_eq!(
+                applied.candidates[0].node_id,
+                case["selected_node_id"].as_str().unwrap(),
+                "{}",
+                case["task_id"]
+            );
+            let decision = applied.decision.unwrap();
+            assert_eq!(
+                ranker_receipt_profile(&decision, 0),
+                case["expected_primary_receipt"].as_str().unwrap()
+            );
+            assert_eq!(
+                ranker_receipt_profile(&decision, 1),
+                case["expected_fallback_receipt"].as_str().unwrap()
+            );
+        }
+    }
 }
