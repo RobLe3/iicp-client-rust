@@ -437,6 +437,16 @@ pub type TcpStreamingHandler = Arc<
         + Sync,
 >;
 
+struct ConcurrencyGateLease(Option<Arc<crate::concurrency::ConcurrencyGate>>);
+
+impl Drop for ConcurrencyGateLease {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.release();
+        }
+    }
+}
+
 /// Discover lookup callback — given an intent URN, return a CBOR Array of node
 /// descriptors. Typically delegated to the IicpClient's discover() call.
 pub type DiscoverLookup = Arc<
@@ -874,6 +884,7 @@ impl IicpTcpServer {
                 .await?;
             return Ok(true);
         }
+        let _gate_lease = ConcurrencyGateLease(gate);
         while let Some(item) = events.next().await {
             let event = match item {
                 Ok(event)
@@ -924,9 +935,6 @@ impl IicpTcpServer {
             socket
                 .write_all(&encode_frame(MsgType::Response as u8, &payload, 0))
                 .await?;
-        }
-        if let Some(g) = gate {
-            g.release();
         }
         Ok(true)
     }
