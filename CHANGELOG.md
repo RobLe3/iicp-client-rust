@@ -9,13 +9,20 @@ in the main repo).
 
 ## [Unreleased]
 
-### Added — local runtime health and service lifecycle
+## [0.7.102] — 2026-08-12
+
+### Added — negotiated service lifecycle streaming
+- Added an explicit opt-in native streaming client/server path with ordered task, call, session and sequence validation.
+- Genuine OpenAI-compatible streaming can pass through direct TCP and authenticated relay paths with bounded aggregation, backpressure, cancellation cleanup and terminal-state enforcement.
+- Capability-level `supported_profiles` advertisement remains disabled unless the operator enables it; buffered `call()` and terminal-only backends retain their existing behavior.
+
+### Added — local runtime health and native supervision evidence
 - Added the reference versioned, content-free local liveness/readiness snapshot and `iicp-node healthcheck`; shared scenarios keep external connectivity separate from local runtime progress.
 - `iicp-node service install`, `status`, `restart`, and `uninstall` now execute the selected launchd or systemd user-service lifecycle unless dry-run mode is explicit.
-- Added an opt-in systemd notifier driven by the shared runtime-health classifier. It remains disabled by default; isolated manager and fault-injection evidence does not by itself authorize a production watchdog default.
+- Added an opt-in systemd notifier driven by the shared runtime-health classifier, together with isolated manager, fault-injection and load evidence. It remains disabled by default pending representative operator evidence.
 
 ### Hardened — protocol and managed-operation boundaries
-- Added fail-closed native RESPONSE sequence validation, aligned consumer co-signature transition fixtures, bounded MCP session replay, and a managed-operator startup profile without changing the released buffered call contract.
+- Added fail-closed native RESPONSE sequence and lifecycle-identity validation, aligned consumer co-signature transition fixtures, bounded MCP session replay, and a managed-operator startup profile.
 
 ## [0.7.101] — 2026-08-01
 
