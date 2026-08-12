@@ -203,7 +203,7 @@ pub fn encode_response(
     encode_cbor(&CborValue::Map(entries))
 }
 
-fn encode_lifecycle_response(
+pub(crate) fn encode_lifecycle_response(
     session_id: &str,
     call_id: &str,
     task_id: &str,
@@ -357,7 +357,9 @@ fn cbor_to_u64(v: &CborValue) -> Option<u64> {
     }
 }
 
-fn decode_lifecycle_response(body: &CborValue) -> Result<NativeResponseFrame, IicpTcpClientError> {
+pub(crate) fn decode_lifecycle_response(
+    body: &CborValue,
+) -> Result<NativeResponseFrame, IicpTcpClientError> {
     let lifecycle = cbor_map_get(body, 13)
         .ok_or_else(|| IicpTcpClientError::Protocol("missing_lifecycle".into()))?;
     Ok(NativeResponseFrame {
