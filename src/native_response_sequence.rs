@@ -22,6 +22,8 @@ pub struct NativeResponseFrame {
     pub result: serde_json::Value,
     #[serde(default)]
     pub error: serde_json::Value,
+    #[serde(default)]
+    pub tokens_used: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]

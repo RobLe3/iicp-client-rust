@@ -17,7 +17,7 @@ use ciborium::value::Value as CborValue;
 use futures_util::StreamExt;
 use iicp_client::iicp_tcp::{
     decode_cbor, encode_frame, IicpTcpClient, IicpTcpClientError, IicpTcpServer, MsgType,
-    FRAME_HEADER_LEN, FRAMING_VERSION, IICP_MAGIC,
+    TcpStreamEvent, FRAME_HEADER_LEN, FRAMING_VERSION, IICP_MAGIC,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -550,4 +550,93 @@ async fn test_client_call_stream_yields_validated_partial_and_terminal() {
     assert_eq!(second.status, "success");
     assert_eq!(second.result, serde_json::json!("lo"));
     assert!(events.next().await.is_none());
+}
+
+#[tokio::test]
+async fn test_stream_call_round_trips_through_server_handler() {
+    let server = IicpTcpServer::new("127.0.0.1", 0).with_streaming_handler(Arc::new(|task| {
+        assert_eq!(task.task_id, "stream-task");
+        Box::pin(futures_util::stream::iter(vec![
+            Ok(TcpStreamEvent {
+                status: "partial".into(),
+                result: Some(serde_json::json!("hel")),
+                error_code: None,
+                error_message: None,
+                tokens_used: Some(1),
+                event: None,
+            }),
+            Ok(TcpStreamEvent {
+                status: "success".into(),
+                result: Some(serde_json::json!("lo")),
+                error_code: None,
+                error_message: None,
+                tokens_used: Some(2),
+                event: None,
+            }),
+        ]))
+    }));
+    let listener = server.bind().await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = server.serve_on(listener).await;
+    });
+
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    let events = client.call_stream(
+        "urn:iicp:intent:test:v1",
+        serde_json::json!({}),
+        "stream-task",
+        "stream-session",
+        Some("stream-call".into()),
+        None,
+    );
+    futures_util::pin_mut!(events);
+    let first = events.next().await.unwrap().unwrap();
+    let second = events.next().await.unwrap().unwrap();
+    assert_eq!(first.status, "partial");
+    assert_eq!(first.lifecycle.sequence, 0);
+    assert_eq!(first.tokens_used, Some(1));
+    assert_eq!(second.status, "success");
+    assert_eq!(second.lifecycle.sequence, 1);
+    assert_eq!(second.tokens_used, Some(2));
+    assert!(events.next().await.is_none());
+}
+
+#[tokio::test]
+async fn test_stream_handler_failure_after_partial_emits_terminal_error() {
+    let server = IicpTcpServer::new("127.0.0.1", 0).with_streaming_handler(Arc::new(|_| {
+        Box::pin(futures_util::stream::iter(vec![
+            Ok(TcpStreamEvent {
+                status: "partial".into(),
+                result: Some(serde_json::json!("some")),
+                error_code: None,
+                error_message: None,
+                tokens_used: None,
+                event: None,
+            }),
+            Err("sensitive backend detail".to_string()),
+        ]))
+    }));
+    let listener = server.bind().await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let _ = server.serve_on(listener).await;
+    });
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    let events = client.call_stream(
+        "urn:iicp:intent:test:v1",
+        serde_json::json!({}),
+        "task-error",
+        "session-error",
+        Some("call-error".into()),
+        None,
+    );
+    futures_util::pin_mut!(events);
+    assert_eq!(events.next().await.unwrap().unwrap().status, "partial");
+    let terminal = events.next().await.unwrap().unwrap();
+    assert_eq!(terminal.status, "error");
+    assert_eq!(terminal.error["code"], "backend_error");
+    assert!(terminal.is_final);
 }
