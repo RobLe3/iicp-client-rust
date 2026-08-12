@@ -58,9 +58,19 @@ def main() -> int:
         require(toolchain("stable", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"), "Clippy")
         require(toolchain("1.86.0", "test", "--locked", "--all-features"), "Rust 1.86")
         require(toolchain("stable", "test", "--locked", "--all-features"), "stable Rust")
-        require(run(["cargo", "audit"]), "RustSec audit")
         with tempfile.TemporaryDirectory(prefix="iicp-rust-quality-") as temporary:
             temp = Path(temporary)
+            advisory_db = temp / "advisory-db"
+            require(
+                run(
+                    [
+                        "git", "clone", "--quiet", "--depth", "1",
+                        "https://github.com/RustSec/advisory-db.git", str(advisory_db),
+                    ]
+                ),
+                "fresh RustSec database",
+            )
+            require(run(["cargo", "audit", "--db", str(advisory_db)]), "RustSec audit")
             coverage = temp / "coverage.json"
             require(
                 run(
