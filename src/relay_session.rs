@@ -16,6 +16,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
+use crate::iicp_tcp::{decode_cbor, decode_lifecycle_response};
+use crate::native_response_sequence::{NativeResponseFrame, NativeResponseSequence};
 use crate::relay_ticket::{
     consume_relay_bind_ticket, verify_relay_bind_ticket, RelayBindTicketClaims,
 };
@@ -33,6 +35,46 @@ const MT_RELAY_BIND: u8 = 0x0b;
 const MT_RELAY_ACK: u8 = 0x0c;
 const MT_CALL: u8 = 0x05;
 const MT_RESPONSE: u8 = 0x06;
+const MAX_RELAY_STREAM_EVENTS: usize = 32;
+
+struct PendingRelayStream {
+    sequence: NativeResponseSequence,
+    tx: mpsc::Sender<NativeResponseFrame>,
+    failure: Arc<Mutex<Option<String>>>,
+}
+
+type PendingRelayStreams = Arc<Mutex<HashMap<String, PendingRelayStream>>>;
+
+struct PendingStreamGuard {
+    call_id: String,
+    pending: PendingRelayStreams,
+}
+
+impl Drop for PendingStreamGuard {
+    fn drop(&mut self) {
+        self.pending.lock().unwrap().remove(&self.call_id);
+    }
+}
+
+fn deliver_stream_event(pending: &PendingRelayStreams, call_id: &str, event: NativeResponseFrame) {
+    let mut streams = pending.lock().unwrap();
+    let Some(stream) = streams.get_mut(call_id) else {
+        return;
+    };
+    if let Err(error) = stream.sequence.accept(&event) {
+        *stream.failure.lock().unwrap() = Some(error.code.into());
+        streams.remove(call_id);
+        return;
+    }
+    if stream.tx.try_send(event).is_err() {
+        *stream.failure.lock().unwrap() = Some("relay_backpressure_exceeded".into());
+        streams.remove(call_id);
+    }
+}
+
+fn take_stream_failure(failure: &Arc<Mutex<Option<String>>>) -> Option<String> {
+    failure.lock().unwrap().take()
+}
 
 fn make_frame(msg_type: u8, payload: &[u8]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
@@ -121,6 +163,7 @@ pub struct RelayWorkerSession {
     write_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Pending request map: call_id → oneshot sender.
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    stream_pending: PendingRelayStreams,
 }
 
 impl RelayWorkerSession {
@@ -129,6 +172,7 @@ impl RelayWorkerSession {
             worker_id,
             write_tx,
             pending: Arc::new(Mutex::new(HashMap::new())),
+            stream_pending: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -182,6 +226,82 @@ impl RelayWorkerSession {
             let _ = tx.send(result);
         }
     }
+
+    pub fn forward_stream(
+        &self,
+        task: &Value,
+        timeout_secs: u64,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<NativeResponseFrame, String>> + Send>,
+    > {
+        let call_id = Uuid::new_v4().to_string();
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&call_id)
+            .to_string();
+        let session_id = task
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&call_id)
+            .to_string();
+        let (tx, mut rx) = mpsc::channel(MAX_RELAY_STREAM_EVENTS);
+        let failure = Arc::new(Mutex::new(None));
+        self.stream_pending.lock().unwrap().insert(
+            call_id.clone(),
+            PendingRelayStream {
+                sequence: NativeResponseSequence::new(&session_id, &call_id, &task_id),
+                tx,
+                failure: Arc::clone(&failure),
+            },
+        );
+        let payload_json = serde_json::to_string(task).unwrap_or_default();
+        let cbor = cbor_encode_int_map(&[
+            (2, CborVal::Text(session_id)),
+            (15, CborVal::Text(call_id.clone())),
+            (24, CborVal::Text(task_id)),
+            (5, CborVal::Bytes(payload_json.into_bytes())),
+        ]);
+        let send_result = self.write_tx.send(make_frame(MT_CALL, &cbor));
+        let pending = Arc::clone(&self.stream_pending);
+        Box::pin(async_stream::stream! {
+            let _guard = PendingStreamGuard { call_id: call_id.clone(), pending };
+            if send_result.is_err() {
+                yield Err("relay session write channel closed".into());
+                return;
+            }
+            loop {
+                if let Some(reason) = take_stream_failure(&failure) {
+                    yield Err(reason);
+                    return;
+                }
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), rx.recv()).await {
+                    Ok(Some(event)) => {
+                        let terminal = event.is_final;
+                        yield Ok(event);
+                        if terminal { return; }
+                    }
+                    Ok(None) => {
+                        let reason = failure
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| "relay stream closed before terminal".into());
+                        yield Err(reason);
+                        return;
+                    }
+                    Err(_) => {
+                        yield Err(format!("relay stream timeout ({timeout_secs}s) for call {call_id}"));
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn on_stream_response(&self, call_id: &str, event: NativeResponseFrame) {
+        deliver_stream_event(&self.stream_pending, call_id, event);
+    }
 }
 
 // ── HttpPollWorkerSession (#450 browser workers) ─────────────────────────────
@@ -209,6 +329,7 @@ pub struct HttpPollWorkerSession {
     call_tx: mpsc::UnboundedSender<Value>,
     call_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<Value>>>,
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
+    stream_pending: PendingRelayStreams,
     last_pull: Arc<Mutex<std::time::Instant>>,
     liveness_window: std::time::Duration,
     closed: Arc<std::sync::atomic::AtomicBool>,
@@ -239,6 +360,7 @@ impl HttpPollWorkerSession {
             call_tx,
             call_rx: Arc::new(tokio::sync::Mutex::new(call_rx)),
             pending: Arc::new(Mutex::new(HashMap::new())),
+            stream_pending: Arc::new(Mutex::new(HashMap::new())),
             last_pull: Arc::new(Mutex::new(std::time::Instant::now())),
             liveness_window,
             closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -290,6 +412,78 @@ impl HttpPollWorkerSession {
         }
     }
 
+    pub fn forward_stream(
+        &self,
+        task: &Value,
+        timeout_secs: u64,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<NativeResponseFrame, String>> + Send>,
+    > {
+        let call_id = Uuid::new_v4().to_string();
+        let task_id = task
+            .get("task_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&call_id)
+            .to_string();
+        let session_id = task
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or(&call_id)
+            .to_string();
+        let (tx, mut rx) = mpsc::channel(MAX_RELAY_STREAM_EVENTS);
+        let failure = Arc::new(Mutex::new(None));
+        self.stream_pending.lock().unwrap().insert(
+            call_id.clone(),
+            PendingRelayStream {
+                sequence: NativeResponseSequence::new(&session_id, &call_id, &task_id),
+                tx,
+                failure: Arc::clone(&failure),
+            },
+        );
+        let send_result = self.call_tx.send(serde_json::json!({
+            "call_id": call_id, "task_id": task_id, "session_id": session_id,
+            "stream": true, "task": task,
+        }));
+        let pending = Arc::clone(&self.stream_pending);
+        Box::pin(async_stream::stream! {
+            let _guard = PendingStreamGuard { call_id: call_id.clone(), pending };
+            if send_result.is_err() {
+                yield Err("relay poll session closed".into());
+                return;
+            }
+            loop {
+                if let Some(reason) = take_stream_failure(&failure) {
+                    yield Err(reason);
+                    return;
+                }
+                match tokio::time::timeout(Duration::from_secs(timeout_secs), rx.recv()).await {
+                    Ok(Some(event)) => {
+                        let terminal = event.is_final;
+                        yield Ok(event);
+                        if terminal { return; }
+                    }
+                    Ok(None) => {
+                        let reason = failure
+                            .lock()
+                            .unwrap()
+                            .clone()
+                            .unwrap_or_else(|| "relay stream closed before terminal".into());
+                        yield Err(reason);
+                        return;
+                    }
+                    Err(_) => {
+                        yield Err(format!("relay stream timeout ({timeout_secs}s) for call {call_id}"));
+                        return;
+                    }
+                }
+            }
+        })
+    }
+
+    pub fn on_stream_response(&self, call_id: &str, event: NativeResponseFrame) {
+        deliver_stream_event(&self.stream_pending, call_id, event);
+    }
+
     pub fn close(&self) {
         self.closed
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -325,6 +519,26 @@ impl RelaySession {
         match self {
             RelaySession::Tcp(s) => s.on_response(call_id, result),
             RelaySession::HttpPoll(s) => s.on_response(call_id, result),
+        }
+    }
+
+    pub fn forward_stream(
+        &self,
+        task: &Value,
+        timeout_secs: u64,
+    ) -> std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<NativeResponseFrame, String>> + Send>,
+    > {
+        match self {
+            RelaySession::Tcp(session) => session.forward_stream(task, timeout_secs),
+            RelaySession::HttpPoll(session) => session.forward_stream(task, timeout_secs),
+        }
+    }
+
+    pub fn on_stream_response(&self, call_id: &str, event: NativeResponseFrame) {
+        match self {
+            RelaySession::Tcp(session) => session.on_stream_response(call_id, event),
+            RelaySession::HttpPoll(session) => session.on_stream_response(call_id, event),
         }
     }
 
@@ -771,6 +985,13 @@ async fn relay_worker_loop(
                 session.send_raw(make_frame(MT_PONG, &pong))?;
             }
             MT_RESPONSE => {
+                if let Ok(body) = decode_cbor(&payload) {
+                    if let Ok(event) = decode_lifecycle_response(&body) {
+                        let call_id = event.call_id.clone();
+                        session.on_stream_response(&call_id, event);
+                        continue;
+                    }
+                }
                 if let Some(body) = cbor_decode_int_map(&payload) {
                     let call_id = cbor_text_or_bytes(body.get(&15)).unwrap_or_default();
                     let result: Value = match cbor_bytes(body.get(&5)) {
@@ -791,6 +1012,33 @@ async fn relay_worker_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt;
+
+    fn stream_event(
+        session_id: &str,
+        call_id: &str,
+        task_id: &str,
+        sequence: u64,
+        status: &str,
+        event: &str,
+        is_final: bool,
+    ) -> NativeResponseFrame {
+        NativeResponseFrame {
+            session_id: session_id.into(),
+            call_id: call_id.into(),
+            status: status.into(),
+            is_final,
+            lifecycle: crate::native_response_sequence::NativeLifecycleEnvelope {
+                task_id: task_id.into(),
+                sequence,
+                event: event.into(),
+                is_final,
+            },
+            result: serde_json::json!({"chunk": sequence}),
+            error: Value::Null,
+            tokens_used: Some(sequence + 1),
+        }
+    }
 
     #[test]
     fn bind_rate_limit_is_per_source_and_recovers() {
@@ -862,6 +1110,78 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let session = RelayWorkerSession::new("w-001".into(), tx);
         session.on_response("unknown", json!({})); // must not panic
+    }
+
+    #[tokio::test]
+    async fn http_poll_stream_preserves_partial_and_terminal_events() {
+        let session = HttpPollWorkerSession::new("w-stream".into(), "intent".into(), vec![]);
+        let mut stream = session.forward_stream(
+            &json!({"task_id":"task-stream","session_id":"session-stream"}),
+            1,
+        );
+        let call = session.next_call(Duration::from_secs(1)).await.unwrap();
+        let call_id = call["call_id"].as_str().unwrap().to_string();
+        assert_eq!(call["stream"], true);
+
+        session.on_stream_response(
+            &call_id,
+            stream_event(
+                "session-stream",
+                &call_id,
+                "task-stream",
+                0,
+                "partial",
+                "partial",
+                false,
+            ),
+        );
+        session.on_stream_response(
+            &call_id,
+            stream_event(
+                "session-stream",
+                &call_id,
+                "task-stream",
+                1,
+                "success",
+                "completed",
+                true,
+            ),
+        );
+
+        let partial = stream.next().await.unwrap().unwrap();
+        let terminal = stream.next().await.unwrap().unwrap();
+        assert_eq!(partial.status, "partial");
+        assert!(!partial.is_final);
+        assert_eq!(terminal.status, "success");
+        assert!(terminal.is_final);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_poll_stream_fails_closed_on_sequence_drift() {
+        let session = HttpPollWorkerSession::new("w-stream".into(), "intent".into(), vec![]);
+        let mut stream = session.forward_stream(
+            &json!({"task_id":"task-stream","session_id":"session-stream"}),
+            1,
+        );
+        let call = session.next_call(Duration::from_secs(1)).await.unwrap();
+        let call_id = call["call_id"].as_str().unwrap().to_string();
+
+        session.on_stream_response(
+            &call_id,
+            stream_event(
+                "session-stream",
+                &call_id,
+                "task-stream",
+                1,
+                "partial",
+                "partial",
+                false,
+            ),
+        );
+
+        assert_eq!(stream.next().await.unwrap().unwrap_err(), "sequence_drift");
+        assert!(stream.next().await.is_none());
     }
 
     #[test]
@@ -1004,6 +1324,57 @@ mod tests {
             .unwrap();
         let result = dispatch.await.unwrap().expect("forward_task must succeed");
         assert_eq!(result["pong"], true);
+    }
+
+    #[tokio::test]
+    async fn tcp_relay_preserves_lifecycle_response_sequence() {
+        use crate::iicp_tcp::{encode_lifecycle_response, TcpStreamEvent};
+
+        let reg = RelaySessionRegistry::new();
+        let port = start_test_relay(reg.clone()).await;
+        let mut worker = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        assert_eq!(ack_status(&wire_bind(&mut worker, "w-stream").await), "ok");
+        let session = reg.get("w-stream").unwrap();
+        let mut events = session.forward_stream(
+            &json!({"task_id":"task-stream","session_id":"session-stream"}),
+            2,
+        );
+
+        let (msg_type, payload) = read_frame(&mut worker).await.unwrap();
+        assert_eq!(msg_type, MT_CALL);
+        let body = cbor_decode_int_map(&payload).unwrap();
+        let call_id = cbor_text_or_bytes(body.get(&15)).unwrap();
+
+        for (sequence, status, result) in
+            [(0, "partial", json!("hel")), (1, "success", json!("lo"))]
+        {
+            let payload = encode_lifecycle_response(
+                "session-stream",
+                &call_id,
+                "task-stream",
+                sequence,
+                &TcpStreamEvent {
+                    status: status.into(),
+                    result: Some(result),
+                    error_code: None,
+                    error_message: None,
+                    tokens_used: Some(sequence + 1),
+                    event: None,
+                },
+            );
+            worker
+                .write_all(&make_frame(MT_RESPONSE, &payload))
+                .await
+                .unwrap();
+        }
+
+        let partial = events.next().await.unwrap().unwrap();
+        let terminal = events.next().await.unwrap().unwrap();
+        assert_eq!(partial.lifecycle.sequence, 0);
+        assert_eq!(partial.status, "partial");
+        assert_eq!(terminal.lifecycle.sequence, 1);
+        assert_eq!(terminal.status, "success");
+        assert!(events.next().await.is_none());
     }
 
     #[tokio::test]

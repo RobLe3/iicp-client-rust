@@ -1012,7 +1012,11 @@ async fn relay_result_endpoint(
     };
     let call_id = payload.get("call_id").and_then(Value::as_str).unwrap_or("");
     let result = payload.get("result");
-    if call_id.is_empty() || !result.map(Value::is_object).unwrap_or(false) {
+    let event = payload.get("event");
+    if call_id.is_empty()
+        || (!result.map(Value::is_object).unwrap_or(false)
+            && !event.map(Value::is_object).unwrap_or(false))
+    {
         return relay_cors(
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1021,7 +1025,20 @@ async fn relay_result_endpoint(
                 .into_response(),
         );
     }
-    session.on_response(call_id, result.expect("checked above").clone());
+    if let Some(event) = event {
+        match serde_json::from_value(event.clone()) {
+            Ok(event) => session.on_stream_response(call_id, event),
+            Err(_) => return relay_cors(
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(json!({"error":{"code":"IICP-E001","message":"invalid lifecycle event"}})),
+                )
+                    .into_response(),
+            ),
+        }
+    } else {
+        session.on_response(call_id, result.expect("checked above").clone());
+    }
     relay_cors(StatusCode::NO_CONTENT.into_response())
 }
 
