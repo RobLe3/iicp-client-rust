@@ -97,6 +97,199 @@ pub fn openai_compat_handler(opts: OpenAiCompatOptions) -> crate::iicp_tcp::TcpT
     build_handler("openai_compat", opts)
 }
 
+/// Build an opt-in, genuinely streaming OpenAI-compatible handler.
+///
+/// The upstream SSE stream remains ordered. Small deltas are aggregated until
+/// 256 UTF-8 bytes, 25 ms, or terminal completion, whichever occurs first.
+#[cfg(feature = "iicp-tcp")]
+pub fn openai_compat_streaming_handler(
+    opts: OpenAiCompatOptions,
+) -> crate::iicp_tcp::TcpStreamingHandler {
+    let opts = Arc::new(opts);
+    Arc::new(move |task| {
+        use futures_util::StreamExt;
+
+        let opts = Arc::clone(&opts);
+        Box::pin(async_stream::stream! {
+            let path = match task.intent.as_str() {
+                "urn:iicp:intent:llm:chat:v1" => "/chat/completions",
+                "urn:iicp:intent:llm:completion:v1" => "/completions",
+                _ => {
+                    yield Ok(stream_error(
+                        "unsupported_streaming_intent",
+                        "openai_compat: streaming is limited to chat and completion intents",
+                    ));
+                    return;
+                }
+            };
+            let mut body = match task.payload {
+                Value::Object(map) => map,
+                _ => {
+                    yield Ok(stream_error("invalid_payload", "openai_compat: task.payload must be an object"));
+                    return;
+                }
+            };
+            if !body.contains_key("model") {
+                if let Some(model) = &opts.model {
+                    body.insert("model".into(), json!(model));
+                }
+            }
+            if !body.contains_key("model") {
+                yield Ok(stream_error("missing_model", "openai_compat: no model configured"));
+                return;
+            }
+            body.insert("stream".into(), Value::Bool(true));
+            body.entry("stream_options").or_insert_with(|| json!({"include_usage": true}));
+
+            let mut request = reqwest::Client::builder().timeout(opts.timeout).build().unwrap().post(
+                format!("{}{}", opts.base_url.trim_end_matches('/'), path),
+            ).json(&body);
+            if let Some(key) = &opts.api_key {
+                request = request.bearer_auth(key);
+            }
+            let response = match request.send().await {
+                Ok(response) => response,
+                Err(error) if error.is_timeout() => {
+                    yield Ok(stream_timeout("openai_compat: backend timed out"));
+                    return;
+                }
+                Err(_) => {
+                    yield Ok(stream_error("backend_transport_error", "openai_compat: backend transport failed"));
+                    return;
+                }
+            };
+            if !response.status().is_success() {
+                let status = response.status().as_u16();
+                let detail = response.text().await.unwrap_or_default();
+                yield Ok(stream_error(
+                    &format!("upstream_{status}"),
+                    &format!("openai_compat: upstream {status}: {}", detail.chars().take(512).collect::<String>()),
+                ));
+                return;
+            }
+
+            let mut bytes = response.bytes_stream();
+            let mut wire_buffer = String::new();
+            let mut output_buffer = String::new();
+            let mut tokens_used = None;
+            let mut flush_deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+            loop {
+                tokio::select! {
+                    next = bytes.next() => {
+                        let Some(next) = next else {
+                            if !output_buffer.is_empty() {
+                                yield Ok(stream_partial(std::mem::take(&mut output_buffer), tokens_used));
+                            }
+                            yield Ok(stream_error("stream_incomplete", "openai_compat: upstream closed before [DONE]"));
+                            return;
+                        };
+                        let chunk = match next {
+                            Ok(chunk) => chunk,
+                            Err(error) if error.is_timeout() => {
+                                if !output_buffer.is_empty() {
+                                    yield Ok(stream_partial(std::mem::take(&mut output_buffer), tokens_used));
+                                }
+                                yield Ok(stream_timeout("openai_compat: backend timed out"));
+                                return;
+                            }
+                            Err(_) => {
+                                if !output_buffer.is_empty() {
+                                    yield Ok(stream_partial(std::mem::take(&mut output_buffer), tokens_used));
+                                }
+                                yield Ok(stream_error("backend_transport_error", "openai_compat: backend stream failed"));
+                                return;
+                            }
+                        };
+                        wire_buffer.push_str(&String::from_utf8_lossy(&chunk));
+                        while let Some(newline) = wire_buffer.find('\n') {
+                            let line = wire_buffer[..newline].trim_end_matches('\r').to_owned();
+                            wire_buffer.drain(..=newline);
+                            let Some(data) = line.strip_prefix("data:").map(str::trim) else { continue; };
+                            if data == "[DONE]" {
+                                if !output_buffer.is_empty() {
+                                    yield Ok(stream_partial(std::mem::take(&mut output_buffer), tokens_used));
+                                }
+                                yield Ok(stream_success(tokens_used));
+                                return;
+                            }
+                            if data.is_empty() { continue; }
+                            let event: Value = match serde_json::from_str(data) {
+                                Ok(event) => event,
+                                Err(_) => {
+                                    yield Ok(stream_error("invalid_backend_stream", "openai_compat: upstream emitted invalid SSE JSON"));
+                                    return;
+                                }
+                            };
+                            if let Some(total) = event.pointer("/usage/total_tokens").and_then(Value::as_u64) {
+                                tokens_used = Some(total);
+                            }
+                            let text = if task.intent.ends_with(":chat:v1") {
+                                event.pointer("/choices/0/delta/content").and_then(Value::as_str)
+                            } else {
+                                event.pointer("/choices/0/text").and_then(Value::as_str)
+                            };
+                            if let Some(text) = text {
+                                output_buffer.push_str(text);
+                            }
+                            if output_buffer.len() >= 256 {
+                                yield Ok(stream_partial(std::mem::take(&mut output_buffer), tokens_used));
+                                flush_deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(flush_deadline), if !output_buffer.is_empty() => {
+                        yield Ok(stream_partial(std::mem::take(&mut output_buffer), tokens_used));
+                        flush_deadline = tokio::time::Instant::now() + Duration::from_millis(25);
+                    }
+                }
+            }
+        })
+    })
+}
+
+#[cfg(feature = "iicp-tcp")]
+fn stream_partial(result: String, tokens_used: Option<u64>) -> crate::iicp_tcp::TcpStreamEvent {
+    crate::iicp_tcp::TcpStreamEvent {
+        status: "partial".into(),
+        result: Some(Value::String(result)),
+        error_code: None,
+        error_message: None,
+        tokens_used,
+        event: None,
+    }
+}
+
+#[cfg(feature = "iicp-tcp")]
+fn stream_success(tokens_used: Option<u64>) -> crate::iicp_tcp::TcpStreamEvent {
+    crate::iicp_tcp::TcpStreamEvent {
+        status: "success".into(),
+        result: Some(Value::String(String::new())),
+        error_code: None,
+        error_message: None,
+        tokens_used,
+        event: None,
+    }
+}
+
+#[cfg(feature = "iicp-tcp")]
+fn stream_error(code: &str, message: &str) -> crate::iicp_tcp::TcpStreamEvent {
+    crate::iicp_tcp::TcpStreamEvent {
+        status: "error".into(),
+        result: None,
+        error_code: Some(code.into()),
+        error_message: Some(message.into()),
+        tokens_used: None,
+        event: None,
+    }
+}
+
+#[cfg(feature = "iicp-tcp")]
+fn stream_timeout(message: &str) -> crate::iicp_tcp::TcpStreamEvent {
+    let mut event = stream_error("backend_timeout", message);
+    event.status = "timeout".into();
+    event
+}
+
 /// Shared handler builder used by every engine module (openai_compat / vllm /
 /// llamacpp). `engine` is the label that appears in error messages.
 #[cfg(feature = "iicp-tcp")]

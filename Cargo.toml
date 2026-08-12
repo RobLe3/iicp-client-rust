@@ -35,7 +35,7 @@ default = ["nat", "iicp-tcp"]
 metrics = ["dep:prometheus"]
 # Native IICP binary transport (port 9484, spec/iicp-framing.md). Default-on (#457);
 # adds ciborium (~50KB). Pure-HTTP library consumers can drop it via --no-default-features.
-iicp-tcp = ["dep:ciborium", "dep:futures-util"]
+iicp-tcp = ["dep:ciborium", "dep:futures-util", "dep:async-stream"]
 # ADR-041 UPnP NAT detection — auto-discover the public endpoint on operator
 # networks behind a UPnP-capable router.
 nat = ["dep:igd-next"]
@@ -61,7 +61,7 @@ name = "systemd_watchdog_fixture"
 required-features = ["systemd-notify", "runtime-health-fault-injection"]
 
 [dependencies]
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -73,6 +73,7 @@ tracing = "0.1"
 prometheus = { version = "0.14", optional = true }
 ciborium = { version = "0.2", optional = true }
 futures-util = { version = "0.3", optional = true }
+async-stream = { version = "0.3", optional = true }
 igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
 
 # ADR-019 pricing-block HMAC-SHA256. Pulled in unconditionally — operators
