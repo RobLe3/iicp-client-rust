@@ -4,10 +4,14 @@
 
 use std::time::Duration;
 
-use iicp_client::backends::openai_compat::{invoke, OpenAiCompatOptions};
+use futures_util::StreamExt;
+use iicp_client::backends::openai_compat::{
+    invoke, openai_compat_streaming_handler, OpenAiCompatOptions,
+};
 use iicp_client::backends::{
     invoke_backend, invoke_backend_with_cancellation, llamacpp, meshllm, vllm, BACKEND_TYPES,
 };
+use iicp_client::iicp_tcp::TcpTask;
 use iicp_client::service_lifecycle::BackendCancellationRegistry;
 use serde_json::json;
 
@@ -18,6 +22,64 @@ fn opts(base_url: String, model: Option<&str>) -> OpenAiCompatOptions {
         api_key: None,
         timeout: Duration::from_secs(5),
     }
+}
+
+#[tokio::test]
+async fn openai_streaming_handler_emits_ordered_output_and_terminal_usage() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("POST", "/chat/completions")
+        .with_status(200)
+        .with_header("content-type", "text/event-stream")
+        .with_body(concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hel\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"lo\"}}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":7}}\n\n",
+            "data: [DONE]\n\n"
+        ))
+        .create_async()
+        .await;
+    let handler = openai_compat_streaming_handler(opts(server.url(), Some("qwen")));
+    let events = handler(TcpTask {
+        task_id: "task-1".into(),
+        intent: "urn:iicp:intent:llm:chat:v1".into(),
+        payload: json!({"messages": []}),
+    });
+    futures_util::pin_mut!(events);
+    let mut collected = Vec::new();
+    while let Some(event) = events.next().await {
+        collected.push(event.unwrap());
+    }
+    mock.assert_async().await;
+    assert_eq!(collected.last().unwrap().status, "success");
+    assert_eq!(collected.last().unwrap().tokens_used, Some(7));
+    let output = collected
+        .iter()
+        .filter(|event| event.status == "partial")
+        .filter_map(|event| event.result.as_ref().and_then(|value| value.as_str()))
+        .collect::<String>();
+    assert_eq!(output, "hello");
+}
+
+#[tokio::test]
+async fn openai_streaming_handler_fails_closed_on_invalid_sse() {
+    let mut server = mockito::Server::new_async().await;
+    server
+        .mock("POST", "/completions")
+        .with_status(200)
+        .with_body("data: not-json\n\n")
+        .create_async()
+        .await;
+    let handler = openai_compat_streaming_handler(opts(server.url(), Some("qwen")));
+    let events = handler(TcpTask {
+        task_id: "task-2".into(),
+        intent: "urn:iicp:intent:llm:completion:v1".into(),
+        payload: json!({"prompt": "hi"}),
+    });
+    futures_util::pin_mut!(events);
+    let event = events.next().await.unwrap().unwrap();
+    assert_eq!(event.status, "error");
+    assert_eq!(event.error_code.as_deref(), Some("invalid_backend_stream"));
 }
 
 #[tokio::test]
