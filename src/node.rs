@@ -277,12 +277,29 @@ fn modalities_for_model(model: &str) -> Vec<&'static str> {
 /// discover. Back-compatible: a single text chat model yields the same single
 /// `["text"]` capability as before. Order: first-seen group leads (configured
 /// model — typically chat/text — first).
+#[cfg(test)]
 fn build_capabilities(models: &[String], default_intent: &str, max_tokens: u32) -> Vec<Value> {
+    build_capabilities_with_profiles(models, default_intent, max_tokens, &[])
+}
+
+fn build_capabilities_with_profiles(
+    models: &[String],
+    default_intent: &str,
+    max_tokens: u32,
+    supported_profiles: &[String],
+) -> Vec<Value> {
+    let mut profiles = supported_profiles.to_vec();
+    let mut seen = std::collections::HashSet::new();
+    profiles.retain(|profile| seen.insert(profile.clone()));
     if models.is_empty() {
-        return vec![json!({
+        let mut capability = json!({
             "intent": default_intent, "models": [], "max_tokens": max_tokens,
             "input_modalities": ["text"],
-        })];
+        });
+        if !profiles.is_empty() {
+            capability["supported_profiles"] = json!(profiles);
+        }
+        return vec![capability];
     }
     // Group key = "intent\0modalities" to keep (intent, modality) groups distinct + ordered.
     let mut order: Vec<String> = Vec::new();
@@ -303,12 +320,16 @@ fn build_capabilities(models: &[String], default_intent: &str, max_tokens: u32) 
         .into_iter()
         .map(|key| {
             let (intent, modalities, models) = groups.remove(&key).expect("key from order");
-            json!({
+            let mut capability = json!({
                 "intent": intent,
                 "models": models,
                 "max_tokens": max_tokens,
                 "input_modalities": modalities,
-            })
+            });
+            if !profiles.is_empty() {
+                capability["supported_profiles"] = json!(profiles);
+            }
+            capability
         })
         .collect()
 }
@@ -419,6 +440,8 @@ pub struct NodeConfig {
     /// Pre-normative receipt profiles explicitly enabled by the operator.
     /// Unknown values are ignored and an empty list is not advertised.
     pub supported_receipt_profiles: Vec<String>,
+    /// Explicit opt-in capability profiles. Empty means no profile claim.
+    pub supported_profiles: Vec<String>,
 }
 
 impl NodeConfig {
@@ -471,6 +494,7 @@ impl NodeConfig {
             backend_api_key: None,
             excluded_models: Vec::new(),
             supported_receipt_profiles: Vec::new(),
+            supported_profiles: Vec::new(),
         }
     }
 }
@@ -1810,7 +1834,12 @@ impl IicpNode {
 
         let mut new_payload = self.build_register_payload(); // reads effective endpoint
         if models_changed {
-            let new_caps = build_capabilities(&live, &self.cfg.intent, self.cfg.max_tokens);
+            let new_caps = build_capabilities_with_profiles(
+                &live,
+                &self.cfg.intent,
+                self.cfg.max_tokens,
+                &self.cfg.supported_profiles,
+            );
             new_payload["capabilities"] = serde_json::to_value(&new_caps).unwrap_or(json!([]));
         }
         let url = format!(
@@ -2021,7 +2050,12 @@ impl IicpNode {
             // #409 — advertise one capability object per intent the backend can
             // serve (e.g. chat + embedding from one Ollama/LM Studio backend),
             // classified from the detected model set, instead of a single intent.
-            "capabilities": build_capabilities(&models, &self.cfg.intent, self.cfg.max_tokens),
+            "capabilities": build_capabilities_with_profiles(
+                &models,
+                &self.cfg.intent,
+                self.cfg.max_tokens,
+                &self.cfg.supported_profiles,
+            ),
             "limits": {
                 "max_concurrent": self.cfg.max_concurrent,
                 "tokens_per_min": self.cfg.tokens_per_min,
@@ -2517,6 +2551,7 @@ impl IicpNode {
             let hb_backend_stability = Arc::clone(&self.backend_stability);
             let hb_intent = self.cfg.intent.clone();
             let hb_max_tokens = self.cfg.max_tokens;
+            let hb_supported_profiles = self.cfg.supported_profiles.clone();
             let hb_registered_models = Arc::clone(&self.registered_models);
             let hb_public_models = Arc::clone(&self.public_models);
             // #527 — endpoint rotation (Quick Tunnel URL): the watchdog publishes
@@ -2667,8 +2702,12 @@ impl IicpNode {
                                     if live_set != reg_set {
                                         let mut new_payload = hb_register_payload.clone();
                                         attach_current_node_token(&mut new_payload, &token);
-                                        let new_caps =
-                                            build_capabilities(&live, &hb_intent, hb_max_tokens);
+                                        let new_caps = build_capabilities_with_profiles(
+                                            &live,
+                                            &hb_intent,
+                                            hb_max_tokens,
+                                            &hb_supported_profiles,
+                                        );
                                         new_payload["capabilities"] =
                                             serde_json::to_value(&new_caps).unwrap_or(json!([]));
                                         if let Some(credentials) =
@@ -3320,10 +3359,32 @@ mod task_rate_tests {
 
 #[cfg(test)]
 mod capability_tests {
-    use super::{build_capabilities, filter_public_backend_models, IicpNode, NodeConfig};
+    use super::{
+        build_capabilities, build_capabilities_with_profiles, filter_public_backend_models,
+        IicpNode, NodeConfig,
+    };
 
     const CHAT: &str = "urn:iicp:intent:llm:chat:v1";
     const EMBED: &str = "urn:iicp:intent:llm:embedding:v1";
+
+    #[test]
+    fn supported_profiles_are_explicit_and_deduplicated() {
+        let models = vec!["qwen".to_string()];
+        assert!(build_capabilities(&models, CHAT, 4096)[0]
+            .get("supported_profiles")
+            .is_none());
+        let profile = "urn:iicp:profile:service-lifecycle:v1".to_string();
+        let capabilities = build_capabilities_with_profiles(
+            &models,
+            CHAT,
+            4096,
+            &[profile.clone(), profile.clone()],
+        );
+        assert_eq!(
+            capabilities[0]["supported_profiles"],
+            serde_json::json!([profile])
+        );
+    }
 
     #[test]
     fn excluded_backend_alias_is_not_used_as_health_or_registration_evidence() {
