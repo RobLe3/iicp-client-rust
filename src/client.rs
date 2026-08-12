@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use rand::Rng;
@@ -16,7 +16,10 @@ use crate::routing_policy::{
     filter_nodes_for_routing_policy, resolved_policy, routing_policy_refusal_message,
     ROUTING_POLICY_REFUSAL_CODE,
 };
-use crate::selection::weighted_v1_index;
+use crate::selection::{
+    apply_candidate_ranker, ranker_receipt_profile, weighted_v1_index, CandidateRanker,
+    RankerDecision,
+};
 use crate::types::*;
 
 // Compiled once at first use — avoid per-call allocation (fix: rust#3).
@@ -173,6 +176,7 @@ pub struct IicpClient {
     /// Phase 2 (#496): in-process consumer token cache.
     ct_cache: ConsumerTokenCache,
     dispatch_ticket_key: std::sync::Mutex<Option<String>>,
+    candidate_ranker: Option<Arc<dyn CandidateRanker>>,
 }
 
 impl IicpClient {
@@ -204,7 +208,18 @@ impl IicpClient {
             http,
             ct_cache: ConsumerTokenCache::new(),
             dispatch_ticket_key: std::sync::Mutex::new(None),
+            candidate_ranker: None,
         })
+    }
+
+    /// Attach an optional, process-local ranker for already eligible candidates.
+    ///
+    /// The ranker cannot add providers or bypass IICP ticket, authorization, CX,
+    /// and dispatch controls. Returning `Ok(None)` preserves the configured
+    /// built-in selection strategy.
+    pub fn with_candidate_ranker(mut self, ranker: Arc<dyn CandidateRanker>) -> Self {
+        self.candidate_ranker = Some(ranker);
+        self
     }
 
     /// Discover nodes for *intent* (SDK-01). Accepts an optional traceparent for propagation.
@@ -521,10 +536,11 @@ impl IicpClient {
         }
 
         let eligible_candidate_count = decision.eligible.len();
-        let candidates: Vec<_> = {
+        let eligible_nodes = decision.eligible;
+        let built_in_candidates: Vec<_> = {
             let mut rng = rand::thread_rng();
             let max_retries = MAX_RETRIES as usize;
-            let safe_nodes = decision.eligible;
+            let safe_nodes = eligible_nodes.clone();
             if self.config.routing_strategy == "deterministic" || safe_nodes.len() <= 1 {
                 safe_nodes.into_iter().take(max_retries).collect()
             } else if self.config.routing_strategy == "weighted_v1" {
@@ -600,6 +616,23 @@ impl IicpClient {
                 safe_nodes.into_iter().take(max_retries).collect()
             }
         };
+        let (candidates, ranker_decision): (Vec<_>, Option<RankerDecision>) =
+            if let Some(ranker) = &self.candidate_ranker {
+                let applied = apply_candidate_ranker(
+                    ranker.as_ref(),
+                    &request,
+                    &eligible_nodes,
+                    built_in_candidates,
+                    MAX_RETRIES as usize,
+                )
+                .map_err(|message| IicpError::PolicyRefused {
+                    code: "IICP-CANDIDATE-RANKER-REFUSED".into(),
+                    message,
+                })?;
+                (applied.candidates, applied.decision)
+            } else {
+                (built_in_candidates, None)
+            };
 
         if candidates.is_empty() {
             return Err(IicpError::NoNodes {
@@ -609,7 +642,7 @@ impl IicpClient {
 
         let mut last_err: Option<IicpError> = None;
 
-        'nodes: for node in &candidates {
+        'nodes: for (candidate_index, node) in candidates.iter().enumerate() {
             // Phase 2 (#496): acquire directory-issued consumer token when caller has identity.
             let consumer_token: Option<String> = if self.config.consumer_auth_mode == "disabled" {
                 None
@@ -704,13 +737,18 @@ impl IicpClient {
                         resp.dispatch_ticket_id_prefix = node.dispatch_ticket_id_prefix.clone();
                         resp.routing_receipt = Some(RoutingReceipt {
                             receipt_version: "iicp-routing-receipt-v1".into(),
-                            selection_profile: if profile_negotiation.is_some()
-                                || self.config.route_discovery_mode == "legacy"
-                            {
-                                self.config.routing_strategy.clone()
-                            } else {
-                                "directory_ticket_v1".into()
-                            },
+                            selection_profile: ranker_decision
+                                .as_ref()
+                                .map(|decision| ranker_receipt_profile(decision, candidate_index))
+                                .unwrap_or_else(|| {
+                                    if profile_negotiation.is_some()
+                                        || self.config.route_discovery_mode == "legacy"
+                                    {
+                                        self.config.routing_strategy.clone()
+                                    } else {
+                                        "directory_ticket_v1".into()
+                                    }
+                                }),
                             eligible_candidate_count,
                             selected_node_id_prefix: node_short_id(&node.node_id).to_string(),
                             profile_negotiation: profile_negotiation.clone(),

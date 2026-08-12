@@ -1,13 +1,40 @@
 // SPDX-License-Identifier: Apache-2.0
 use iicp_client::{
-    make_traceparent, ClientConfig, DiscoverOptions, IicpClient, IicpError, RouteConstraints,
+    make_traceparent, CandidateEvidenceV0, CandidateRanker, ClientConfig, DiscoverOptions,
+    IicpClient, IicpError, RankerDecision, RankerMode, RankerRequest, RouteConstraints,
     RoutingPolicy, RoutingProfile, TaskConstraints, TaskRequest,
 };
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 fn env_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
+
+struct ModelRanker {
+    target_model: String,
+    observed_candidates: Mutex<Vec<CandidateEvidenceV0>>,
+}
+
+impl CandidateRanker for ModelRanker {
+    fn rank(
+        &self,
+        request: &RankerRequest<'_>,
+        candidates: &[CandidateEvidenceV0],
+    ) -> std::result::Result<Option<RankerDecision>, String> {
+        assert_eq!(request.intent, "urn:iicp:intent:llm:chat:v1");
+        assert_eq!(request.request.payload["messages"], serde_json::json!([]));
+        *self.observed_candidates.lock().unwrap() = candidates.to_vec();
+        let selected = candidates
+            .iter()
+            .find(|candidate| candidate.models.contains(&self.target_model))
+            .ok_or_else(|| "target model not present".to_string())?;
+        Ok(Some(RankerDecision {
+            candidate_ref: selected.candidate_ref.clone(),
+            policy_id: "test-model-ranker-v0".into(),
+            mode: RankerMode::Normal,
+        }))
+    }
 }
 
 // is_transient() — used by retry logic (SDK-05)
@@ -232,6 +259,110 @@ async fn submit_prefers_ticketed_route_and_exposes_only_ticket_prefix() {
         Some("abc123def456")
     );
     assert!(!format!("{response:?}").contains("secret-ticket-token"));
+    unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
+}
+
+#[tokio::test]
+#[allow(clippy::await_holding_lock)]
+async fn candidate_ranker_sees_only_eligible_nodes_and_cannot_bypass_dispatch() {
+    let _guard = env_test_lock();
+    unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
+
+    let mut directory = mockito::Server::new_async().await;
+    let mut provider_a = mockito::Server::new_async().await;
+    let mut provider_b = mockito::Server::new_async().await;
+    let _discover = directory
+        .mock("GET", mockito::Matcher::Regex(r"/v1/discover.*".into()))
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            serde_json::json!({
+                "count": 3,
+                "nodes": [
+                    {
+                        "node_id": "node-a", "endpoint": provider_a.url(), "score": 0.95,
+                        "load": 0.1, "available": true, "region": "eu", "models": ["model-a"],
+                        "cx_public_key": {
+                            "algorithm": "X25519", "encoding": "base64url",
+                            "key": "-LKZgrZEnFMr9ctB3uQDKsME07ZzS4Ce-SapFAePul0", "key_id": "cx-a"
+                        }
+                    },
+                    {
+                        "node_id": "node-b", "endpoint": provider_b.url(), "score": 0.80,
+                        "load": 0.2, "available": true, "region": "eu", "models": ["model-b"],
+                        "cx_public_key": {
+                            "algorithm": "X25519", "encoding": "base64url",
+                            "key": "-LKZgrZEnFMr9ctB3uQDKsME07ZzS4Ce-SapFAePul0", "key_id": "cx-b"
+                        }
+                    },
+                    {
+                        "node_id": "node-unavailable", "endpoint": "https://unavailable.example",
+                        "score": 1.0, "available": false, "region": "eu", "models": ["model-c"]
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .create_async()
+        .await;
+    let task_a = provider_a
+        .mock("POST", "/v1/task")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(
+            r#"{"task_id":"ranked-task","status":"success","result":{"answer":"a-fallback"},"metrics":null}"#,
+        )
+        .expect(1)
+        .create_async()
+        .await;
+    let task_b = provider_b
+        .mock("POST", "/v1/task")
+        .with_status(503)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"error":{"code":"backend_unavailable","message":"retry"}}"#)
+        .expect(3)
+        .create_async()
+        .await;
+    let ranker = Arc::new(ModelRanker {
+        target_model: "model-b".into(),
+        observed_candidates: Mutex::new(vec![]),
+    });
+    let client = IicpClient::new(ClientConfig {
+        directory_url: directory.url(),
+        route_discovery_mode: "legacy".into(),
+        routing_strategy: "deterministic".into(),
+        ..Default::default()
+    })
+    .unwrap()
+    .with_candidate_ranker(ranker.clone());
+    let response = client
+        .submit(TaskRequest {
+            task_id: "ranked-task".into(),
+            intent: "urn:iicp:intent:llm:chat:v1".into(),
+            payload: serde_json::json!({"messages": []}),
+            constraints: None,
+            route_constraints: None,
+            auth: None,
+            source_node_id: None,
+            routing_policy: None,
+        })
+        .await
+        .unwrap();
+
+    let observed = ranker.observed_candidates.lock().unwrap();
+    assert_eq!(observed.len(), 2, "unavailable node reached the ranker");
+    assert!(observed
+        .iter()
+        .all(|candidate| !candidate.models.contains(&"model-c".to_string())));
+    assert_eq!(
+        response
+            .routing_receipt
+            .as_ref()
+            .map(|receipt| receipt.selection_profile.as_str()),
+        Some("external_ranker/test-model-ranker-v0/fallback")
+    );
+    task_a.assert_async().await;
+    task_b.assert_async().await;
     unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
 }
 

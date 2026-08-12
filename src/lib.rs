@@ -113,6 +113,10 @@ pub use routing_policy::{
     filter_nodes_for_routing_policy, resolved_policy, routing_policy_refusal_message,
     ROUTING_POLICY_REFUSAL_CODE,
 };
+pub use selection::{
+    CandidateEvidenceV0, CandidateRanker, RankerDecision, RankerMode, RankerRequest,
+    CANDIDATE_EVIDENCE_SCHEMA_V0,
+};
 pub use types::{
     ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage, ClientConfig, CxPublicKey,
     DiscoverOptions, Node, NodeList, ProfileRequest, RouteConstraints, RoutingPolicy,

@@ -145,6 +145,22 @@ not silently fall back to anonymous dispatch if consumer-token acquisition
 fails. The default remains `"optional"`; `"disabled"` skips token
 acquisition.
 
+### Experimental local candidate rankers
+
+Library users may attach a `CandidateRanker` when they need to test a learned
+or application-specific ordering policy. The client calls it only after the
+normal endpoint, availability, confidentiality, and routing-policy checks.
+The ranker receives a redacted `CandidateEvidenceV0` list and may select one
+listed reference or decline. A decline leaves the configured IICP selection
+strategy unchanged. A ranker error or unknown reference fails before provider
+dispatch.
+
+This is a Rust-only experiment, not a wire profile or default. Tickets,
+consumer authorization, payload confidentiality, retries, and dispatch remain
+inside `IicpClient`. The generic interface does not send request content to an
+external service; an application-owned adapter must define and secure any such
+boundary itself.
+
 ## Migrate from existing AI tools
 
 Direct call:
