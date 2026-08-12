@@ -350,4 +350,131 @@ mod tests {
                 .unwrap_err();
         assert_eq!(err, "local evaluator unavailable");
     }
+
+    struct FixtureRanker {
+        outcome: String,
+        candidate_ref: Option<String>,
+        policy_id: Option<String>,
+        mode: Option<RankerMode>,
+        message: Option<String>,
+    }
+
+    impl CandidateRanker for FixtureRanker {
+        fn rank(
+            &self,
+            request: &RankerRequest<'_>,
+            candidates: &[CandidateEvidenceV0],
+        ) -> std::result::Result<Option<RankerDecision>, String> {
+            assert_eq!(
+                request.request_ref,
+                "3c3a728202a98f783e76b600fd25128bac2768fefcf578b290afc4010cd3117d"
+            );
+            assert_eq!(candidates.len(), 2);
+            match self.outcome.as_str() {
+                "decline" => Ok(None),
+                "error" => Err(self.message.clone().unwrap()),
+                "select" => Ok(Some(RankerDecision {
+                    candidate_ref: self.candidate_ref.clone().unwrap(),
+                    policy_id: self.policy_id.clone().unwrap(),
+                    mode: self.mode.unwrap(),
+                })),
+                other => panic!("unexpected fixture outcome: {other}"),
+            }
+        }
+    }
+
+    #[test]
+    fn shared_candidate_ranker_fixture_matches_rust_behavior() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/candidate-ranker-v0.json"))
+                .unwrap();
+        assert_eq!(fixture["schema"], "iicp.candidate-ranker-parity.v0");
+        assert_eq!(fixture["evidence_schema"], CANDIDATE_EVIDENCE_SCHEMA_V0);
+        let request = TaskRequest {
+            task_id: fixture["request"]["task_id"].as_str().unwrap().into(),
+            intent: fixture["request"]["intent"].as_str().unwrap().into(),
+            payload: serde_json::json!({"marker": fixture["request"]["payload_marker"]}),
+            constraints: None,
+            route_constraints: None,
+            auth: None,
+            source_node_id: None,
+            routing_policy: Some(RoutingPolicy::default()),
+        };
+        let fixture_nodes = fixture["nodes"].as_array().unwrap();
+        let eligible: Vec<_> = fixture["eligible_node_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| {
+                let raw = fixture_nodes
+                    .iter()
+                    .find(|raw| raw["node_id"] == *id)
+                    .unwrap();
+                let mut candidate = node(
+                    raw["node_id"].as_str().unwrap(),
+                    raw["endpoint"].as_str().unwrap(),
+                    raw["directory_score"].as_f64().unwrap(),
+                );
+                candidate.load = raw["load"].as_f64().unwrap();
+                candidate.models = Some(
+                    raw["models"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|model| model.as_str().unwrap().to_string())
+                        .collect(),
+                );
+                candidate
+            })
+            .collect();
+
+        for case in fixture["cases"].as_array().unwrap() {
+            let definition = &case["ranker"];
+            let ranker = FixtureRanker {
+                outcome: definition["outcome"].as_str().unwrap().into(),
+                candidate_ref: definition["candidate_ref"].as_str().map(str::to_string),
+                policy_id: definition["policy_id"].as_str().map(str::to_string),
+                mode: definition["mode"].as_str().map(|mode| match mode {
+                    "normal" => RankerMode::Normal,
+                    "exploration" => RankerMode::Exploration,
+                    other => panic!("unexpected fixture mode: {other}"),
+                }),
+                message: definition["message"].as_str().map(str::to_string),
+            };
+            let result = apply_candidate_ranker(&ranker, &request, &eligible, eligible.clone(), 3);
+            if let Some(expected_error) = case["expected_error_contains"].as_str() {
+                assert!(
+                    result.unwrap_err().contains(expected_error),
+                    "{}",
+                    case["id"]
+                );
+                continue;
+            }
+            let applied = result.unwrap();
+            let actual_order: Vec<_> = applied
+                .candidates
+                .iter()
+                .map(|candidate| candidate.node_id.as_str())
+                .collect();
+            let expected_order: Vec<_> = case["expected_order"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|id| id.as_str().unwrap())
+                .collect();
+            assert_eq!(actual_order, expected_order, "{}", case["id"]);
+            if let Some(decision) = applied.decision {
+                assert_eq!(
+                    ranker_receipt_profile(&decision, 0),
+                    case["expected_primary_receipt"].as_str().unwrap()
+                );
+                assert_eq!(
+                    ranker_receipt_profile(&decision, 1),
+                    case["expected_fallback_receipt"].as_str().unwrap()
+                );
+            } else {
+                assert!(case["expected_primary_receipt"].is_null());
+            }
+        }
+    }
 }

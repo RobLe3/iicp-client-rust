@@ -155,11 +155,12 @@ listed reference or decline. A decline leaves the configured IICP selection
 strategy unchanged. A ranker error or unknown reference fails before provider
 dispatch.
 
-This is a Rust-only experiment, not a wire profile or default. Tickets,
-consumer authorization, payload confidentiality, retries, and dispatch remain
-inside `IicpClient`. The generic interface does not send request content to an
-external service; an application-owned adapter must define and secure any such
-boundary itself.
+Rust, Python and TypeScript implement the same experimental client contract and
+test it against the shared `candidate-ranker-v0` fixture. This is not a wire
+profile or default. Tickets, consumer authorization, payload confidentiality,
+retries, and dispatch remain inside `IicpClient`. The generic interface does
+not send request content to an external service; an application-owned adapter
+must define and secure any such boundary itself.
 
 ## Migrate from existing AI tools
 
