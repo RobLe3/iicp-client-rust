@@ -264,8 +264,12 @@ impl RelayWorkerSession {
         ]);
         let send_result = self.write_tx.send(make_frame(MT_CALL, &cbor));
         let pending = Arc::clone(&self.stream_pending);
+        let guard = PendingStreamGuard {
+            call_id: call_id.clone(),
+            pending,
+        };
         Box::pin(async_stream::stream! {
-            let _guard = PendingStreamGuard { call_id: call_id.clone(), pending };
+            let _guard = guard;
             if send_result.is_err() {
                 yield Err("relay session write channel closed".into());
                 return;
@@ -445,8 +449,12 @@ impl HttpPollWorkerSession {
             "stream": true, "task": task,
         }));
         let pending = Arc::clone(&self.stream_pending);
+        let guard = PendingStreamGuard {
+            call_id: call_id.clone(),
+            pending,
+        };
         Box::pin(async_stream::stream! {
-            let _guard = PendingStreamGuard { call_id: call_id.clone(), pending };
+            let _guard = guard;
             if send_result.is_err() {
                 yield Err("relay poll session closed".into());
                 return;
@@ -1182,6 +1190,90 @@ mod tests {
 
         assert_eq!(stream.next().await.unwrap().unwrap_err(), "sequence_drift");
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_poll_stream_bounds_slow_consumer() {
+        let session = HttpPollWorkerSession::new("w-bound".into(), "intent".into(), vec![]);
+        let mut stream = session.forward_stream(
+            &json!({"task_id":"task-bound","session_id":"session-bound"}),
+            1,
+        );
+        let call = session.next_call(Duration::from_secs(1)).await.unwrap();
+        let call_id = call["call_id"].as_str().unwrap().to_string();
+        session.on_stream_response(
+            &call_id,
+            stream_event(
+                "session-bound",
+                &call_id,
+                "task-bound",
+                0,
+                "partial",
+                "partial",
+                false,
+            ),
+        );
+        assert_eq!(stream.next().await.unwrap().unwrap().status, "partial");
+        for sequence in 1..=33 {
+            session.on_stream_response(
+                &call_id,
+                stream_event(
+                    "session-bound",
+                    &call_id,
+                    "task-bound",
+                    sequence,
+                    "partial",
+                    "partial",
+                    false,
+                ),
+            );
+        }
+        assert_eq!(
+            stream.next().await.unwrap().unwrap_err(),
+            "relay_backpressure_exceeded"
+        );
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_poll_stream_drop_and_timeout_remove_pending_state() {
+        let session = HttpPollWorkerSession::new("w-cleanup".into(), "intent".into(), vec![]);
+        let cancelled = session.forward_stream(
+            &json!({"task_id":"task-cancel","session_id":"session-cancel"}),
+            1,
+        );
+        let call = session.next_call(Duration::from_secs(1)).await.unwrap();
+        let call_id = call["call_id"].as_str().unwrap().to_string();
+        assert!(session
+            .stream_pending
+            .lock()
+            .unwrap()
+            .contains_key(&call_id));
+        drop(cancelled);
+        assert!(!session
+            .stream_pending
+            .lock()
+            .unwrap()
+            .contains_key(&call_id));
+
+        let mut incomplete = session.forward_stream(
+            &json!({"task_id":"task-timeout","session_id":"session-timeout"}),
+            0,
+        );
+        let call = session.next_call(Duration::from_secs(1)).await.unwrap();
+        let call_id = call["call_id"].as_str().unwrap().to_string();
+        assert!(incomplete
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("relay stream timeout"));
+        drop(incomplete);
+        assert!(!session
+            .stream_pending
+            .lock()
+            .unwrap()
+            .contains_key(&call_id));
     }
 
     #[test]
