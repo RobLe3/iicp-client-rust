@@ -979,6 +979,7 @@ dependencies = [
  "chrono",
  "ciborium",
  "ed25519-dalek",
+ "futures-util",
  "hex",
  "hkdf",
  "hmac",

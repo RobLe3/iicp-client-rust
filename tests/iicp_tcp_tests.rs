@@ -14,12 +14,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ciborium::value::Value as CborValue;
+use futures_util::StreamExt;
 use iicp_client::iicp_tcp::{
     decode_cbor, encode_frame, IicpTcpClient, IicpTcpClientError, IicpTcpServer, MsgType,
     FRAME_HEADER_LEN, FRAMING_VERSION, IICP_MAGIC,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -464,4 +465,89 @@ async fn test_client_full_session_init_ping_discover_call_close() {
         Some(&serde_json::json!("v"))
     );
     client.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn test_client_call_stream_yields_validated_partial_and_terminal() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let (message_type, _) = read_frame(&mut socket).await.unwrap();
+        assert_eq!(message_type, MsgType::Init as u8);
+        let ack = encode_frame(
+            MsgType::Ack as u8,
+            &cbor_encode(&CborValue::Map(vec![(
+                CborValue::Integer(1.into()),
+                CborValue::Integer((FRAMING_VERSION as i64).into()),
+            )])),
+            0,
+        );
+        socket.write_all(&ack).await.unwrap();
+        let (message_type, call) = read_frame(&mut socket).await.unwrap();
+        assert_eq!(message_type, MsgType::Call as u8);
+        let call = decode_cbor(&call).unwrap();
+        assert!(format!("{call:?}").contains("stream-task"));
+
+        for (sequence, status, event, is_final, result) in [
+            (0, "partial", "partial", false, "hel"),
+            (1, "success", "completed", true, "lo"),
+        ] {
+            let response = CborValue::Map(vec![
+                (
+                    CborValue::Integer(2.into()),
+                    CborValue::Text("stream-session".into()),
+                ),
+                (
+                    CborValue::Integer(3.into()),
+                    CborValue::Text("stream-call".into()),
+                ),
+                (CborValue::Integer(4.into()), CborValue::Text(status.into())),
+                (CborValue::Integer(5.into()), CborValue::Text(result.into())),
+                (CborValue::Integer(12.into()), CborValue::Bool(is_final)),
+                (
+                    CborValue::Integer(13.into()),
+                    CborValue::Map(vec![
+                        (
+                            CborValue::Integer(1.into()),
+                            CborValue::Text("stream-task".into()),
+                        ),
+                        (
+                            CborValue::Integer(2.into()),
+                            CborValue::Integer(sequence.into()),
+                        ),
+                        (CborValue::Integer(3.into()), CborValue::Text(event.into())),
+                        (CborValue::Integer(4.into()), CborValue::Bool(is_final)),
+                    ]),
+                ),
+            ]);
+            socket
+                .write_all(&encode_frame(
+                    MsgType::Response as u8,
+                    &cbor_encode(&response),
+                    0,
+                ))
+                .await
+                .unwrap();
+        }
+    });
+
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    client.handshake().await.unwrap();
+    let events = client.call_stream(
+        "urn:iicp:intent:test:v1",
+        serde_json::json!({}),
+        "stream-task",
+        "stream-session",
+        Some("stream-call".into()),
+        None,
+    );
+    futures_util::pin_mut!(events);
+    let first = events.next().await.unwrap().unwrap();
+    let second = events.next().await.unwrap().unwrap();
+    assert_eq!(first.status, "partial");
+    assert_eq!(first.result, serde_json::json!("hel"));
+    assert_eq!(second.status, "success");
+    assert_eq!(second.result, serde_json::json!("lo"));
+    assert!(events.next().await.is_none());
 }
