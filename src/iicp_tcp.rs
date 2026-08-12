@@ -22,9 +22,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use ciborium::value::Value as CborValue;
+use futures_util::{stream, Stream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, warn};
+
+use crate::native_response_sequence::{
+    NativeLifecycleEnvelope, NativeResponseFrame, NativeResponseSequence,
+};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -242,6 +247,62 @@ fn cbor_to_bytes(v: &CborValue) -> Option<Vec<u8>> {
         CborValue::Bytes(b) => Some(b.clone()),
         _ => None,
     }
+}
+
+fn cbor_to_bool(v: &CborValue) -> Option<bool> {
+    match v {
+        CborValue::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn cbor_to_u64(v: &CborValue) -> Option<u64> {
+    match v {
+        CborValue::Integer(value) => {
+            let number: i128 = (*value).into();
+            u64::try_from(number).ok()
+        }
+        _ => None,
+    }
+}
+
+fn decode_lifecycle_response(body: &CborValue) -> Result<NativeResponseFrame, IicpTcpClientError> {
+    let lifecycle = cbor_map_get(body, 13)
+        .ok_or_else(|| IicpTcpClientError::Protocol("missing_lifecycle".into()))?;
+    Ok(NativeResponseFrame {
+        session_id: cbor_map_get(body, 2)
+            .and_then(cbor_to_str)
+            .unwrap_or_default(),
+        call_id: cbor_map_get(body, 3)
+            .and_then(cbor_to_str)
+            .unwrap_or_default(),
+        status: cbor_map_get(body, 4)
+            .and_then(cbor_to_str)
+            .unwrap_or_default(),
+        is_final: cbor_map_get(body, 12)
+            .and_then(cbor_to_bool)
+            .unwrap_or(false),
+        lifecycle: NativeLifecycleEnvelope {
+            task_id: cbor_map_get(lifecycle, 1)
+                .and_then(cbor_to_str)
+                .unwrap_or_default(),
+            sequence: cbor_map_get(lifecycle, 2)
+                .and_then(cbor_to_u64)
+                .unwrap_or(u64::MAX),
+            event: cbor_map_get(lifecycle, 3)
+                .and_then(cbor_to_str)
+                .unwrap_or_default(),
+            is_final: cbor_map_get(lifecycle, 4)
+                .and_then(cbor_to_bool)
+                .unwrap_or(false),
+        },
+        result: cbor_map_get(body, 5)
+            .map(cbor_to_json)
+            .unwrap_or(serde_json::Value::Null),
+        error: cbor_map_get(body, 6)
+            .map(cbor_to_json)
+            .unwrap_or(serde_json::Value::Null),
+    })
 }
 
 // ── Server ────────────────────────────────────────────────────────────────────
@@ -891,6 +952,123 @@ impl IicpTcpClient {
             Some(other) => Ok(cbor_to_json(other)),
             None => Ok(serde_json::Value::Object(Default::default())),
         }
+    }
+
+    /// Consume this connected client and stream validated lifecycle RESPONSE events.
+    ///
+    /// Consuming the client makes cancellation fail closed: dropping the returned
+    /// stream also drops the TCP socket, so unread partial responses cannot corrupt
+    /// a later RPC on the same connection. Buffered `call()` remains unchanged.
+    pub fn call_stream(
+        self,
+        intent: impl Into<String>,
+        payload: serde_json::Value,
+        task_id: impl Into<String>,
+        session_id: impl Into<String>,
+        call_id: Option<String>,
+        idempotency_key: Option<String>,
+    ) -> impl Stream<Item = Result<NativeResponseFrame, IicpTcpClientError>> {
+        struct State {
+            client: IicpTcpClient,
+            request: Vec<u8>,
+            sequence: NativeResponseSequence,
+            started: bool,
+            finished: bool,
+        }
+
+        let intent = intent.into();
+        let task_id = task_id.into();
+        let session_id = session_id.into();
+        let call_id = call_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let payload_bytes = serde_json::to_vec(&payload).unwrap_or_default();
+        let mut entries = vec![
+            (
+                CborValue::Integer(2.into()),
+                CborValue::Text(session_id.clone()),
+            ),
+            (CborValue::Integer(3.into()), CborValue::Text(intent)),
+            (
+                CborValue::Integer(5.into()),
+                CborValue::Bytes(payload_bytes),
+            ),
+            (
+                CborValue::Integer(15.into()),
+                CborValue::Text(call_id.clone()),
+            ),
+            (
+                CborValue::Integer(24.into()),
+                CborValue::Text(task_id.clone()),
+            ),
+        ];
+        if let Some(key) = idempotency_key {
+            entries.push((CborValue::Integer(16.into()), CborValue::Text(key)));
+        }
+        let request = encode_frame(
+            MsgType::Call as u8,
+            &encode_cbor(&CborValue::Map(entries)),
+            0,
+        );
+        let state = State {
+            client: self,
+            request,
+            sequence: NativeResponseSequence::new(session_id, call_id, task_id),
+            started: false,
+            finished: false,
+        };
+
+        stream::unfold(state, |mut state| async move {
+            if state.finished {
+                return None;
+            }
+            if !state.started {
+                if let Err(error) = state.client.write_all(&state.request.clone()).await {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+                state.started = true;
+            }
+            let (msg_type, payload) = match state.client.read_frame().await {
+                Ok(frame) => frame,
+                Err(_) => {
+                    state.finished = true;
+                    return Some((
+                        Err(IicpTcpClientError::Protocol(
+                            "missing_terminal_response".into(),
+                        )),
+                        state,
+                    ));
+                }
+            };
+            if msg_type != MsgType::Response as u8 {
+                state.finished = true;
+                return Some((
+                    Err(IicpTcpClientError::Protocol(format!(
+                        "expected RESPONSE (0x06), got 0x{msg_type:02x}"
+                    ))),
+                    state,
+                ));
+            }
+            let body = match decode_cbor(&payload).map_err(IicpTcpClientError::Protocol) {
+                Ok(body) => body,
+                Err(error) => {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+            };
+            let frame = match decode_lifecycle_response(&body) {
+                Ok(frame) => frame,
+                Err(error) => {
+                    state.finished = true;
+                    return Some((Err(error), state));
+                }
+            };
+            if let Err(error) = state.sequence.accept(&frame) {
+                state.finished = true;
+                return Some((Err(IicpTcpClientError::Protocol(error.code.into())), state));
+            }
+            state.finished = frame.is_final;
+            Some((Ok(frame), state))
+        })
     }
 
     /// Send CLOSE — server hangs up cleanly. Subsequent RPCs on this client will fail.

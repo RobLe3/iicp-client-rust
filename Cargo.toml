@@ -35,7 +35,7 @@ default = ["nat", "iicp-tcp"]
 metrics = ["dep:prometheus"]
 # Native IICP binary transport (port 9484, spec/iicp-framing.md). Default-on (#457);
 # adds ciborium (~50KB). Pure-HTTP library consumers can drop it via --no-default-features.
-iicp-tcp = ["dep:ciborium"]
+iicp-tcp = ["dep:ciborium", "dep:futures-util"]
 # ADR-041 UPnP NAT detection — auto-discover the public endpoint on operator
 # networks behind a UPnP-capable router.
 nat = ["dep:igd-next"]
@@ -72,6 +72,7 @@ axum = "0.7"
 tracing = "0.1"
 prometheus = { version = "0.14", optional = true }
 ciborium = { version = "0.2", optional = true }
+futures-util = { version = "0.3", optional = true }
 igd-next = { version = "0.17", default-features = false, features = ["aio_tokio"], optional = true }
 
 # ADR-019 pricing-block HMAC-SHA256. Pulled in unconditionally — operators
