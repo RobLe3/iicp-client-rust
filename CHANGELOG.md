@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.7.103] - 2026-08-13
 
 ### Security — portable atomic single-instance lock
 
