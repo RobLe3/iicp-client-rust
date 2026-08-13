@@ -61,3 +61,15 @@ Use a temporary node identity and content-free output. Do not publish hostnames,
 addresses, node IDs, credentials, prompts, model output, or raw logs. Remove the
 temporary unit after the exercise. Default enablement requires a separate
 maintainer decision after both architecture classes pass.
+
+Copy `evidence/systemd-operator-validation-v1.json` before the representative
+run and complete the copy with content-free outcomes and measured cadence. Run:
+
+```bash
+python3 scripts/check_systemd_operator_validation.py <completed-record.json>
+```
+
+The repository copy remains blank. A completed record recommends either
+`retain_opt_in` or `propose_default_enablement`; it does not itself authorize a
+default-policy change. A failed or unavailable representative run is valid
+evidence for retaining opt-in behavior.

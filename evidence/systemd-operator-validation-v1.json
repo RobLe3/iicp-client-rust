@@ -1,0 +1,56 @@
+{
+  "schema_version": "iicp-systemd-operator-validation-v1",
+  "status": "blank-representative-operator-template",
+  "result_present": false,
+  "consent_confirmed": false,
+  "observed_at_utc": null,
+  "platform": {
+    "distribution": null,
+    "architecture": null,
+    "systemd_version": null,
+    "service_scope": null,
+    "representative_operator_environment": false
+  },
+  "artifact": {
+    "sdk_version": "0.7.102",
+    "source_commit": null,
+    "binary_sha256": null,
+    "native_watchdog_enabled": true
+  },
+  "measurements": {
+    "startup_seconds": null,
+    "normal_progress_max_ms": null,
+    "loaded_progress_max_ms": null,
+    "configured_watchdog_usec": null
+  },
+  "checks": {
+    "slow_startup": null,
+    "memory_or_long_inference_pressure": null,
+    "process_crash_recovery": null,
+    "runtime_stall_recovery": null,
+    "dependency_loss_no_restart_loop": null,
+    "reboot_start": null,
+    "logout_survival": null,
+    "linger_verified": null,
+    "restart_limit_verified": null,
+    "rollback_verified": null
+  },
+  "policy_recommendation": null,
+  "policy_rationale": null,
+  "privacy": {
+    "hostname": false,
+    "addresses": false,
+    "node_ids": false,
+    "credentials": false,
+    "prompts": false,
+    "model_output": false,
+    "raw_logs": false,
+    "personal_data": false
+  },
+  "claim_boundary": {
+    "classifies_historical_pi_incident": false,
+    "authorizes_default_enablement": false,
+    "proves_all_linux_distributions": false,
+    "proves_host_health": false
+  }
+}
