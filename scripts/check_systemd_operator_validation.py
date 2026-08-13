@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import tomllib
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT = ROOT / "evidence/systemd-operator-validation-v1.json"
@@ -25,6 +26,11 @@ RESULTS = {"pass", "fail", "not_applicable"}
 RECOMMENDATIONS = {"retain_opt_in", "propose_default_enablement"}
 
 
+def current_sdk_version(root: Path = ROOT) -> str:
+    with (root / "Cargo.toml").open("rb") as manifest:
+        return str(tomllib.load(manifest)["package"]["version"])
+
+
 def validate(record: dict) -> list[str]:
     errors: list[str] = []
     present = record.get("result_present")
@@ -37,6 +43,8 @@ def validate(record: dict) -> list[str]:
     checks = record.get("checks", {})
     if set(checks) != CHECKS:
         errors.append("operator record must contain the complete check set")
+    if record.get("artifact", {}).get("sdk_version") != current_sdk_version():
+        errors.append("operator record must pin the current Rust SDK release")
     if not present:
         if record.get("status") != "blank-representative-operator-template":
             errors.append("empty record must identify itself as a blank template")
