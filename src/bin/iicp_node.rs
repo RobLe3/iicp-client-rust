@@ -2977,7 +2977,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     // #405 — single-instance lock: refuse a second LIVE process for this node_id
     // (the token-rotation war). Distinct node_ids are unaffected. Held for the
-    // serve lifetime; the pidfile is removed on shutdown (Drop). Fails open.
+    // serve lifetime; only the owning process removes the lock on shutdown.
+    // Unverifiable existing ownership fails closed unless --force is explicit.
     let _instance_lock =
         match iicp_client::instance_lock::InstanceLock::acquire(&opts.node_id, opts.force) {
             Ok(lock) => lock,
