@@ -1,5 +1,15 @@
 # Changelog
 
+## [Unreleased]
+
+### Security — portable atomic single-instance lock
+
+- Replace the external `kill -0` command with a direct Unix process check and
+  atomically acquire the existing cross-SDK PID file. Minimal Docker images now
+  reject a second process for the same node ID, indeterminate owners fail
+  closed, stale PID files recover safely, and `--force` remains the explicit
+  takeover path.
+
 All notable changes to the IICP Rust SDK (`iicp-client`).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

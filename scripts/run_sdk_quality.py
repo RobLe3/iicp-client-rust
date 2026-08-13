@@ -58,6 +58,7 @@ def main() -> int:
         require(toolchain("stable", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"), "Clippy")
         require(toolchain("1.86.0", "test", "--locked", "--all-features"), "Rust 1.86")
         require(toolchain("stable", "test", "--locked", "--all-features"), "stable Rust")
+        require(run(["./scripts/test_instance_lock_container.sh"]), "supported-image instance lock")
         with tempfile.TemporaryDirectory(prefix="iicp-rust-quality-") as temporary:
             temp = Path(temporary)
             advisory_db = temp / "advisory-db"
@@ -111,6 +112,7 @@ def main() -> int:
             "dependency_audit": {"status": "pass"},
             "locked_build": {"status": "pass"},
             "clean_install": {"status": "pass"},
+            "supported_image_instance_lock": {"status": "pass"},
         },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
