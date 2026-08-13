@@ -17,6 +17,7 @@ fn blank_systemd_operator_record_is_valid_but_not_evidence() {
     )
     .unwrap();
     assert_eq!(record["result_present"], false);
+    assert_eq!(record["artifact"]["sdk_version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(
         record["claim_boundary"]["authorizes_default_enablement"],
         false
