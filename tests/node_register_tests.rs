@@ -1,4 +1,6 @@
 // Phase 2 (#529/#55): re-register sends current_node_token after seed_token
+use serde_json::Value;
+
 #[test]
 fn seed_token_then_payload_carries_current_node_token() {
     use iicp_client::{IicpNode, NodeConfig};
@@ -60,4 +62,33 @@ fn register_payload_advertises_only_enabled_consumer_cosignature_profile() {
         payload["supported_receipt_profiles"],
         serde_json::json!(["consumer_cosignature_v1"])
     );
+}
+
+#[test]
+fn shared_e050_client_lifecycle_projects_current_tokens_and_rotated_endpoints() {
+    use iicp_client::{IicpNode, NodeConfig};
+    let fixture: Value = serde_json::from_str(include_str!(
+        "fixtures/e050-client-credential-lifecycle-v1.json"
+    ))
+    .unwrap();
+    for scenario in fixture["scenarios"].as_array().unwrap() {
+        let cfg = NodeConfig::new(
+            "n-reg",
+            "https://old-tunnel.example".to_string(),
+            "urn:iicp:intent:llm:chat:v1",
+        );
+        let node = IicpNode::new(cfg);
+        if let Some(token) = scenario["starting_token"].as_str() {
+            node.seed_token(token);
+        }
+        node.set_endpoint(scenario["requested_endpoint"].as_str().unwrap().to_string());
+        let payload = node.register_payload_for_test();
+        assert_eq!(
+            payload.get("current_node_token").and_then(Value::as_str),
+            scenario["expected_request_token"].as_str(),
+            "{}",
+            scenario["id"]
+        );
+        assert_eq!(payload["endpoint"], scenario["requested_endpoint"]);
+    }
 }
