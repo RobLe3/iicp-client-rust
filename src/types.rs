@@ -405,7 +405,7 @@ pub struct TaskMetrics {
 }
 
 /// A single chat message (role + content).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,

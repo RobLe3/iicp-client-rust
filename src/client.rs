@@ -790,7 +790,28 @@ impl IicpClient {
         messages: Vec<ChatMessage>,
         opts: Option<ChatOptions>,
     ) -> Result<ChatResponse> {
+        self.chat_with_runtime_identity(messages, opts, None).await
+    }
+
+    /// Chat with the pre-normative runtime identity context explicitly enabled.
+    /// Ordinary `chat()` remains byte-compatible and does not inject context.
+    pub async fn chat_with_runtime_identity(
+        &self,
+        messages: Vec<ChatMessage>,
+        opts: Option<ChatOptions>,
+        runtime_identity: Option<crate::runtime_identity::RuntimeIdentityOptions>,
+    ) -> Result<ChatResponse> {
         let opts = opts.unwrap_or_default();
+        let messages = crate::runtime_identity::compose_runtime_identity(
+            &messages,
+            "urn:iicp:intent:llm:chat:v1",
+            runtime_identity.as_ref(),
+        )
+        .map_err(|code| IicpError::Protocol {
+            code: code.into(),
+            message: "runtime identity context could not be composed before dispatch".into(),
+            status: 400,
+        })?;
         let mut payload = serde_json::json!({ "messages": messages });
         if let Some(ref model) = opts.model {
             payload["model"] = serde_json::Value::String(model.clone());
