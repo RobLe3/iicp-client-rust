@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.104] — 2026-08-14
+
+### Added — effective capabilities and runtime identity
+
+- Added the shared effective-capability-v1 parser, matcher and explicit provider variants without inferring verified behavior from model names.
+- Added opt-in, chat-only runtime identity composition. It preserves application instructions, omits unknown facts and leaves non-chat payloads unchanged.
+- Retains the 0.7.103 portable atomic single-instance security fix.
+
 ## [0.7.103] - 2026-08-13
 
 ### Security — portable atomic single-instance lock
