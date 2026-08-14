@@ -28,6 +28,9 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
 use crate::backend_stability::{observe_backend_stability, BackendStabilityObservation};
+use crate::effective_capability::{
+    EffectiveCapability, EffectiveCapabilityAdvertisement, EFFECTIVE_CAPABILITY_SCHEMA_VERSION,
+};
 use crate::errors::{IicpError, Result};
 
 const DEFAULT_DIRECTORY: &str = "https://iicp.network/api";
@@ -332,6 +335,18 @@ fn build_capabilities_with_profiles(
             capability
         })
         .collect()
+}
+
+fn effective_capability_models(capabilities: &[EffectiveCapability]) -> Vec<String> {
+    capabilities
+        .iter()
+        .flat_map(|capability| capability.models.iter().cloned())
+        .fold(Vec::new(), |mut models, model| {
+            if !models.contains(&model) {
+                models.push(model);
+            }
+            models
+        })
 }
 
 /// Configuration for an IICP provider node.
@@ -1594,6 +1609,9 @@ async fn task_endpoint(
 /// IICP provider node — handles registration, heartbeats, and task serving.
 pub struct IicpNode {
     cfg: NodeConfig,
+    /// Complete service-path variants explicitly supplied by the operator.
+    /// Empty preserves the legacy model-name-derived advertisement.
+    effective_capabilities: Vec<EffectiveCapability>,
     http: Client,
     /// ADR-019 HMAC key used for signing pricing declarations. Initialized
     /// from `cfg.node_hmac_key`; populated from the directory's response on
@@ -1684,6 +1702,7 @@ impl IicpNode {
         );
         Self {
             cfg,
+            effective_capabilities: Vec::new(),
             http,
             runtime_hmac_key,
             runtime_token: Arc::new(std::sync::RwLock::new(String::new())),
@@ -1708,6 +1727,29 @@ impl IicpNode {
 
     pub fn runtime_health(&self) -> crate::runtime_health::RuntimeHealth {
         self.runtime_health.clone()
+    }
+
+    /// Configure complete effective-capability variants for directory
+    /// registration. Explicit variants replace the legacy model-name heuristic;
+    /// their fields are never merged across variants.
+    pub fn with_effective_capabilities(
+        mut self,
+        capabilities: Vec<EffectiveCapability>,
+    ) -> Result<Self> {
+        if !capabilities.is_empty() {
+            EffectiveCapabilityAdvertisement {
+                schema_version: EFFECTIVE_CAPABILITY_SCHEMA_VERSION.to_string(),
+                capabilities: capabilities.clone(),
+            }
+            .validate()
+            .map_err(IicpError::Node)?;
+        }
+        let models = effective_capability_models(&capabilities);
+        if !capabilities.is_empty() {
+            *self.public_models.write().expect("poisoned") = models;
+        }
+        self.effective_capabilities = capabilities;
+        Ok(self)
     }
 
     /// Persist refreshed directory credentials into this saved node identity.
@@ -1819,7 +1861,7 @@ impl IicpNode {
 
         // Model drift — None/empty probe means "can't tell", not "no models".
         let live = self.probe_health_models().await.unwrap_or_default();
-        let models_changed = if live.is_empty() {
+        let models_changed = if !self.effective_capabilities.is_empty() || live.is_empty() {
             false
         } else {
             let registered = self.registered_models.read().expect("poisoned").clone();
@@ -2050,12 +2092,22 @@ impl IicpNode {
             // #409 — advertise one capability object per intent the backend can
             // serve (e.g. chat + embedding from one Ollama/LM Studio backend),
             // classified from the detected model set, instead of a single intent.
-            "capabilities": build_capabilities_with_profiles(
-                &models,
-                &self.cfg.intent,
-                self.cfg.max_tokens,
-                &self.cfg.supported_profiles,
-            ),
+            "capabilities": if self.effective_capabilities.is_empty() {
+                build_capabilities_with_profiles(
+                    &models,
+                    &self.cfg.intent,
+                    self.cfg.max_tokens,
+                    &self.cfg.supported_profiles,
+                )
+            } else {
+                self.effective_capabilities
+                    .iter()
+                    .map(|capability| {
+                        serde_json::to_value(capability)
+                            .expect("effective capabilities validated before registration")
+                    })
+                    .collect::<Vec<_>>()
+            },
             "limits": {
                 "max_concurrent": self.cfg.max_concurrent,
                 "tokens_per_min": self.cfg.tokens_per_min,
@@ -2199,20 +2251,24 @@ impl IicpNode {
         );
         // #494 — track the registered model set for drift detection.
         {
-            let mut models: Vec<String> = match &self.cfg.model {
-                Some(m) => vec![m.clone()],
-                None => Vec::new(),
-            };
-            for cap in &self.cfg.capabilities {
-                if !models.contains(cap) {
-                    models.push(cap.clone());
+            let models = if self.effective_capabilities.is_empty() {
+                let mut models: Vec<String> = match &self.cfg.model {
+                    Some(m) => vec![m.clone()],
+                    None => Vec::new(),
+                };
+                for cap in &self.cfg.capabilities {
+                    if !models.contains(cap) {
+                        models.push(cap.clone());
+                    }
                 }
-            }
-            let models = filter_public_backend_models(
-                models,
-                &self.cfg.excluded_models,
-                self.cfg.backend.as_deref(),
-            );
+                filter_public_backend_models(
+                    models,
+                    &self.cfg.excluded_models,
+                    self.cfg.backend.as_deref(),
+                )
+            } else {
+                effective_capability_models(&self.effective_capabilities)
+            };
             *self.registered_models.write().expect("poisoned") = models.clone();
             *self.public_models.write().expect("poisoned") = models;
         }
@@ -2552,6 +2608,7 @@ impl IicpNode {
             let hb_intent = self.cfg.intent.clone();
             let hb_max_tokens = self.cfg.max_tokens;
             let hb_supported_profiles = self.cfg.supported_profiles.clone();
+            let hb_has_explicit_effective_capabilities = !self.effective_capabilities.is_empty();
             let hb_registered_models = Arc::clone(&self.registered_models);
             let hb_public_models = Arc::clone(&self.public_models);
             // #527 — endpoint rotation (Quick Tunnel URL): the watchdog publishes
@@ -2692,7 +2749,7 @@ impl IicpNode {
                             }
                             // #494 — detect model drift; re-register when live set differs.
                             if let Some(live) = live_models {
-                                if !live.is_empty() {
+                                if !hb_has_explicit_effective_capabilities && !live.is_empty() {
                                     let registered =
                                         hb_registered_models.read().expect("poisoned").clone();
                                     let live_set: std::collections::HashSet<_> =
