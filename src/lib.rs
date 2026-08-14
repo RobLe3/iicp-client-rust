@@ -52,6 +52,7 @@ pub mod conformance;
 pub mod delegation;
 #[cfg(feature = "dispatch-admission-sqlite")]
 pub mod dispatch_admission_sqlite;
+pub mod effective_capability;
 pub mod idempotency;
 pub mod identity;
 pub mod instance_lock;
