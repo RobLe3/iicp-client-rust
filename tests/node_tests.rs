@@ -4,6 +4,7 @@
 use std::net::TcpListener as StdListener;
 
 use iicp_client::confidentiality::encrypt_payload;
+use iicp_client::effective_capability::EffectiveCapability;
 use iicp_client::node::{IicpNode, NodeConfig};
 use iicp_client::CxPublicKey;
 use serde_json::{json, Value};
@@ -540,6 +541,52 @@ async fn test_register_payload_spec_compliant() {
         .starts_with("cx-"));
     let token = node.register().await.unwrap();
     assert_eq!(token, "tok-1");
+}
+
+#[tokio::test]
+async fn test_explicit_effective_capabilities_replace_model_name_heuristics() {
+    use mockito::{Matcher, Server};
+
+    let explicit_json = json!({
+        "intent": "urn:iicp:intent:llm:chat:v1",
+        "variant_id": "explicit-vision",
+        "models": ["custom-model"],
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"],
+        "claim_provenance": {"source": "runtime_introspection"}
+    });
+    let explicit: EffectiveCapability = serde_json::from_value(explicit_json.clone()).unwrap();
+
+    let mut server = Server::new_async().await;
+    let register = server
+        .mock("POST", "/v1/register")
+        .match_body(Matcher::PartialJson(json!({
+            "capabilities": [explicit_json.clone()]
+        })))
+        .with_status(201)
+        .with_header("content-type", "application/json")
+        .with_body(json!({"node_token": "tok-effective", "node_id": "n-effective"}).to_string())
+        .expect(1)
+        .create_async()
+        .await;
+
+    let mut cfg = NodeConfig::new(
+        "n-effective",
+        "https://provider.example.com:8080",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.directory_url = server.url();
+    cfg.model = Some("qwen-vl-heuristic-name".into());
+    let node = IicpNode::new(cfg)
+        .with_effective_capabilities(vec![explicit])
+        .unwrap();
+
+    assert_eq!(
+        node.register_payload_for_test()["capabilities"],
+        json!([explicit_json])
+    );
+    assert_eq!(node.register().await.unwrap(), "tok-effective");
+    register.assert_async().await;
 }
 
 /// iter-1413: spec v0.7.0 — register includes transport_endpoint when configured.
