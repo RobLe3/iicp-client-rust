@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.105] — 2026-08-15
+
+### Changed — factual runtime self-description by default
+
+- Compatible chat helpers now add the bounded IICP runtime identity capsule by default; applications can disable it or require a supported instruction channel.
+- The capsule names the active intent and client version, omits unknown or private routing facts, preserves application instructions, and is rebuilt from the original messages for each fallback candidate.
+- Raw task submission, non-chat intents, wire semantics and provider behavior remain unchanged.
+
 ## [0.7.104] — 2026-08-14
 
 ### Added — effective capabilities and runtime identity
