@@ -34,6 +34,63 @@ enum TicketRouteError {
     Iicp(IicpError),
 }
 
+#[derive(Clone)]
+struct RuntimeIdentityDispatch {
+    messages: Vec<ChatMessage>,
+    options: Option<crate::runtime_identity::RuntimeIdentityOptions>,
+}
+
+fn runtime_identity_payload_for_candidate(
+    request: &TaskRequest,
+    node: &Node,
+    candidate_index: usize,
+    context: &RuntimeIdentityDispatch,
+) -> Result<serde_json::Value> {
+    let requested_model = request
+        .constraints
+        .as_ref()
+        .and_then(|constraints| constraints.model.as_ref());
+    let selected_model = requested_model
+        .and_then(|requested| {
+            node.models
+                .as_ref()
+                .and_then(|models| models.iter().find(|model| *model == requested))
+        })
+        .cloned()
+        .or_else(|| {
+            node.models
+                .as_ref()
+                .filter(|models| models.len() == 1)
+                .and_then(|models| models.first().cloned())
+        });
+    let selection_reason = [
+        "matched_intent_and_constraints",
+        "fallback_after_unavailable_candidate",
+    ][usize::from(candidate_index > 0)];
+    let options = crate::runtime_identity::with_runtime_facts(
+        context.options.clone(),
+        "iicp-client-rust",
+        env!("CARGO_PKG_VERSION"),
+        crate::runtime_identity::RuntimeIdentityConnectionMode::Routed,
+        selected_model,
+        Vec::new(),
+        selection_reason,
+    );
+    let messages = crate::runtime_identity::compose_runtime_identity(
+        &context.messages,
+        &request.intent,
+        Some(&options),
+    )
+    .map_err(|code| IicpError::Protocol {
+        code: code.into(),
+        message: "runtime identity context could not be composed before dispatch".into(),
+        status: 400,
+    })?;
+    let mut payload = request.payload.clone();
+    payload["messages"] = serde_json::to_value(messages)?;
+    Ok(payload)
+}
+
 /// SSRF guard: return true only if url is safe to use as a node endpoint (#388).
 fn is_ssrf_safe(url: &str) -> bool {
     let lower = url.to_lowercase();
@@ -429,7 +486,15 @@ impl IicpClient {
     /// Discover → select best node → submit task (SDK-01/02).
     /// Retries up to MAX_RETRIES on transient errors (SDK-05).
     /// Generates one W3C traceparent shared across discover + POST (SDK-06).
-    pub async fn submit(&self, mut request: TaskRequest) -> Result<TaskResponse> {
+    pub async fn submit(&self, request: TaskRequest) -> Result<TaskResponse> {
+        self.submit_internal(request, None).await
+    }
+
+    async fn submit_internal(
+        &self,
+        mut request: TaskRequest,
+        runtime_identity: Option<RuntimeIdentityDispatch>,
+    ) -> Result<TaskResponse> {
         self.validate_intent(&request.intent)?;
         if request.task_id.is_empty() {
             request.task_id = uuid::Uuid::new_v4().to_string();
@@ -643,6 +708,14 @@ impl IicpClient {
         let mut last_err: Option<IicpError> = None;
 
         'nodes: for (candidate_index, node) in candidates.iter().enumerate() {
+            let candidate_payload = runtime_identity
+                .as_ref()
+                .map(|context| {
+                    runtime_identity_payload_for_candidate(&request, node, candidate_index, context)
+                })
+                .transpose()?
+                .unwrap_or_else(|| request.payload.clone());
+
             // Phase 2 (#496): acquire directory-issued consumer token when caller has identity.
             let consumer_token: Option<String> = if self.config.consumer_auth_mode == "disabled" {
                 None
@@ -678,7 +751,7 @@ impl IicpClient {
             });
             let body: serde_json::Value = if let Some(ref cx_key) = node.cx_public_key {
                 let (iicp_conf, shared_secret) = encrypt_payload_with_context(
-                    &request.payload,
+                    &candidate_payload,
                     cx_key,
                     &request.task_id,
                     &request.intent,
@@ -702,7 +775,11 @@ impl IicpClient {
                      only because IICP_CX_ALLOW_PLAINTEXT=1 is set.",
                     node.node_id
                 );
-                serde_json::to_value(&request)?
+                let original_payload =
+                    std::mem::replace(&mut request.payload, candidate_payload.clone());
+                let body = serde_json::to_value(&request)?;
+                request.payload = original_payload;
+                body
             };
 
             for attempt in 0..MAX_RETRIES {
@@ -790,11 +867,15 @@ impl IicpClient {
         messages: Vec<ChatMessage>,
         opts: Option<ChatOptions>,
     ) -> Result<ChatResponse> {
-        self.chat_with_runtime_identity(messages, opts, None).await
+        self.chat_with_runtime_identity(
+            messages,
+            opts,
+            Some(crate::runtime_identity::RuntimeIdentityOptions::default()),
+        )
+        .await
     }
 
-    /// Chat with the pre-normative runtime identity context explicitly enabled.
-    /// Ordinary `chat()` remains byte-compatible and does not inject context.
+    /// Chat with explicit control over the pre-normative runtime identity context.
     pub async fn chat_with_runtime_identity(
         &self,
         messages: Vec<ChatMessage>,
@@ -802,17 +883,8 @@ impl IicpClient {
         runtime_identity: Option<crate::runtime_identity::RuntimeIdentityOptions>,
     ) -> Result<ChatResponse> {
         let opts = opts.unwrap_or_default();
-        let messages = crate::runtime_identity::compose_runtime_identity(
-            &messages,
-            "urn:iicp:intent:llm:chat:v1",
-            runtime_identity.as_ref(),
-        )
-        .map_err(|code| IicpError::Protocol {
-            code: code.into(),
-            message: "runtime identity context could not be composed before dispatch".into(),
-            status: 400,
-        })?;
-        let mut payload = serde_json::json!({ "messages": messages });
+        let original_messages = messages;
+        let mut payload = serde_json::json!({ "messages": original_messages });
         if let Some(ref model) = opts.model {
             payload["model"] = serde_json::Value::String(model.clone());
         }
@@ -847,7 +919,15 @@ impl IicpClient {
             source_node_id: None,
             routing_policy: opts.routing_policy,
         };
-        let task_resp = self.submit(request).await?;
+        let task_resp = self
+            .submit_internal(
+                request,
+                Some(RuntimeIdentityDispatch {
+                    messages: original_messages,
+                    options: runtime_identity,
+                }),
+            )
+            .await?;
         let node_id = task_resp.metrics.as_ref().and_then(|m| m.node_id.clone());
         let task_id = task_resp.task_id.clone();
         let result = task_resp.result.ok_or_else(|| IicpError::Protocol {

@@ -31,48 +31,60 @@ def current_sdk_version(root: Path = ROOT) -> str:
         return str(tomllib.load(manifest)["package"]["version"])
 
 
-def validate(record: dict) -> list[str]:
+def validate_common(record: dict) -> list[str]:
     errors: list[str] = []
-    present = record.get("result_present")
-    if present not in {True, False}:
-        return ["result_present must be boolean"]
     for field in ("privacy", "claim_boundary"):
         values = record.get(field, {})
         if not values or any(value is not False for value in values.values()):
             errors.append(f"{field} must retain every content-free boundary")
-    checks = record.get("checks", {})
-    if set(checks) != CHECKS:
+    if set(record.get("checks", {})) != CHECKS:
         errors.append("operator record must contain the complete check set")
     if record.get("artifact", {}).get("sdk_version") != current_sdk_version():
         errors.append("operator record must pin the current Rust SDK release")
-    if not present:
-        if record.get("status") != "blank-representative-operator-template":
-            errors.append("empty record must identify itself as a blank template")
-        return errors
+    return errors
 
+
+def validate_completed(record: dict) -> list[str]:
+    errors: list[str] = []
     if record.get("consent_confirmed") is not True:
         errors.append("completed record requires operator consent")
     if not record.get("observed_at_utc"):
         errors.append("completed record requires UTC observation time")
+
     platform = record.get("platform", {})
     for field in ("distribution", "architecture", "systemd_version", "service_scope"):
         if not platform.get(field):
             errors.append(f"completed record requires platform {field}")
     if platform.get("representative_operator_environment") is not True:
         errors.append("completed record must come from a representative operator environment")
+
     artifact = record.get("artifact", {})
     if not artifact.get("source_commit") or not artifact.get("binary_sha256"):
         errors.append("completed record requires source commit and binary digest")
     if artifact.get("native_watchdog_enabled") is not True:
         errors.append("operator lane must exercise the native watchdog")
+
     measurements = record.get("measurements", {})
     if any(not isinstance(value, int) or value <= 0 for value in measurements.values()):
         errors.append("completed record requires positive integer measurements")
-    if {value for value in checks.values() if value not in RESULTS}:
+    checks = record.get("checks", {})
+    if any(value not in RESULTS for value in checks.values()):
         errors.append("every operator check must be pass, fail, or not_applicable")
     if record.get("policy_recommendation") not in RECOMMENDATIONS or not record.get("policy_rationale"):
         errors.append("completed record requires bounded policy recommendation and rationale")
     return errors
+
+
+def validate(record: dict) -> list[str]:
+    present = record.get("result_present")
+    if present not in {True, False}:
+        return ["result_present must be boolean"]
+    errors = validate_common(record)
+    if not present:
+        if record.get("status") != "blank-representative-operator-template":
+            errors.append("empty record must identify itself as a blank template")
+        return errors
+    return errors + validate_completed(record)
 
 
 def main() -> int:

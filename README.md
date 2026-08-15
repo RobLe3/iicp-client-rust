@@ -29,7 +29,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.104"
+iicp-client = "0.7.105"
 ```
 
 ## One-line test
@@ -46,7 +46,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.104 or newer
+iicp-node --version    # prints iicp-node 0.7.105 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -84,6 +84,28 @@ async fn main() -> iicp_client::Result<()> {
     println!("{}", reply.choices[0].message.content);
     Ok(())
 }
+```
+
+## Runtime self-description
+
+Compatible `chat()` calls now add a small system context by default. It tells
+the selected service that the request arrived through IICP, names the active
+intent and client version, and distinguishes the service from IICP itself.
+Candidate-specific model facts are included only when the active route supplies
+them. The context is rebuilt on fallback, never includes endpoints, tokens,
+node identities, candidate sets or scores, and is not a prompt-injection
+security boundary.
+
+Raw `submit()` calls and non-chat intents are unchanged. Use
+`chat_with_runtime_identity` when an application must disable the context or
+require a supported system-instruction channel:
+
+```rust
+use iicp_client::runtime_identity::{RuntimeIdentityMode, RuntimeIdentityOptions};
+
+let mut identity = RuntimeIdentityOptions::default();
+identity.mode = RuntimeIdentityMode::Disabled; // or Required
+let reply = client.chat_with_runtime_identity(messages, None, Some(identity)).await?;
 ```
 
 ## Do I need to run a node?
@@ -193,7 +215,7 @@ base URL. Full guide: <https://iicp.network/docs/proxy>
 
 ## Keep provider nodes current
 
-The current public release line is **0.7.104**. Upgrade through your package
+The current public release line is **0.7.105**. Upgrade through your package
 manager before troubleshooting an older installation. Routing profiles can
 refuse remote dispatch before a prompt leaves the client; use `sensitive` for
 local-only work, `eu-restricted` for EU/EEA routing, or `strict-policy` when a

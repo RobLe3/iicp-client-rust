@@ -7,7 +7,7 @@ use iicp_client::ChatMessage;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const FIXTURE_SHA256: &str = "91514f8ad7a6a02ba75d834741096a605d22390e6e21210e6369254cf12cd897";
+const FIXTURE_SHA256: &str = "a31064ca630ab5409fb2f57edd1ef29a5c79532b8960927f6a0d2b52d7d71c81";
 
 fn fixture() -> Value {
     serde_json::from_slice(include_bytes!(
@@ -38,8 +38,16 @@ fn exact_shared_fixture_is_pinned() {
 #[test]
 fn disabled_and_non_chat_messages_are_unchanged() {
     let messages = vec![message("user", "hello")];
+    assert!(
+        compose_runtime_identity(&messages, RUNTIME_IDENTITY_CHAT_INTENT, None).unwrap()
+            != messages
+    );
+    let disabled = RuntimeIdentityOptions {
+        mode: RuntimeIdentityMode::Disabled,
+        ..Default::default()
+    };
     assert_eq!(
-        compose_runtime_identity(&messages, RUNTIME_IDENTITY_CHAT_INTENT, None).unwrap(),
+        compose_runtime_identity(&messages, RUNTIME_IDENTITY_CHAT_INTENT, Some(&disabled)).unwrap(),
         messages
     );
     let explicit = RuntimeIdentityOptions {
@@ -99,6 +107,9 @@ fn supplied_facts_are_bounded() {
         selected_model: Some("model-a".into()),
         effective_capabilities: vec!["input_modality:image".into()],
         selection_reason: Some("matched_intent_and_constraints".into()),
+        client_name: Some("iicp-client-rust".into()),
+        client_version: Some("0.7.105".into()),
+        connection_mode: Some(iicp_client::runtime_identity::RuntimeIdentityConnectionMode::Routed),
         ..Default::default()
     };
     let result = compose_runtime_identity(
@@ -133,5 +144,35 @@ fn unsupported_channel_degrades_optional_and_refuses_required() {
     assert_eq!(
         compose_runtime_identity(&messages, RUNTIME_IDENTITY_CHAT_INTENT, Some(&required)),
         Err("required_identity_context_unsupported")
+    );
+}
+
+#[test]
+fn default_auto_renders_client_and_rejects_control_character_facts() {
+    let options = RuntimeIdentityOptions {
+        client_name: Some("iicp-client-rust".into()),
+        client_version: Some("0.7.105".into()),
+        ..Default::default()
+    };
+    let result = compose_runtime_identity(
+        &[message("user", "What is this?")],
+        RUNTIME_IDENTITY_CHAT_INTENT,
+        Some(&options),
+    )
+    .unwrap();
+    assert!(result[0]
+        .content
+        .contains("client: iicp-client-rust 0.7.105"));
+    let invalid = RuntimeIdentityOptions {
+        selected_model: Some("model\ninjected".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        compose_runtime_identity(
+            &[message("user", "hello")],
+            RUNTIME_IDENTITY_CHAT_INTENT,
+            Some(&invalid),
+        ),
+        Err("runtime_identity_selected_model_invalid")
     );
 }
