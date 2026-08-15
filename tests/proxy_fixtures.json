@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "contract": "project/proxy-unification-contract.md",
+  "contract": "https://github.com/RobLe3/IICP/blob/main/spec/v1.9/iicp-semantics.md",
   "issue": 477,
   "epic": 476,
   "intent": "urn:iicp:intent:llm:chat:v1",

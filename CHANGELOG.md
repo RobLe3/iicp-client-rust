@@ -22,7 +22,7 @@ All notable changes to the IICP Rust SDK (`iicp-client`).
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
-within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/iicp.network/blob/main/project/VERSIONING.md)
+within the scope of the IICP Software axis (see [`VERSIONING.md`](https://github.com/RobLe3/IICP/blob/main/VERSIONING.md)
 in the main repo).
 
 ## [Unreleased]
@@ -578,4 +578,4 @@ All lifecycle and policy additions in this release remain opt-in and pre-normati
 
 See git log — the Tier 1 ports (transport_endpoint, IICP TCP, UPnP, openai_compat,
 NAT observability) and Tier 2 items (CIP policy, pricing, conformance, ConcurrencyGate)
-shipped across iter-1409..1440 of the main repo's FORGE loop.
+shipped in the coordinated 0.5.x implementation series.

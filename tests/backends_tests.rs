@@ -630,7 +630,7 @@ async fn test_audio_speech_requires_input_field() {
 }
 
 /// Live ratification (#414): requires an OpenAI-compat /v1/audio/speech backend on
-/// :8091 (e.g. the espeak-ng shim documented in FORGE_STATE iter-2026).
+/// :8091 (for example, a local espeak-ng-compatible test shim).
 /// Run with: cargo test --test backends_tests -- --ignored audio_speech_live
 #[tokio::test]
 #[ignore]
@@ -681,7 +681,7 @@ async fn test_safety_moderate_routes_without_model() {
 }
 
 /// Live ratification (#414): requires an OpenAI-compat /v1/moderations backend on
-/// :8092 (e.g. the unitary/toxic-bert shim documented in FORGE_STATE iter-2027).
+/// :8092 (for example, a local unitary/toxic-bert-compatible test shim).
 /// Run with: cargo test --test backends_tests -- --ignored safety_moderate_live
 #[tokio::test]
 #[ignore]

@@ -4,7 +4,7 @@
 //! A loopback HTTP server (axum) that translates external chat-API requests into IICP
 //! mesh calls via [`IicpClient`] and back. It does NOT register with the directory
 //! (consumer gateway). Mirrors the Python `iicp_client.proxy` and the TS gateway per
-//! `project/proxy-unification-contract.md`; verified against the shared golden fixtures.
+//! public IICP proxy semantics; verified against the shared golden fixtures.
 //!
 //! v1 covers the non-CIP fixtures. The CIP affordability / no-eligible-workers gates
 //! (402 IICP-E036 / 503 IICP-E022) require porting the proxy CIP dispatch and are
