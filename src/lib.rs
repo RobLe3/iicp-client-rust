@@ -80,6 +80,7 @@ pub mod relay_ticket;
 pub mod relay_worker_client;
 pub mod request_projection;
 pub mod routing_policy;
+pub mod runtime_config;
 pub mod runtime_health;
 pub mod runtime_identity;
 pub mod scheduler;

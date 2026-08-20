@@ -1,0 +1,371 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "definitions": {
+    "CipConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "require_same_trust_domain": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "require_same_trust_domain"
+      ],
+      "type": "object"
+    },
+    "DirectoryConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "authority_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/definitions/DirectorySource"
+        },
+        "url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "DirectorySource": {
+      "enum": [
+        "public",
+        "remote",
+        "local",
+        "static"
+      ],
+      "type": "string"
+    },
+    "ExecutionConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_external_providers": {
+          "type": "boolean"
+        },
+        "allow_local": {
+          "type": "boolean"
+        },
+        "allow_public_iicp": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "allow_external_providers",
+        "allow_local",
+        "allow_public_iicp"
+      ],
+      "type": "object"
+    },
+    "FederationConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "trusted_domains": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "MembershipConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "credential": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/SecretRef"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "reject_unknown_peers": {
+          "type": "boolean"
+        },
+        "require_authenticated_clients": {
+          "type": "boolean"
+        },
+        "require_authenticated_nodes": {
+          "type": "boolean"
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "revocation_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "reject_unknown_peers",
+        "require_authenticated_clients",
+        "require_authenticated_nodes",
+        "required"
+      ],
+      "type": "object"
+    },
+    "MeshConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "require_authenticated_gossip": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "enabled",
+        "require_authenticated_gossip"
+      ],
+      "type": "object"
+    },
+    "NetworkPolicy": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_auto_update_network": {
+          "type": "boolean"
+        },
+        "allow_external_bootstrap": {
+          "type": "boolean"
+        },
+        "allow_external_relay": {
+          "type": "boolean"
+        },
+        "allow_public_fallback": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "allow_auto_update_network",
+        "allow_external_bootstrap",
+        "allow_external_relay",
+        "allow_public_fallback"
+      ],
+      "type": "object"
+    },
+    "OperatingMode": {
+      "enum": [
+        "public",
+        "private",
+        "federated_private",
+        "local_only",
+        "custom"
+      ],
+      "type": "string"
+    },
+    "SecretRef": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "environment"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "file"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "account": {
+              "type": "string"
+            },
+            "service": {
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "macos_keychain"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "account",
+            "service",
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "source": {
+              "enum": [
+                "windows_credential"
+              ],
+              "type": "string"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "target"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "collection": {
+              "type": "string"
+            },
+            "label": {
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "linux_secret_service"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "collection",
+            "label",
+            "source"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "provider": {
+              "type": "string"
+            },
+            "reference": {
+              "type": "string"
+            },
+            "source": {
+              "enum": [
+                "external"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "reference",
+            "source"
+          ],
+          "type": "object"
+        }
+      ]
+    }
+  },
+  "properties": {
+    "cip": {
+      "$ref": "#/definitions/CipConfig"
+    },
+    "directory": {
+      "$ref": "#/definitions/DirectoryConfig"
+    },
+    "execution": {
+      "$ref": "#/definitions/ExecutionConfig"
+    },
+    "federation": {
+      "$ref": "#/definitions/FederationConfig"
+    },
+    "membership": {
+      "$ref": "#/definitions/MembershipConfig"
+    },
+    "mesh": {
+      "$ref": "#/definitions/MeshConfig"
+    },
+    "mode": {
+      "$ref": "#/definitions/OperatingMode"
+    },
+    "network": {
+      "$ref": "#/definitions/NetworkPolicy"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "minimum": 0.0,
+      "type": "integer"
+    },
+    "secret_refs": {
+      "additionalProperties": {
+        "$ref": "#/definitions/SecretRef"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "trust_domain_id": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "cip",
+    "directory",
+    "execution",
+    "federation",
+    "membership",
+    "mesh",
+    "mode",
+    "network",
+    "schema_version"
+  ],
+  "title": "RuntimeConfigV1",
+  "type": "object"
+}

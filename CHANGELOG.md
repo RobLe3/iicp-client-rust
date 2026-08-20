@@ -35,6 +35,18 @@ in the main repo).
 
 ## [Unreleased]
 
+### Added — canonical runtime configuration foundation
+
+- Added a versioned JSON configuration schema and deterministic public,
+  private, federated-private, local-only and custom presets for the Rust
+  runtime.
+- Added `config schema`, `config validate`, `config effective` and legacy-node
+  migration commands with explicit `CLI > environment > file > preset`
+  precedence.
+- Restricted and local-only configurations now reject incomplete or
+  contradictory security controls before network startup. Portable output uses
+  typed secret references and never exports legacy credential values.
+
 ## [0.7.102] — 2026-08-12
 
 ### Added — negotiated service lifecycle streaming

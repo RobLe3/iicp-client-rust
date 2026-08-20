@@ -658,3 +658,24 @@ cargo run --example quickstart
 ---
 
 Apache 2.0 · [iicp.network](https://iicp.network)
+
+### Canonical runtime configuration (development candidate)
+
+The Rust runtime exposes one versioned JSON configuration authority for CLI,
+headless automation and a future wizard or GUI. It is additive and does not
+enable restricted-domain operation by itself.
+
+```bash
+iicp-node config schema
+iicp-node config validate --file runtime-config.json
+iicp-node config effective --mode private \
+  --trust-domain example.internal \
+  --directory-authority did:key:directory
+```
+
+Precedence is `CLI > environment > configuration file > preset/default`.
+`public` preserves the current defaults. `private`, `federated_private` and
+`local_only` reject incomplete or contradictory controls before network or
+runtime startup. Portable configuration contains typed secret references, not
+node tokens, HMAC keys, enrollment tokens or private keys. The committed schema
+is `schemas/runtime-config-v1.schema.json`.

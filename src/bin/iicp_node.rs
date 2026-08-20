@@ -278,6 +278,7 @@ fn print_help() {
          \x20 serve                      Register and serve a node\n\
          \x20 doctor                     Check local health, directory presence, and recovery action\n\
          \x20 healthcheck                Check local runtime liveness/readiness snapshot\n\
+         \x20 config                     Validate or project canonical runtime configuration\n\
          \x20 query <prompt>             Discover mesh nodes and submit a chat task\n\
          \x20 credits                    Show your operator wallet plus this node's credit ledger\n\
          \x20 operator rename <name>     Change your public display_name (signed by your operator key)\n\
@@ -299,6 +300,10 @@ fn print_help() {
          \x20 --backend-type TYPE        IICP_BACKEND_TYPE — openai_compat | vllm | llamacpp | meshllm | anthropic (default openai_compat)\n\
          \x20 --public-endpoint URL      IICP_PUBLIC_ENDPOINT — externally reachable URL\n\
          \x20 --directory-url URL        IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
+         \x20 --config FILE              IICP_CONFIG_FILE — canonical runtime configuration JSON\n\
+         \x20 --mode MODE                IICP_MODE — public | private | federated_private | local_only | custom\n\
+         \x20 --trust-domain ID          IICP_TRUST_DOMAIN_ID — required by restricted modes\n\
+         \x20 --directory-authority ID   IICP_DIRECTORY_AUTHORITY — required by restricted modes\n\
          \x20 --region REGION            IICP_REGION (e.g. us-east; unknown if unset)\n\
          \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
          \x20 --max-concurrent N         IICP_MAX_CONCURRENT (default 4)\n\
@@ -682,6 +687,191 @@ fn run_healthcheck(args: &[String]) -> Result<i32, String> {
             iicp_client::runtime_health::Liveness::NotLive => 1,
             _ => 2,
         })
+    }
+}
+
+fn parse_operating_mode(value: &str) -> Result<iicp_client::runtime_config::OperatingMode, String> {
+    use iicp_client::runtime_config::OperatingMode;
+    match value {
+        "public" => Ok(OperatingMode::Public),
+        "private" => Ok(OperatingMode::Private),
+        "federated_private" | "federated-private" => Ok(OperatingMode::FederatedPrivate),
+        "local_only" | "local-only" => Ok(OperatingMode::LocalOnly),
+        "custom" => Ok(OperatingMode::Custom),
+        _ => Err(format!(
+            "unknown mode {value:?}; expected public, private, federated_private, local_only or custom"
+        )),
+    }
+}
+
+fn parse_bool_config(value: &str, source: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(format!("{source} must be true or false")),
+    }
+}
+
+fn config_environment_overrides() -> Result<iicp_client::runtime_config::ConfigOverrides, String> {
+    use iicp_client::runtime_config::ConfigOverrides;
+    Ok(ConfigOverrides {
+        mode: env::var("IICP_MODE")
+            .ok()
+            .map(|value| parse_operating_mode(&value))
+            .transpose()?,
+        directory_url: env::var("IICP_DIRECTORY_URL").ok(),
+        directory_authority: env::var("IICP_DIRECTORY_AUTHORITY").ok(),
+        trust_domain_id: env::var("IICP_TRUST_DOMAIN_ID").ok(),
+        allow_public_fallback: env::var("IICP_ALLOW_PUBLIC_FALLBACK")
+            .ok()
+            .map(|value| parse_bool_config(&value, "IICP_ALLOW_PUBLIC_FALLBACK"))
+            .transpose()?,
+        trusted_domains: env::var("IICP_TRUSTED_DOMAINS").ok().map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        }),
+    })
+}
+
+fn run_config(args: &[String]) -> Result<i32, String> {
+    use iicp_client::runtime_config::{ConfigOverrides, OperatingMode, RuntimeConfigV1};
+
+    let Some(action) = args.first().map(String::as_str) else {
+        return Err("config requires schema, validate, effective or migrate-node".into());
+    };
+    match action {
+        "schema" => return run_config_schema(args),
+        "migrate-node" => return run_config_migration(args),
+        "validate" | "effective" => {}
+        _ => return Err(format!("unknown config action: {action}")),
+    }
+
+    let mut file = None;
+    let mut cli = ConfigOverrides::default();
+    let mut preset = OperatingMode::Public;
+    let mut i = 1;
+    while i < args.len() {
+        let value = |index: usize, option: &str| {
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| format!("{option} requires a value"))
+        };
+        match args[i].as_str() {
+            "--file" => {
+                i += 1;
+                let path = value(i, "--file")?;
+                file = Some(RuntimeConfigV1::from_json(
+                    &fs::read_to_string(&path).map_err(|error| format!("read {path}: {error}"))?,
+                )?);
+            }
+            "--mode" => {
+                i += 1;
+                let mode = parse_operating_mode(&value(i, "--mode")?)?;
+                preset = mode;
+                cli.mode = Some(mode);
+            }
+            "--directory-url" => {
+                i += 1;
+                cli.directory_url = Some(value(i, "--directory-url")?);
+            }
+            "--directory-authority" => {
+                i += 1;
+                cli.directory_authority = Some(value(i, "--directory-authority")?);
+            }
+            "--trust-domain" => {
+                i += 1;
+                cli.trust_domain_id = Some(value(i, "--trust-domain")?);
+            }
+            "--allow-public-fallback" => {
+                i += 1;
+                cli.allow_public_fallback = Some(parse_bool_config(
+                    &value(i, "--allow-public-fallback")?,
+                    "--allow-public-fallback",
+                )?);
+            }
+            "--trusted-domain" => {
+                i += 1;
+                cli.trusted_domains
+                    .get_or_insert_with(Vec::new)
+                    .push(value(i, "--trusted-domain")?);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: iicp-node config {action} [--file FILE] [--mode MODE] [--directory-url URL] [--directory-authority ID] [--trust-domain ID] [--allow-public-fallback BOOL] [--trusted-domain ID]"
+                );
+                return Ok(0);
+            }
+            other => return Err(format!("unknown config option: {other}")),
+        }
+        i += 1;
+    }
+    emit_resolved_config(action, preset, file, cli)
+}
+
+fn run_config_schema(args: &[String]) -> Result<i32, String> {
+    use iicp_client::runtime_config::RuntimeConfigV1;
+    if args.len() != 1 {
+        return Err(format!("unknown config schema option: {}", args[1]));
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&RuntimeConfigV1::schema_json())
+            .map_err(|error| error.to_string())?
+    );
+    Ok(0)
+}
+
+fn run_config_migration(args: &[String]) -> Result<i32, String> {
+    use iicp_client::runtime_config::RuntimeConfigV1;
+    if args.len() != 3 || args[1] != "--node" {
+        return Err("usage: iicp-node config migrate-node --node NAME".into());
+    }
+    let node = load_node(&args[2])
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("saved node {:?} does not exist", args[2]))?;
+    let migration = RuntimeConfigV1::migrate_legacy_node(&node);
+    if migration.contained_secret_material {
+        eprintln!(
+            "NOTICE: legacy secret material was detected and omitted; configure a SecretRef before restricted operation."
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&migration.config).map_err(|error| error.to_string())?
+    );
+    Ok(0)
+}
+
+fn emit_resolved_config(
+    action: &str,
+    preset: iicp_client::runtime_config::OperatingMode,
+    file: Option<iicp_client::runtime_config::RuntimeConfigV1>,
+    cli: iicp_client::runtime_config::ConfigOverrides,
+) -> Result<i32, String> {
+    use iicp_client::runtime_config::RuntimeConfigV1;
+    let config = RuntimeConfigV1::resolve(preset, file, config_environment_overrides()?, cli);
+    let findings = config.validate();
+    if action == "effective" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&config).map_err(|error| error.to_string())?
+        );
+    }
+    if findings.is_empty() {
+        if action == "validate" {
+            println!("VALID: runtime configuration schema v1");
+        }
+        Ok(0)
+    } else {
+        eprintln!(
+            "{}",
+            serde_json::to_string_pretty(&findings).map_err(|error| error.to_string())?
+        );
+        Ok(2)
     }
 }
 
@@ -1922,6 +2112,8 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
 }
 
 fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
+    use iicp_client::runtime_config::{ConfigOverrides, OperatingMode, RuntimeConfigV1};
+
     let mut opts = ServeOpts {
         node: env_or("IICP_NODE_NAME", None).unwrap_or_default(),
         // #410 — default EMPTY here so saved-node config (--node) can supply backend_url.
@@ -1968,6 +2160,9 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             Err(_) => None,
         },
     };
+    let mut config_file = env::var("IICP_CONFIG_FILE").ok();
+    let mut config_cli = ConfigOverrides::default();
+    let mut config_preset = OperatingMode::Public;
 
     let mut i = 0;
     while i < args.len() {
@@ -2025,7 +2220,26 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     "--backend-api-key" => opts.backend_api_key = v,
                     "--model" => opts.model = v,
                     "--public-endpoint" => opts.public_endpoint = v,
-                    "--directory-url" => opts.directory_url = v,
+                    "--directory-url" => {
+                        opts.directory_url = v.clone();
+                        config_cli.directory_url = Some(v);
+                    }
+                    "--config" => config_file = Some(v),
+                    "--mode" => {
+                        let mode = parse_operating_mode(&v)?;
+                        config_preset = mode;
+                        config_cli.mode = Some(mode);
+                    }
+                    "--trust-domain" => config_cli.trust_domain_id = Some(v),
+                    "--directory-authority" => config_cli.directory_authority = Some(v),
+                    "--allow-public-fallback" => {
+                        config_cli.allow_public_fallback =
+                            Some(parse_bool_config(&v, "--allow-public-fallback")?)
+                    }
+                    "--trusted-domain" => config_cli
+                        .trusted_domains
+                        .get_or_insert_with(Vec::new)
+                        .push(v),
                     "--region" => opts.region = v,
                     "--intent" => opts.intent = v,
                     "--max-concurrent" => {
@@ -2053,6 +2267,38 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                 i += 2;
             }
         }
+    }
+
+    let file_config = config_file
+        .map(|path| {
+            fs::read_to_string(&path)
+                .map_err(|error| format!("read runtime config {path}: {error}"))
+                .and_then(|contents| RuntimeConfigV1::from_json(&contents))
+        })
+        .transpose()?;
+    let config = RuntimeConfigV1::resolve(
+        config_preset,
+        file_config,
+        config_environment_overrides()?,
+        config_cli,
+    );
+    let findings = config.validate();
+    if !findings.is_empty() {
+        return Err(format!(
+            "runtime configuration rejected before startup: {}",
+            serde_json::to_string(&findings).map_err(|error| error.to_string())?
+        ));
+    }
+    if let Some(url) = config.directory.url {
+        opts.directory_url = url;
+    }
+    if config.mode == OperatingMode::LocalOnly {
+        opts.skip_registration = true;
+        opts.auto_detect_nat = false;
+        opts.no_auto_detect_nat = true;
+        opts.tunnel = Some(false);
+        opts.relay_worker_endpoint.clear();
+        opts.external_ip_probe_url.clear();
     }
     Ok(opts)
 }
@@ -5547,6 +5793,15 @@ async fn main() {
             }
         }
     }
+    if cmd == "config" {
+        match run_config(&args[2..]) {
+            Ok(code) => process::exit(code),
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                process::exit(2);
+            }
+        }
+    }
     if cmd == "operator" {
         if let Err(e) = run_operator(&args[2..]).await {
             eprintln!("ERROR: {e}");
@@ -5699,6 +5954,42 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_runtime_config_fails_before_serve_when_incomplete() {
+        let error = match parse_args(&["--mode".into(), "private".into()]) {
+            Ok(_) => panic!("incomplete private mode must fail"),
+            Err(error) => error,
+        };
+        assert!(error.contains("trust_domain_required"));
+        assert!(error.contains("directory_authority_required"));
+    }
+
+    #[test]
+    fn private_runtime_config_applies_cli_overrides() {
+        let options = parse_args(&[
+            "--mode".into(),
+            "private".into(),
+            "--trust-domain".into(),
+            "example.internal".into(),
+            "--directory-authority".into(),
+            "did:key:directory".into(),
+            "--directory-url".into(),
+            "https://directory.example/api".into(),
+        ])
+        .unwrap();
+        assert_eq!(options.directory_url, "https://directory.example/api");
+    }
+
+    #[test]
+    fn local_only_runtime_config_disables_external_startup_paths() {
+        let options = parse_args(&["--mode".into(), "local-only".into()]).unwrap();
+        assert!(options.skip_registration);
+        assert!(!options.auto_detect_nat);
+        assert_eq!(options.tunnel, Some(false));
+        assert!(options.relay_worker_endpoint.is_empty());
+        assert!(options.external_ip_probe_url.is_empty());
+    }
 
     // Reachability escalation order (tunnel-FIRST, relay = last resort; maintainer 2026-06-13).
     // serve consumes plan_reachability, so the tested order is the used order. Parity w/ Py/TS.
