@@ -35,6 +35,15 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.106] — 2026-08-20
+
+### Fixed — retry-safe outcome metrics
+
+- Retain one heartbeat metrics batch across transport failures and retry it with the same identifier until the directory acknowledges it.
+- Continue accumulating new task counters while a prior batch is pending.
+- Preserve compatibility with older directory responses that do not provide the additive acknowledgement.
+
+
 ### Added — canonical runtime configuration foundation
 
 - Added a versioned JSON configuration schema and deterministic public,
