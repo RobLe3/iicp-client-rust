@@ -337,6 +337,12 @@ fn build_capabilities_with_profiles(
         .collect()
 }
 
+fn metrics_batch_acknowledged(response: &Value, batch_id: &str) -> bool {
+    response["metrics_batch_accepted"]
+        .as_str()
+        .is_none_or(|accepted| accepted == batch_id)
+}
+
 fn effective_capability_models(capabilities: &[EffectiveCapability]) -> Vec<String> {
     capabilities
         .iter()
@@ -2627,6 +2633,7 @@ impl IicpNode {
                 let mut token = token;
                 let mut seq: u64 = 0;
                 let mut recovery_failures: u32 = 0;
+                let mut pending_metrics: Option<(String, usize, usize, usize)> = None;
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
                     hb_runtime_health.advance_supervisor();
@@ -2634,9 +2641,23 @@ impl IicpNode {
                     // Drain incremental task counters so the directory receives
                     // the delta since the last heartbeat (ReputationService::upsert
                     // expects incremental, not cumulative counts).
-                    let ok = hb_tasks_success.swap(0, Ordering::Relaxed);
-                    let fail = hb_tasks_failed.swap(0, Ordering::Relaxed);
-                    let latency_total_ms = hb_tasks_latency_total_ms.swap(0, Ordering::Relaxed);
+                    if pending_metrics.is_none() {
+                        let ok = hb_tasks_success.swap(0, Ordering::Relaxed);
+                        let fail = hb_tasks_failed.swap(0, Ordering::Relaxed);
+                        let latency_total_ms = hb_tasks_latency_total_ms.swap(0, Ordering::Relaxed);
+                        if ok > 0 || fail > 0 {
+                            pending_metrics = Some((
+                                uuid::Uuid::new_v4().to_string(),
+                                ok,
+                                fail,
+                                latency_total_ms,
+                            ));
+                        }
+                    }
+                    let (ok, fail, latency_total_ms) = pending_metrics
+                        .as_ref()
+                        .map(|(_, ok, fail, latency)| (*ok, *fail, *latency))
+                        .unwrap_or((0, 0, 0));
                     let metrics = if ok > 0 || fail > 0 {
                         let mut m = json!({"tasks_success": ok, "tasks_failed": fail});
                         let total = ok + fail;
@@ -2696,6 +2717,9 @@ impl IicpNode {
                         // avoid moving reputation on idle periods.
                         "metrics": metrics,
                     });
+                    if let Some((batch_id, ..)) = pending_metrics.as_ref() {
+                        hb_body["metrics_batch_id"] = json!(batch_id);
+                    }
                     attach_update_status(&mut hb_body);
                     // ADR-047 Part A (#411) — answer the directory's liveness
                     // challenge in the long-running serve loop, not only in the
@@ -2746,6 +2770,16 @@ impl IicpNode {
                                     *hb_liveness_challenge.write().expect("poisoned") =
                                         Some(ch.to_string());
                                 }
+                                if let Some((batch_id, ..)) = pending_metrics.as_ref() {
+                                    let acknowledged = metrics_batch_acknowledged(&data, batch_id);
+                                    if acknowledged {
+                                        pending_metrics = None;
+                                    }
+                                }
+                            } else {
+                                // A legacy directory may return a successful response
+                                // without the additive acknowledgement field.
+                                pending_metrics = None;
                             }
                             // #494 — detect model drift; re-register when live set differs.
                             if let Some(live) = live_models {
@@ -3411,6 +3445,31 @@ mod task_rate_tests {
             .unwrap();
         b.insert("k".to_string(), (past, 1));
         assert!(task_rate_step(&mut b, 1, "k", now));
+    }
+}
+
+#[cfg(test)]
+mod heartbeat_metrics_tests {
+    use super::metrics_batch_acknowledged;
+
+    #[test]
+    fn metrics_batch_requires_matching_ack_when_present() {
+        assert!(metrics_batch_acknowledged(
+            &serde_json::json!({"metrics_batch_accepted": "batch-1"}),
+            "batch-1"
+        ));
+        assert!(!metrics_batch_acknowledged(
+            &serde_json::json!({"metrics_batch_accepted": "batch-other"}),
+            "batch-1"
+        ));
+    }
+
+    #[test]
+    fn legacy_success_without_ack_is_accepted() {
+        assert!(metrics_batch_acknowledged(
+            &serde_json::json!({"ok": true}),
+            "batch-1"
+        ));
     }
 }
 
