@@ -419,6 +419,9 @@ pub struct NodeConfig {
     /// Phase 2 mesh (ADR-009/022). When `true`, serve() gossips peers and exposes
     /// POST /v1/peers. Default false.
     pub enable_mesh: bool,
+    /// Admission policy for every peer learned through bootstrap or gossip.
+    /// Public is the compatibility default; restricted policy is explicit.
+    pub peer_admission: crate::peer_manager::PeerAdmissionMode,
     /// When `true`, serve() exposes POST /v1/relay to forward tasks to peers learned
     /// via gossip (ADR-022). Requires `enable_mesh`. Default false.
     pub relay_capable: bool,
@@ -495,6 +498,7 @@ impl NodeConfig {
             availability_windows: Vec::new(),
             enable_idempotency: false,
             enable_mesh: false,
+            peer_admission: crate::peer_manager::PeerAdmissionMode::Public,
             relay_capable: false,
             relay_accept_port: 9485,
             relay_worker_endpoint: None,
@@ -728,31 +732,27 @@ async fn peers_endpoint(
     let sig = headers
         .get("x-iicp-signature")
         .and_then(|v| v.to_str().ok());
-    if !state.peer_manager.verify_exchange(&body, sig) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error":{"code":"IICP-E012","message":"invalid_signature"}})),
-        )
-            .into_response();
-    }
-    if let Ok(parsed) = serde_json::from_slice::<Value>(&body) {
-        if let Some(arr) = parsed.get("known_peers").and_then(Value::as_array) {
-            let dicts: Vec<Value> = arr.iter().filter(|p| p.is_object()).cloned().collect();
-            state.peer_manager.merge_peers(&dicts);
+    let incoming = match state.peer_manager.verify_and_extract_exchange(&body, sig) {
+        Ok(incoming) => incoming,
+        Err(reason) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"error":{"code":"IICP-E012","message":reason}})),
+            )
+                .into_response();
         }
-    }
+    };
+    let dicts: Vec<Value> = incoming
+        .iter()
+        .filter(|peer| peer.is_object())
+        .cloned()
+        .collect();
+    state.peer_manager.merge_peers(&dicts);
     let peers: Vec<Value> = state
         .peer_manager
         .get_peers()
         .iter()
-        .map(|p| {
-            json!({
-                "node_id": p.node_id,
-                "endpoint": p.endpoint,
-                "region": p.region,
-                "last_seen": p.last_seen,
-            })
-        })
+        .map(crate::peer_manager::PeerInfo::to_response_value)
         .collect();
     Json(json!({ "peers": peers })).into_response()
 }
@@ -2445,6 +2445,7 @@ impl IicpNode {
                 crate::peer_manager::PeerManagerOpts {
                     relay_capable: self.cfg.relay_capable,
                     relay_accept_port: self.cfg.relay_accept_port,
+                    admission: self.cfg.peer_admission.clone(),
                 },
             )),
             http: self.http.clone(),

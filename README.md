@@ -679,3 +679,9 @@ Precedence is `CLI > environment > configuration file > preset/default`.
 runtime startup. Portable configuration contains typed secret references, not
 node tokens, HMAC keys, enrollment tokens or private keys. The committed schema
 is `schemas/runtime-config-v1.schema.json`.
+
+Restricted peer admission is a separate, fail-closed layer for private and
+federated-private modes. It verifies per-peer membership rather than treating
+directory selection or gossip introduction as authority. See
+[`docs/RESTRICTED_PEER_ADMISSION.md`](docs/RESTRICTED_PEER_ADMISSION.md) for the
+secret-reference boundary, refusal behavior and current limitations.

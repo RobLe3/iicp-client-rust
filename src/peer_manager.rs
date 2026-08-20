@@ -9,8 +9,9 @@
 //! Thread-safe: the gossip task and axum handlers share the peer store via a Mutex.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -18,6 +19,7 @@ use sha2::{Digest, Sha256};
 const GOSSIP_INTERVAL: Duration = Duration::from_secs(30);
 const PEER_EXPIRY: Duration = Duration::from_secs(90);
 const BOOTSTRAP_LIMIT: u32 = 5;
+const MAX_REPLAY_IDS: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PeerInfo {
@@ -30,6 +32,42 @@ pub struct PeerInfo {
     pub relay_capable: bool,
     pub relay_accept_port: u16,
     pub relay_load: f64,
+    /// Present only after restricted-domain admission succeeds.
+    pub trust_domain_id: Option<String>,
+    pub membership_generation: Option<u64>,
+    pub membership_expires_at: Option<u64>,
+    pub membership: Option<crate::restricted_membership::MembershipEnvelope>,
+}
+
+impl PeerInfo {
+    pub fn to_response_value(&self) -> Value {
+        let mut value = serde_json::json!({
+            "node_id": self.node_id,
+            "endpoint": self.endpoint,
+            "region": self.region,
+            "last_seen": self.last_seen,
+        });
+        if let Some(membership) = &self.membership {
+            value["membership"] = serde_json::to_value(membership).unwrap_or(Value::Null);
+        }
+        value
+    }
+
+    pub fn to_gossip_value(&self) -> Value {
+        let mut value = serde_json::json!({
+            "node_id": self.node_id,
+            "endpoint": self.endpoint,
+            "region": self.region,
+            "last_seen": self.last_seen,
+            "relay_capable": self.relay_capable,
+            "relay_accept_port": self.relay_accept_port,
+            "relay_load": self.relay_load,
+        });
+        if let Some(membership) = &self.membership {
+            value["membership"] = serde_json::to_value(membership).unwrap_or(Value::Null);
+        }
+        value
+    }
 }
 
 /// R3: result of relay election — elected peer + derived relay accept address.
@@ -41,9 +79,47 @@ pub struct ElectedRelay {
 }
 
 /// Options for PeerManager constructor (R3 relay capability).
+#[derive(Clone, Default)]
+pub enum PeerAdmissionMode {
+    #[default]
+    Public,
+    Restricted(Box<RestrictedPeerAdmission>),
+}
+
+#[derive(Clone)]
+pub struct RestrictedLocalIdentity {
+    pub membership: crate::restricted_membership::MembershipEnvelope,
+    pub signing_seed: [u8; 32],
+}
+
+#[derive(Clone)]
+pub struct RestrictedPeerAdmission {
+    pub policy: crate::restricted_membership::MembershipPolicy,
+    pub directory_membership_bearer: String,
+    pub local: Option<RestrictedLocalIdentity>,
+}
+
+impl std::fmt::Debug for PeerAdmissionMode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Public => formatter.write_str("Public"),
+            Self::Restricted(restricted) => formatter
+                .debug_struct("Restricted")
+                .field("policy", &restricted.policy)
+                .field("local_identity_configured", &restricted.local.is_some())
+                .field(
+                    "directory_membership_configured",
+                    &!restricted.directory_membership_bearer.is_empty(),
+                )
+                .finish(),
+        }
+    }
+}
+
 pub struct PeerManagerOpts {
     pub relay_capable: bool,
     pub relay_accept_port: u16,
+    pub admission: PeerAdmissionMode,
 }
 
 impl Default for PeerManagerOpts {
@@ -51,6 +127,7 @@ impl Default for PeerManagerOpts {
         Self {
             relay_capable: false,
             relay_accept_port: 9485,
+            admission: PeerAdmissionMode::Public,
         }
     }
 }
@@ -63,7 +140,10 @@ pub struct PeerManager {
     own_endpoint: Mutex<String>,
     own_relay_capable: bool,
     own_relay_accept_port: u16,
+    admission: PeerAdmissionMode,
+    minimum_generation: AtomicU64,
     peers: Mutex<HashMap<String, PeerInfo>>,
+    replay_ids: Mutex<HashMap<String, u64>>,
     client: reqwest::Client,
 }
 
@@ -77,6 +157,10 @@ impl PeerManager {
         node_token: impl Into<String>,
         opts: PeerManagerOpts,
     ) -> Self {
+        let minimum_generation = match &opts.admission {
+            PeerAdmissionMode::Public => 0,
+            PeerAdmissionMode::Restricted(restricted) => restricted.policy.minimum_generation,
+        };
         Self {
             directory_url: directory_url.into().trim_end_matches('/').to_string(),
             node_token: node_token.into(),
@@ -84,12 +168,16 @@ impl PeerManager {
             own_endpoint: Mutex::new(String::new()),
             own_relay_capable: opts.relay_capable,
             own_relay_accept_port: opts.relay_accept_port,
+            admission: opts.admission,
+            minimum_generation: AtomicU64::new(minimum_generation),
             peers: Mutex::new(HashMap::new()),
+            replay_ids: Mutex::new(HashMap::new()),
             client: reqwest::Client::new(),
         }
     }
 
     pub fn get_peers(&self) -> Vec<PeerInfo> {
+        self.prune();
         self.peers
             .lock()
             .expect("peers lock")
@@ -99,11 +187,35 @@ impl PeerManager {
     }
 
     pub fn relay_target(&self, node_id: &str) -> Option<PeerInfo> {
+        self.prune();
         self.peers.lock().expect("peers lock").get(node_id).cloned()
+    }
+
+    /// Advance the trusted membership generation and immediately remove stale
+    /// direct and relay candidates. Generations never move backwards.
+    pub fn update_minimum_generation(&self, generation: u64) -> usize {
+        self.minimum_generation
+            .fetch_max(generation, Ordering::SeqCst);
+        let minimum = self.minimum_generation.load(Ordering::SeqCst);
+        let mut peers = self.peers.lock().expect("peers lock");
+        let before = peers.len();
+        peers.retain(|_, peer| {
+            peer.membership_generation
+                .is_none_or(|peer_generation| peer_generation >= minimum)
+        });
+        before - peers.len()
     }
 
     /// Merge incoming peer entries. Returns the count of newly added peers.
     pub fn merge_peers(&self, incoming: &[Value]) -> usize {
+        self.merge_peers_for_scope(incoming, "peers")
+    }
+
+    fn merge_peers_for_scope(&self, incoming: &[Value], scope: &str) -> usize {
+        self.merge_peers_at(incoming, scope, unix_time())
+    }
+
+    fn merge_peers_at(&self, incoming: &[Value], scope: &str, epoch: u64) -> usize {
         let own = self.own_id.lock().expect("own_id lock").clone();
         let now = Instant::now();
         let mut peers = self.peers.lock().expect("peers lock");
@@ -113,6 +225,36 @@ impl PeerManager {
             if nid.is_empty() || nid == own {
                 continue;
             }
+            if matches!(self.admission, PeerAdmissionMode::Restricted(_))
+                && !valid_restricted_peer(p)
+            {
+                continue;
+            }
+            let membership = match &self.admission {
+                PeerAdmissionMode::Public => None,
+                PeerAdmissionMode::Restricted(restricted) => {
+                    let mut policy = restricted.policy.clone();
+                    policy.minimum_generation = policy
+                        .minimum_generation
+                        .max(self.minimum_generation.load(Ordering::SeqCst));
+                    let Some(value) = p.get("membership") else {
+                        continue;
+                    };
+                    let Ok(envelope) = serde_json::from_value::<
+                        crate::restricted_membership::MembershipEnvelope,
+                    >(value.clone()) else {
+                        continue;
+                    };
+                    if crate::restricted_membership::verify_membership(
+                        &envelope, &policy, nid, scope, epoch,
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    Some(envelope)
+                }
+            };
             if !peers.contains_key(nid) {
                 added += 1;
             }
@@ -145,14 +287,85 @@ impl PeerManager {
                         .and_then(Value::as_u64)
                         .unwrap_or(9485) as u16,
                     relay_load: p.get("relay_load").and_then(Value::as_f64).unwrap_or(0.0),
+                    trust_domain_id: membership
+                        .as_ref()
+                        .map(|value| value.assertion.domain_id.clone()),
+                    membership_generation: membership
+                        .as_ref()
+                        .map(|value| value.assertion.generation),
+                    membership_expires_at: membership
+                        .as_ref()
+                        .map(|value| value.assertion.expires_at),
+                    membership,
                 },
             );
         }
         added
     }
 
+    /// Verify one complete gossip request and return only its advertised peers.
+    /// Restricted mode never falls back to the legacy HMAC or tokenless path.
+    pub fn verify_and_extract_exchange(
+        &self,
+        body: &[u8],
+        signature: Option<&str>,
+    ) -> Result<Vec<Value>, &'static str> {
+        match &self.admission {
+            PeerAdmissionMode::Public => {
+                if !self.verify_exchange(body, signature) {
+                    return Err("invalid_signature");
+                }
+                extract_known_peers(body).ok_or("malformed_exchange")
+            }
+            PeerAdmissionMode::Restricted(restricted) => {
+                let mut policy = restricted.policy.clone();
+                policy.minimum_generation = policy
+                    .minimum_generation
+                    .max(self.minimum_generation.load(Ordering::SeqCst));
+                let parsed: Value =
+                    serde_json::from_slice(body).map_err(|_| "malformed_exchange")?;
+                let membership = serde_json::from_value(parsed["membership"].clone())
+                    .map_err(|_| "membership_malformed")?;
+                let gossip: crate::restricted_membership::GossipEnvelope =
+                    serde_json::from_value(parsed["gossip"].clone())
+                        .map_err(|_| "gossip_malformed")?;
+                let peers = parsed["known_peers"]
+                    .as_array()
+                    .cloned()
+                    .ok_or("malformed_exchange")?;
+                let payload = serde_jcs::to_vec(&serde_json::json!({"known_peers": peers}))
+                    .map_err(|_| "malformed_exchange")?;
+                crate::restricted_membership::verify_gossip(
+                    &gossip,
+                    &membership,
+                    &policy,
+                    &payload,
+                    unix_time(),
+                    false,
+                )
+                .map_err(crate::restricted_membership::MembershipRefusal::code)?;
+                let now = unix_time();
+                let mut replay_ids = self.replay_ids.lock().expect("replay lock");
+                replay_ids.retain(|_, expires_at| *expires_at > now);
+                if replay_ids.contains_key(&gossip.proof.replay_id) {
+                    return Err(
+                        crate::restricted_membership::MembershipRefusal::ReplayDetected.code(),
+                    );
+                }
+                if replay_ids.len() >= MAX_REPLAY_IDS {
+                    return Err(
+                        crate::restricted_membership::MembershipRefusal::ReplayCapacity.code(),
+                    );
+                }
+                replay_ids.insert(gossip.proof.replay_id, membership.assertion.expires_at);
+                Ok(peers)
+            }
+        }
+    }
+
     /// R3: return relay-capable peers for relay election.
     pub fn get_relay_candidates(&self) -> Vec<PeerInfo> {
+        self.prune();
         self.peers
             .lock()
             .expect("peers lock")
@@ -216,14 +429,23 @@ impl PeerManager {
     /// Drop peers not contacted within the expiry window. Returns count pruned.
     pub fn prune(&self) -> usize {
         let now = Instant::now();
+        let epoch = unix_time();
         let mut peers = self.peers.lock().expect("peers lock");
         let before = peers.len();
-        peers.retain(|_, p| now.duration_since(p.last_contact) < PEER_EXPIRY);
+        peers.retain(|_, p| {
+            now.duration_since(p.last_contact) < PEER_EXPIRY
+                && p.membership_expires_at
+                    .is_none_or(|expires| expires > epoch)
+        });
         before - peers.len()
     }
 
-    /// Verify an inbound /v1/peers HMAC signature. No token configured → accept.
+    /// Verify a public-mode inbound /v1/peers HMAC signature. Restricted mode
+    /// always rejects this compatibility path.
     pub fn verify_exchange(&self, body: &[u8], signature: Option<&str>) -> bool {
+        if matches!(self.admission, PeerAdmissionMode::Restricted(_)) {
+            return false;
+        }
         if self.node_token.is_empty() {
             return true;
         }
@@ -260,18 +482,27 @@ impl PeerManager {
 
     async fn bootstrap(&self) {
         let url = format!("{}/v1/bootstrap", self.directory_url);
-        if let Ok(resp) = self
+        let mut request = self
             .client
             .get(&url)
             .query(&[("limit", BOOTSTRAP_LIMIT)])
-            .timeout(Duration::from_secs(5))
-            .send()
-            .await
-        {
+            .timeout(Duration::from_secs(5));
+        if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
+            let Some(local) = &restricted.local else {
+                return;
+            };
+            if restricted.directory_membership_bearer.is_empty() {
+                return;
+            }
+            request = request
+                .header("X-IICP-Membership", &restricted.directory_membership_bearer)
+                .header("X-IICP-Subject-Id", &local.membership.assertion.subject.id);
+        }
+        if let Ok(resp) = request.send().await {
             if resp.status().is_success() {
                 if let Ok(body) = resp.json::<Value>().await {
                     if let Some(arr) = body.get("peers").and_then(Value::as_array) {
-                        self.merge_peers(arr);
+                        self.merge_peers_for_scope(arr, "bootstrap");
                     }
                 }
             }
@@ -287,28 +518,49 @@ impl PeerManager {
             .lock()
             .expect("peers lock")
             .values()
-            .map(|p| {
-                serde_json::json!({
-                    "node_id": p.node_id,
-                    "endpoint": p.endpoint,
-                    "region": p.region,
-                    "relay_capable": p.relay_capable,
-                    "relay_accept_port": p.relay_accept_port,
-                    "relay_load": p.relay_load,
-                })
-            })
+            .map(PeerInfo::to_gossip_value)
             .collect();
         if !own_id.is_empty() {
-            known.push(serde_json::json!({
+            let mut own = serde_json::json!({
                 "node_id": own_id,
                 "endpoint": own_ep,
                 "relay_capable": self.own_relay_capable,
                 "relay_accept_port": self.own_relay_accept_port,
                 "relay_load": 0.0,
-            }));
+            });
+            if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
+                if let Some(local) = &restricted.local {
+                    own["membership"] =
+                        serde_json::to_value(&local.membership).unwrap_or(Value::Null);
+                }
+            }
+            known.push(own);
         }
-        let body =
-            serde_json::to_vec(&serde_json::json!({ "known_peers": known })).unwrap_or_default();
+        let payload = serde_json::json!({ "known_peers": known });
+        let body = match &self.admission {
+            PeerAdmissionMode::Public => serde_json::to_vec(&payload).unwrap_or_default(),
+            PeerAdmissionMode::Restricted(restricted) if restricted.local.is_some() => {
+                let local = restricted.local.as_ref().expect("checked above");
+                let canonical = serde_jcs::to_vec(&payload).unwrap_or_default();
+                let Ok(gossip) = crate::restricted_membership::sign_gossip(
+                    &local.membership,
+                    &local.signing_seed,
+                    &restricted.policy.domain_id,
+                    &canonical,
+                    unix_time(),
+                    uuid::Uuid::new_v4().to_string(),
+                ) else {
+                    return;
+                };
+                serde_json::to_vec(&serde_json::json!({
+                    "known_peers": payload["known_peers"],
+                    "membership": local.membership,
+                    "gossip": gossip,
+                }))
+                .unwrap_or_default()
+            }
+            PeerAdmissionMode::Restricted(_) => return,
+        };
         let url = format!("{}/v1/peers", target.endpoint.trim_end_matches('/'));
         let mut req = self
             .client
@@ -342,10 +594,151 @@ impl PeerManager {
     }
 }
 
+fn unix_time() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn extract_known_peers(body: &[u8]) -> Option<Vec<Value>> {
+    serde_json::from_slice::<Value>(body)
+        .ok()?
+        .get("known_peers")?
+        .as_array()
+        .cloned()
+}
+
+fn valid_restricted_peer(peer: &Value) -> bool {
+    let Some(endpoint) = peer.get("endpoint").and_then(Value::as_str) else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(endpoint) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return false;
+    }
+    if peer
+        .get("relay_accept_port")
+        .and_then(Value::as_u64)
+        .is_some_and(|port| port == 0 || port > u16::MAX.into())
+    {
+        return false;
+    }
+    !peer
+        .get("relay_load")
+        .and_then(Value::as_f64)
+        .is_some_and(|load| !load.is_finite() || load < 0.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+
+    fn issued_membership(
+        authority: &SigningKey,
+        member: &SigningKey,
+        node_id: &str,
+        assertion_id: &str,
+        now: u64,
+    ) -> crate::restricted_membership::MembershipEnvelope {
+        use crate::restricted_membership::{
+            DetachedSignature, MembershipAssertion, MembershipEnvelope, MembershipIssuer,
+            MembershipSubject, MEMBERSHIP_SCHEMA, RESTRICTED_PROFILE,
+        };
+        let assertion = MembershipAssertion {
+            schema: MEMBERSHIP_SCHEMA.into(),
+            profile: RESTRICTED_PROFILE.into(),
+            assertion_id: assertion_id.into(),
+            domain_id: "domain-a".into(),
+            subject: MembershipSubject {
+                kind: "node".into(),
+                id: node_id.into(),
+                key_id: format!("{node_id}#key-1"),
+                public_key_ed25519: URL_SAFE_NO_PAD.encode(member.verifying_key().to_bytes()),
+            },
+            issuer: MembershipIssuer {
+                id: "directory-a".into(),
+                key_id: "directory-a#key-1".into(),
+            },
+            issued_at: now.saturating_sub(1),
+            expires_at: now + 300,
+            generation: 3,
+            scopes: vec!["bootstrap".into(), "peers".into(), "relay".into()],
+            audience: vec!["domain-a".into()],
+        };
+        let mut message = b"IICP-RTD-MEMBERSHIP-V0\n".to_vec();
+        message.extend_from_slice(&serde_jcs::to_vec(&assertion).unwrap());
+        MembershipEnvelope {
+            assertion,
+            signature: DetachedSignature {
+                algorithm: "Ed25519".into(),
+                key_id: None,
+                value: URL_SAFE_NO_PAD.encode(authority.sign(&message).to_bytes()),
+            },
+        }
+    }
+
+    fn policy_for(authority: &SigningKey) -> crate::restricted_membership::MembershipPolicy {
+        crate::restricted_membership::MembershipPolicy {
+            domain_id: "domain-a".into(),
+            authority_id: "directory-a".into(),
+            authority_key_id: "directory-a#key-1".into(),
+            authority_public_key_ed25519: URL_SAFE_NO_PAD
+                .encode(authority.verifying_key().to_bytes()),
+            minimum_generation: 3,
+            maximum_clock_skew_seconds: 60,
+        }
+    }
+
+    fn restricted_pm() -> PeerManager {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/restricted-trust-domain-membership-v0.json"
+        ))
+        .unwrap();
+        let m = PeerManager::with_opts(
+            "https://dir.example/api",
+            "",
+            PeerManagerOpts {
+                relay_capable: false,
+                relay_accept_port: 9485,
+                admission: PeerAdmissionMode::Restricted(Box::new(RestrictedPeerAdmission {
+                    policy: crate::restricted_membership::MembershipPolicy {
+                        domain_id: "domain-test-a".into(),
+                        authority_id: "did:iicp:test:directory-a".into(),
+                        authority_key_id: "did:iicp:test:directory-a#key-1".into(),
+                        authority_public_key_ed25519: fixture["authority_public_key_ed25519"]
+                            .as_str()
+                            .unwrap()
+                            .into(),
+                        minimum_generation: 7,
+                        maximum_clock_skew_seconds: 60,
+                    },
+                    directory_membership_bearer: "test-bearer".into(),
+                    local: None,
+                })),
+            },
+        );
+        *m.own_id.lock().unwrap() = "self".into();
+        m
+    }
+
+    fn valid_membership() -> Value {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/restricted-trust-domain-membership-v0.json"
+        ))
+        .unwrap();
+        fixture["vectors"][0]["envelope"].clone()
+    }
 
     fn pm(token: &str) -> PeerManager {
         let m = PeerManager::new("https://dir.example/api", token);
@@ -403,6 +796,139 @@ mod tests {
         assert!(m.verify_exchange(body, Some(&sig)));
         assert!(!m.verify_exchange(body, Some("deadbeef")));
         assert!(!m.verify_exchange(body, None));
+    }
+
+    #[test]
+    fn restricted_admission_requires_each_peers_own_valid_assertion() {
+        let m = restricted_pm();
+        assert_eq!(
+            m.merge_peers_at(
+                &[json!({
+                    "node_id": "did:iicp:test:node-a",
+                    "endpoint": "https://node-a.example",
+                    "membership": valid_membership(),
+                })],
+                "peers",
+                1_800_000_010
+            ),
+            1
+        );
+        assert_eq!(m.get_peers().len(), 1);
+
+        assert_eq!(
+            m.merge_peers(&[json!({
+                "node_id": "did:iicp:test:node-x",
+                "endpoint": "https://node-x.example",
+            })]),
+            0
+        );
+        assert!(m.relay_target("did:iicp:test:node-x").is_none());
+    }
+
+    #[test]
+    fn restricted_mode_rejects_legacy_hmac_and_tokenless_gossip() {
+        let m = restricted_pm();
+        assert!(!m.verify_exchange(br#"{"known_peers":[]}"#, None));
+        assert!(!m.verify_exchange(br#"{"known_peers":[]}"#, Some("legacy")));
+        assert_eq!(
+            m.verify_and_extract_exchange(br#"{"known_peers":[]}"#, None),
+            Err("membership_malformed")
+        );
+    }
+
+    #[test]
+    fn revocation_generation_immediately_removes_direct_and_relay_eligibility() {
+        let m = restricted_pm();
+        assert_eq!(
+            m.merge_peers_at(
+                &[json!({
+                    "node_id": "did:iicp:test:node-a",
+                    "endpoint": "https://node-a.example",
+                    "relay_capable": true,
+                    "membership": valid_membership(),
+                })],
+                "peers",
+                1_800_000_010,
+            ),
+            1
+        );
+        assert_eq!(m.get_relay_candidates().len(), 1);
+        assert_eq!(m.update_minimum_generation(8), 1);
+        assert!(m.relay_target("did:iicp:test:node-a").is_none());
+        assert!(m.get_relay_candidates().is_empty());
+    }
+
+    #[test]
+    fn authenticated_exchange_is_payload_bound_and_single_use() {
+        let now = unix_time();
+        let authority = SigningKey::from_bytes(&[7u8; 32]);
+        let sender = SigningKey::from_bytes(&[8u8; 32]);
+        let advertised = SigningKey::from_bytes(&[9u8; 32]);
+        let sender_membership = issued_membership(
+            &authority,
+            &sender,
+            "node-sender",
+            "00000000-0000-4000-8000-000000000011",
+            now,
+        );
+        let advertised_membership = issued_membership(
+            &authority,
+            &advertised,
+            "node-advertised",
+            "00000000-0000-4000-8000-000000000012",
+            now,
+        );
+        let payload = json!({
+            "known_peers": [{
+                "node_id": "node-advertised",
+                "endpoint": "https://advertised.example",
+                "membership": advertised_membership,
+            }]
+        });
+        let canonical = serde_jcs::to_vec(&payload).unwrap();
+        let gossip = crate::restricted_membership::sign_gossip(
+            &sender_membership,
+            &[8u8; 32],
+            "domain-a",
+            &canonical,
+            now,
+            "00000000-0000-4000-8000-000000000013".into(),
+        )
+        .unwrap();
+        let body = serde_json::to_vec(&json!({
+            "known_peers": payload["known_peers"],
+            "membership": sender_membership,
+            "gossip": gossip,
+        }))
+        .unwrap();
+        let manager = PeerManager::with_opts(
+            "https://directory.example",
+            "",
+            PeerManagerOpts {
+                relay_capable: false,
+                relay_accept_port: 9485,
+                admission: PeerAdmissionMode::Restricted(Box::new(RestrictedPeerAdmission {
+                    policy: policy_for(&authority),
+                    directory_membership_bearer: "bearer".into(),
+                    local: None,
+                })),
+            },
+        );
+        let peers = manager
+            .verify_and_extract_exchange(&body, None)
+            .expect("first authenticated exchange is accepted");
+        assert_eq!(manager.merge_peers(&peers), 1);
+        assert_eq!(
+            manager.verify_and_extract_exchange(&body, None),
+            Err("gossip_replay")
+        );
+
+        let mut tampered: Value = serde_json::from_slice(&body).unwrap();
+        tampered["known_peers"][0]["endpoint"] = json!("https://evil.example");
+        assert_eq!(
+            manager.verify_and_extract_exchange(&serde_json::to_vec(&tampered).unwrap(), None),
+            Err("gossip_payload_mismatch")
+        );
     }
 
     // ── R3: relay election tests ─────────────────────────────────────────────
