@@ -38,6 +38,13 @@ fn fixture() -> Fixture {
     .expect("fixture parses")
 }
 
+fn bootstrap_fixture() -> serde_json::Value {
+    serde_json::from_str(include_str!(
+        "fixtures/restricted-trust-domain-bootstrap-v0.json"
+    ))
+    .expect("bootstrap fixture parses")
+}
+
 fn policy(fixture: &Fixture) -> MembershipPolicy {
     MembershipPolicy {
         domain_id: "domain-test-a".into(),
@@ -124,5 +131,34 @@ fn stale_generation_and_missing_scope_fail_closed() {
             1_800_000_010,
         ),
         Err(MembershipRefusal::MissingScope)
+    );
+}
+
+#[test]
+fn bootstrap_vectors_preserve_public_compatibility_and_revocation_boundaries() {
+    let fixture = bootstrap_fixture();
+    let vectors = fixture["vectors"].as_array().expect("vectors array");
+    let public = vectors
+        .iter()
+        .find(|vector| vector["id"] == "public-legacy-peer-remains-compatible")
+        .expect("public compatibility vector");
+    assert!(public["response"]["peers"][0]
+        .get("membership_vector")
+        .is_none());
+
+    let missing = vectors
+        .iter()
+        .find(|vector| vector["id"] == "restricted-membership-missing")
+        .expect("missing-membership vector");
+    assert_eq!(missing["expected"]["reason"], "membership_missing");
+
+    let partial = vectors
+        .iter()
+        .find(|vector| vector["id"] == "restricted-partial-response-does-not-evict")
+        .expect("partial-response vector");
+    assert_eq!(partial["expected"]["evicted"], serde_json::json!([]));
+    assert_eq!(
+        partial["expected"]["reason"],
+        "partial_absence_is_not_revocation"
     );
 }

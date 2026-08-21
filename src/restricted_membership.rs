@@ -116,18 +116,10 @@ impl RestrictedPeerBundle {
             "peers",
             now,
         )?;
-        let bytes = URL_SAFE_NO_PAD
-            .decode(self.signing_seed_ed25519)
-            .map_err(|_| MembershipRefusal::MalformedEvidence)?;
-        let signing_seed: [u8; 32] = bytes
-            .try_into()
-            .map_err(|_| MembershipRefusal::MalformedEvidence)?;
-        let signing_key = SigningKey::from_bytes(&signing_seed);
-        if URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes())
-            != self.membership.assertion.subject.public_key_ed25519
-        {
-            return Err(MembershipRefusal::WrongSubject);
-        }
+        let signing_seed = signing_seed(
+            &self.signing_seed_ed25519,
+            &self.membership.assertion.subject.public_key_ed25519,
+        )?;
         Ok(crate::peer_manager::PeerAdmissionMode::Restricted(
             Box::new(crate::peer_manager::RestrictedPeerAdmission {
                 policy: self.policy,
@@ -139,6 +131,20 @@ impl RestrictedPeerBundle {
             }),
         ))
     }
+}
+
+fn signing_seed(value: &str, expected_public_key: &str) -> Result<[u8; 32], MembershipRefusal> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| MembershipRefusal::MalformedEvidence)?;
+    let seed = bytes
+        .try_into()
+        .map_err(|_| MembershipRefusal::MalformedEvidence)?;
+    let signing_key = SigningKey::from_bytes(&seed);
+    if URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes()) != expected_public_key {
+        return Err(MembershipRefusal::WrongSubject);
+    }
+    Ok(seed)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,24 +196,71 @@ pub fn verify_membership(
     now: u64,
 ) -> Result<(), MembershipRefusal> {
     let assertion = &envelope.assertion;
+    validate_membership_shape(assertion)?;
+    validate_membership_identity(envelope, policy, expected_subject)?;
+    validate_membership_lifecycle(assertion, policy, required_scope, now)?;
+    verify_membership_signature(envelope, policy)
+}
+
+fn validate_membership_shape(assertion: &MembershipAssertion) -> Result<(), MembershipRefusal> {
     if uuid::Uuid::parse_str(&assertion.assertion_id).is_err()
         || assertion.domain_id.trim().is_empty()
         || assertion.subject.id.trim().is_empty()
         || assertion.subject.key_id.trim().is_empty()
-        || assertion.issuer.id.trim().is_empty()
-        || assertion.issuer.key_id.trim().is_empty()
-        || assertion.audience.is_empty()
+    {
+        return Err(MembershipRefusal::MalformedEvidence);
+    }
+    validate_membership_collections(assertion)
+}
+
+fn validate_membership_collections(
+    assertion: &MembershipAssertion,
+) -> Result<(), MembershipRefusal> {
+    validate_membership_issuer(assertion)?;
+    if assertion.audience.is_empty()
         || assertion.scopes.is_empty()
         || assertion.expires_at <= assertion.issued_at
     {
         return Err(MembershipRefusal::MalformedEvidence);
     }
-    if assertion.schema != MEMBERSHIP_SCHEMA
-        || assertion.profile != RESTRICTED_PROFILE
+    Ok(())
+}
+
+fn validate_membership_issuer(assertion: &MembershipAssertion) -> Result<(), MembershipRefusal> {
+    if assertion.issuer.id.trim().is_empty() || assertion.issuer.key_id.trim().is_empty() {
+        return Err(MembershipRefusal::MalformedEvidence);
+    }
+    Ok(())
+}
+
+fn validate_membership_identity(
+    envelope: &MembershipEnvelope,
+    policy: &MembershipPolicy,
+    expected_subject: &str,
+) -> Result<(), MembershipRefusal> {
+    let assertion = &envelope.assertion;
+    validate_membership_format(envelope)?;
+    validate_membership_authority(assertion, policy)?;
+    if assertion.subject.kind != "node" || assertion.subject.id != expected_subject {
+        return Err(MembershipRefusal::WrongSubject);
+    }
+    Ok(())
+}
+
+fn validate_membership_format(envelope: &MembershipEnvelope) -> Result<(), MembershipRefusal> {
+    if envelope.assertion.schema != MEMBERSHIP_SCHEMA
+        || envelope.assertion.profile != RESTRICTED_PROFILE
         || envelope.signature.algorithm != "Ed25519"
     {
         return Err(MembershipRefusal::UnsupportedEvidence);
     }
+    Ok(())
+}
+
+fn validate_membership_authority(
+    assertion: &MembershipAssertion,
+    policy: &MembershipPolicy,
+) -> Result<(), MembershipRefusal> {
     if assertion.issuer.id != policy.authority_id
         || assertion.issuer.key_id != policy.authority_key_id
     {
@@ -221,26 +274,55 @@ pub fn verify_membership(
     {
         return Err(MembershipRefusal::WrongDomain);
     }
-    if assertion.subject.kind != "node" || assertion.subject.id != expected_subject {
-        return Err(MembershipRefusal::WrongSubject);
+    Ok(())
+}
+
+fn validate_membership_lifecycle(
+    assertion: &MembershipAssertion,
+    policy: &MembershipPolicy,
+    required_scope: &str,
+    now: u64,
+) -> Result<(), MembershipRefusal> {
+    validate_membership_time(assertion, policy, now)?;
+    validate_membership_generation(assertion, policy)?;
+    if !assertion.scopes.iter().any(|scope| scope == required_scope) {
+        return Err(MembershipRefusal::MissingScope);
     }
+    Ok(())
+}
+
+fn validate_membership_time(
+    assertion: &MembershipAssertion,
+    policy: &MembershipPolicy,
+    now: u64,
+) -> Result<(), MembershipRefusal> {
     if assertion.issued_at > now.saturating_add(policy.maximum_clock_skew_seconds) {
         return Err(MembershipRefusal::NotYetValid);
     }
     if assertion.expires_at <= now {
         return Err(MembershipRefusal::Expired);
     }
+    Ok(())
+}
+
+fn validate_membership_generation(
+    assertion: &MembershipAssertion,
+    policy: &MembershipPolicy,
+) -> Result<(), MembershipRefusal> {
     if assertion.generation < policy.minimum_generation {
         return Err(MembershipRefusal::RevokedGeneration);
     }
-    if !assertion.scopes.iter().any(|scope| scope == required_scope) {
-        return Err(MembershipRefusal::MissingScope);
-    }
+    Ok(())
+}
 
+fn verify_membership_signature(
+    envelope: &MembershipEnvelope,
+    policy: &MembershipPolicy,
+) -> Result<(), MembershipRefusal> {
     let key = verifying_key(&policy.authority_public_key_ed25519)?;
     let signature = signature(&envelope.signature.value)?;
     let canonical =
-        serde_jcs::to_vec(assertion).map_err(|_| MembershipRefusal::MalformedEvidence)?;
+        serde_jcs::to_vec(&envelope.assertion).map_err(|_| MembershipRefusal::MalformedEvidence)?;
     let mut message = Vec::with_capacity(MEMBERSHIP_DOMAIN.len() + canonical.len());
     message.extend_from_slice(MEMBERSHIP_DOMAIN);
     message.extend_from_slice(&canonical);
@@ -256,24 +338,61 @@ pub fn verify_gossip(
     now: u64,
     replay_seen: bool,
 ) -> Result<(), MembershipRefusal> {
+    verify_membership(membership, policy, &gossip.proof.sender_id, "peers", now)?;
+    validate_gossip_identity(gossip, membership, policy, replay_seen)?;
+    validate_gossip_freshness_and_payload(gossip, policy, payload, now)?;
+    verify_gossip_signature(gossip, membership)
+}
+
+fn validate_gossip_identity(
+    gossip: &GossipEnvelope,
+    membership: &MembershipEnvelope,
+    policy: &MembershipPolicy,
+    replay_seen: bool,
+) -> Result<(), MembershipRefusal> {
     if uuid::Uuid::parse_str(&gossip.proof.replay_id).is_err() {
         return Err(MembershipRefusal::MalformedEvidence);
     }
-    verify_membership(membership, policy, &gossip.proof.sender_id, "peers", now)?;
+    validate_gossip_format(gossip, membership)?;
+    validate_gossip_binding(gossip, membership, policy)?;
+    if replay_seen {
+        return Err(MembershipRefusal::ReplayDetected);
+    }
+    Ok(())
+}
+
+fn validate_gossip_format(
+    gossip: &GossipEnvelope,
+    membership: &MembershipEnvelope,
+) -> Result<(), MembershipRefusal> {
     if gossip.signature.algorithm != "Ed25519"
         || gossip.signature.key_id.as_deref() != Some(&membership.assertion.subject.key_id)
     {
         return Err(MembershipRefusal::UnsupportedEvidence);
     }
+    Ok(())
+}
+
+fn validate_gossip_binding(
+    gossip: &GossipEnvelope,
+    membership: &MembershipEnvelope,
+    policy: &MembershipPolicy,
+) -> Result<(), MembershipRefusal> {
     if gossip.proof.domain_id != policy.domain_id {
         return Err(MembershipRefusal::WrongDomain);
     }
     if gossip.proof.membership_assertion_id != membership.assertion.assertion_id {
         return Err(MembershipRefusal::WrongSubject);
     }
-    if replay_seen {
-        return Err(MembershipRefusal::ReplayDetected);
-    }
+    Ok(())
+}
+
+fn validate_gossip_freshness_and_payload(
+    gossip: &GossipEnvelope,
+    policy: &MembershipPolicy,
+    payload: &[u8],
+    now: u64,
+) -> Result<(), MembershipRefusal> {
     if gossip.proof.sent_at > now.saturating_add(policy.maximum_clock_skew_seconds)
         || now.saturating_sub(gossip.proof.sent_at) > policy.maximum_clock_skew_seconds
     {
@@ -283,7 +402,13 @@ pub fn verify_gossip(
     if digest != gossip.proof.payload_sha256 {
         return Err(MembershipRefusal::InvalidPayloadBinding);
     }
+    Ok(())
+}
 
+fn verify_gossip_signature(
+    gossip: &GossipEnvelope,
+    membership: &MembershipEnvelope,
+) -> Result<(), MembershipRefusal> {
     let key = verifying_key(&membership.assertion.subject.public_key_ed25519)?;
     let signature = signature(&gossip.signature.value)?;
     let canonical =

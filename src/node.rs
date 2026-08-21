@@ -732,7 +732,7 @@ async fn peers_endpoint(
     let sig = headers
         .get("x-iicp-signature")
         .and_then(|v| v.to_str().ok());
-    let incoming = match state.peer_manager.verify_and_extract_exchange(&body, sig) {
+    let dicts = match verified_peer_dicts(&state.peer_manager, &body, sig) {
         Ok(incoming) => incoming,
         Err(reason) => {
             return (
@@ -742,11 +742,6 @@ async fn peers_endpoint(
                 .into_response();
         }
     };
-    let dicts: Vec<Value> = incoming
-        .iter()
-        .filter(|peer| peer.is_object())
-        .cloned()
-        .collect();
     state.peer_manager.merge_peers(&dicts);
     let peers: Vec<Value> = state
         .peer_manager
@@ -755,6 +750,18 @@ async fn peers_endpoint(
         .map(crate::peer_manager::PeerInfo::to_response_value)
         .collect();
     Json(json!({ "peers": peers })).into_response()
+}
+
+fn verified_peer_dicts(
+    peer_manager: &crate::peer_manager::PeerManager,
+    body: &[u8],
+    signature: Option<&str>,
+) -> std::result::Result<Vec<Value>, &'static str> {
+    Ok(peer_manager
+        .verify_and_extract_exchange(body, signature)?
+        .into_iter()
+        .filter(Value::is_object)
+        .collect())
 }
 
 // ── POST /v1/relay (ADR-022 mesh relay) ───────────────────────────────────────

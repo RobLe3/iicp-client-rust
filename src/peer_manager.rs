@@ -225,82 +225,51 @@ impl PeerManager {
             if nid.is_empty() || nid == own {
                 continue;
             }
-            if matches!(self.admission, PeerAdmissionMode::Restricted(_))
-                && !valid_restricted_peer(p)
-            {
+            let Some(membership) = self.admitted_membership(p, nid, scope, epoch) else {
                 continue;
-            }
-            let membership = match &self.admission {
-                PeerAdmissionMode::Public => None,
-                PeerAdmissionMode::Restricted(restricted) => {
-                    let mut policy = restricted.policy.clone();
-                    policy.minimum_generation = policy
-                        .minimum_generation
-                        .max(self.minimum_generation.load(Ordering::SeqCst));
-                    let Some(value) = p.get("membership") else {
-                        continue;
-                    };
-                    let Ok(envelope) = serde_json::from_value::<
-                        crate::restricted_membership::MembershipEnvelope,
-                    >(value.clone()) else {
-                        continue;
-                    };
-                    if crate::restricted_membership::verify_membership(
-                        &envelope, &policy, nid, scope, epoch,
-                    )
-                    .is_err()
-                    {
-                        continue;
-                    }
-                    Some(envelope)
-                }
             };
             if !peers.contains_key(nid) {
                 added += 1;
             }
-            peers.insert(
-                nid.to_string(),
-                PeerInfo {
-                    node_id: nid.to_string(),
-                    endpoint: p
-                        .get("endpoint")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    region: p
-                        .get("region")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    last_seen: p
-                        .get("last_seen")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    last_contact: now,
-                    relay_capable: p
-                        .get("relay_capable")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    relay_accept_port: p
-                        .get("relay_accept_port")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(9485) as u16,
-                    relay_load: p.get("relay_load").and_then(Value::as_f64).unwrap_or(0.0),
-                    trust_domain_id: membership
-                        .as_ref()
-                        .map(|value| value.assertion.domain_id.clone()),
-                    membership_generation: membership
-                        .as_ref()
-                        .map(|value| value.assertion.generation),
-                    membership_expires_at: membership
-                        .as_ref()
-                        .map(|value| value.assertion.expires_at),
-                    membership,
-                },
-            );
+            peers.insert(nid.to_string(), peer_info(p, nid, membership, now));
         }
         added
+    }
+
+    fn admitted_membership(
+        &self,
+        peer: &Value,
+        node_id: &str,
+        scope: &str,
+        epoch: u64,
+    ) -> Option<Option<crate::restricted_membership::MembershipEnvelope>> {
+        match &self.admission {
+            PeerAdmissionMode::Public => Some(None),
+            PeerAdmissionMode::Restricted(restricted) => self
+                .verified_restricted_membership(peer, node_id, scope, epoch, restricted)
+                .map(Some),
+        }
+    }
+
+    fn verified_restricted_membership(
+        &self,
+        peer: &Value,
+        node_id: &str,
+        scope: &str,
+        epoch: u64,
+        restricted: &RestrictedPeerAdmission,
+    ) -> Option<crate::restricted_membership::MembershipEnvelope> {
+        if !valid_restricted_peer(peer) {
+            return None;
+        }
+        let mut policy = restricted.policy.clone();
+        policy.minimum_generation = policy
+            .minimum_generation
+            .max(self.minimum_generation.load(Ordering::SeqCst));
+        let envelope = serde_json::from_value(peer.get("membership")?.clone()).ok()?;
+        crate::restricted_membership::verify_membership(&envelope, &policy, node_id, scope, epoch)
+            .ok()?;
+        Some(envelope)
     }
 
     /// Verify one complete gossip request and return only its advertised peers.
@@ -318,49 +287,46 @@ impl PeerManager {
                 extract_known_peers(body).ok_or("malformed_exchange")
             }
             PeerAdmissionMode::Restricted(restricted) => {
-                let mut policy = restricted.policy.clone();
-                policy.minimum_generation = policy
-                    .minimum_generation
-                    .max(self.minimum_generation.load(Ordering::SeqCst));
-                let parsed: Value =
-                    serde_json::from_slice(body).map_err(|_| "malformed_exchange")?;
-                let membership = serde_json::from_value(parsed["membership"].clone())
-                    .map_err(|_| "membership_malformed")?;
-                let gossip: crate::restricted_membership::GossipEnvelope =
-                    serde_json::from_value(parsed["gossip"].clone())
-                        .map_err(|_| "gossip_malformed")?;
-                let peers = parsed["known_peers"]
-                    .as_array()
-                    .cloned()
-                    .ok_or("malformed_exchange")?;
-                let payload = serde_jcs::to_vec(&serde_json::json!({"known_peers": peers}))
-                    .map_err(|_| "malformed_exchange")?;
-                crate::restricted_membership::verify_gossip(
-                    &gossip,
-                    &membership,
-                    &policy,
-                    &payload,
-                    unix_time(),
-                    false,
-                )
-                .map_err(crate::restricted_membership::MembershipRefusal::code)?;
-                let now = unix_time();
-                let mut replay_ids = self.replay_ids.lock().expect("replay lock");
-                replay_ids.retain(|_, expires_at| *expires_at > now);
-                if replay_ids.contains_key(&gossip.proof.replay_id) {
-                    return Err(
-                        crate::restricted_membership::MembershipRefusal::ReplayDetected.code(),
-                    );
-                }
-                if replay_ids.len() >= MAX_REPLAY_IDS {
-                    return Err(
-                        crate::restricted_membership::MembershipRefusal::ReplayCapacity.code(),
-                    );
-                }
-                replay_ids.insert(gossip.proof.replay_id, membership.assertion.expires_at);
-                Ok(peers)
+                self.verify_restricted_exchange(body, restricted)
             }
         }
+    }
+
+    fn verify_restricted_exchange(
+        &self,
+        body: &[u8],
+        restricted: &RestrictedPeerAdmission,
+    ) -> Result<Vec<Value>, &'static str> {
+        let mut policy = restricted.policy.clone();
+        policy.minimum_generation = policy
+            .minimum_generation
+            .max(self.minimum_generation.load(Ordering::SeqCst));
+        let (membership, gossip, peers, payload) = parse_restricted_exchange(body)?;
+        crate::restricted_membership::verify_gossip(
+            &gossip,
+            &membership,
+            &policy,
+            &payload,
+            unix_time(),
+            false,
+        )
+        .map_err(crate::restricted_membership::MembershipRefusal::code)?;
+        self.record_replay(&gossip.proof.replay_id, membership.assertion.expires_at)?;
+        Ok(peers)
+    }
+
+    fn record_replay(&self, replay_id: &str, expires_at: u64) -> Result<(), &'static str> {
+        let now = unix_time();
+        let mut replay_ids = self.replay_ids.lock().expect("replay lock");
+        replay_ids.retain(|_, expiry| *expiry > now);
+        if replay_ids.contains_key(replay_id) {
+            return Err(crate::restricted_membership::MembershipRefusal::ReplayDetected.code());
+        }
+        if replay_ids.len() >= MAX_REPLAY_IDS {
+            return Err(crate::restricted_membership::MembershipRefusal::ReplayCapacity.code());
+        }
+        replay_ids.insert(replay_id.to_string(), expires_at);
+        Ok(())
     }
 
     /// R3: return relay-capable peers for relay election.
@@ -482,29 +448,39 @@ impl PeerManager {
 
     async fn bootstrap(&self) {
         let url = format!("{}/v1/bootstrap", self.directory_url);
+        let Some(request) = self.bootstrap_request(&url) else {
+            return;
+        };
+        if let Ok(resp) = request.send().await {
+            self.merge_bootstrap_response(resp).await;
+        }
+    }
+
+    fn bootstrap_request(&self, url: &str) -> Option<reqwest::RequestBuilder> {
         let mut request = self
             .client
-            .get(&url)
+            .get(url)
             .query(&[("limit", BOOTSTRAP_LIMIT)])
             .timeout(Duration::from_secs(5));
         if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
-            let Some(local) = &restricted.local else {
-                return;
-            };
+            let local = restricted.local.as_ref()?;
             if restricted.directory_membership_bearer.is_empty() {
-                return;
+                return None;
             }
             request = request
                 .header("X-IICP-Membership", &restricted.directory_membership_bearer)
                 .header("X-IICP-Subject-Id", &local.membership.assertion.subject.id);
         }
-        if let Ok(resp) = request.send().await {
-            if resp.status().is_success() {
-                if let Ok(body) = resp.json::<Value>().await {
-                    if let Some(arr) = body.get("peers").and_then(Value::as_array) {
-                        self.merge_peers_for_scope(arr, "bootstrap");
-                    }
-                }
+        Some(request)
+    }
+
+    async fn merge_bootstrap_response(&self, response: reqwest::Response) {
+        if !response.status().is_success() {
+            return;
+        }
+        if let Ok(body) = response.json::<Value>().await {
+            if let Some(peers) = body.get("peers").and_then(Value::as_array) {
+                self.merge_peers_for_scope(peers, "bootstrap");
             }
         }
     }
@@ -520,46 +496,12 @@ impl PeerManager {
             .values()
             .map(PeerInfo::to_gossip_value)
             .collect();
-        if !own_id.is_empty() {
-            let mut own = serde_json::json!({
-                "node_id": own_id,
-                "endpoint": own_ep,
-                "relay_capable": self.own_relay_capable,
-                "relay_accept_port": self.own_relay_accept_port,
-                "relay_load": 0.0,
-            });
-            if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
-                if let Some(local) = &restricted.local {
-                    own["membership"] =
-                        serde_json::to_value(&local.membership).unwrap_or(Value::Null);
-                }
-            }
+        if let Some(own) = self.own_peer_value(own_id, own_ep) {
             known.push(own);
         }
         let payload = serde_json::json!({ "known_peers": known });
-        let body = match &self.admission {
-            PeerAdmissionMode::Public => serde_json::to_vec(&payload).unwrap_or_default(),
-            PeerAdmissionMode::Restricted(restricted) if restricted.local.is_some() => {
-                let local = restricted.local.as_ref().expect("checked above");
-                let canonical = serde_jcs::to_vec(&payload).unwrap_or_default();
-                let Ok(gossip) = crate::restricted_membership::sign_gossip(
-                    &local.membership,
-                    &local.signing_seed,
-                    &restricted.policy.domain_id,
-                    &canonical,
-                    unix_time(),
-                    uuid::Uuid::new_v4().to_string(),
-                ) else {
-                    return;
-                };
-                serde_json::to_vec(&serde_json::json!({
-                    "known_peers": payload["known_peers"],
-                    "membership": local.membership,
-                    "gossip": gossip,
-                }))
-                .unwrap_or_default()
-            }
-            PeerAdmissionMode::Restricted(_) => return,
+        let Some(body) = self.exchange_body(&payload) else {
+            return;
         };
         let url = format!("{}/v1/peers", target.endpoint.trim_end_matches('/'));
         let mut req = self
@@ -574,24 +516,93 @@ impl PeerManager {
                 crate::pricing::sign_body(&body, &self.node_token),
             );
         }
-        if let Ok(resp) = req.send().await {
-            if resp.status().is_success() {
-                if let Ok(data) = resp.json::<Value>().await {
-                    if let Some(arr) = data.get("peers").and_then(Value::as_array) {
-                        self.merge_peers(arr);
-                    }
-                }
-                if let Some(p) = self
-                    .peers
-                    .lock()
-                    .expect("peers lock")
-                    .get_mut(&target.node_id)
-                {
-                    p.last_contact = Instant::now();
-                }
-            }
+        if let Ok(response) = req.send().await {
+            self.handle_exchange_response(response, &target.node_id)
+                .await;
         }
     }
+
+    async fn handle_exchange_response(&self, response: reqwest::Response, target_id: &str) {
+        if !response.status().is_success() {
+            return;
+        }
+        if let Ok(data) = response.json::<Value>().await {
+            if let Some(peers) = data.get("peers").and_then(Value::as_array) {
+                self.merge_peers(peers);
+            }
+        }
+        if let Some(peer) = self.peers.lock().expect("peers lock").get_mut(target_id) {
+            peer.last_contact = Instant::now();
+        }
+    }
+
+    fn own_peer_value(&self, node_id: String, endpoint: String) -> Option<Value> {
+        if node_id.is_empty() {
+            return None;
+        }
+        let mut own = serde_json::json!({
+            "node_id": node_id,
+            "endpoint": endpoint,
+            "relay_capable": self.own_relay_capable,
+            "relay_accept_port": self.own_relay_accept_port,
+            "relay_load": 0.0,
+        });
+        if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
+            let local = restricted.local.as_ref()?;
+            own["membership"] = serde_json::to_value(&local.membership).ok()?;
+        }
+        Some(own)
+    }
+
+    fn exchange_body(&self, payload: &Value) -> Option<Vec<u8>> {
+        let PeerAdmissionMode::Restricted(restricted) = &self.admission else {
+            return serde_json::to_vec(payload).ok();
+        };
+        let local = restricted.local.as_ref()?;
+        let canonical = serde_jcs::to_vec(payload).ok()?;
+        let gossip = crate::restricted_membership::sign_gossip(
+            &local.membership,
+            &local.signing_seed,
+            &restricted.policy.domain_id,
+            &canonical,
+            unix_time(),
+            uuid::Uuid::new_v4().to_string(),
+        )
+        .ok()?;
+        serde_json::to_vec(&serde_json::json!({
+            "known_peers": payload["known_peers"],
+            "membership": local.membership,
+            "gossip": gossip,
+        }))
+        .ok()
+    }
+}
+
+type RestrictedExchange = (
+    crate::restricted_membership::MembershipEnvelope,
+    crate::restricted_membership::GossipEnvelope,
+    Vec<Value>,
+    Vec<u8>,
+);
+
+fn parse_restricted_exchange(body: &[u8]) -> Result<RestrictedExchange, &'static str> {
+    let parsed: Value = serde_json::from_slice(body).map_err(|_| "malformed_exchange")?;
+    let membership =
+        serde_json::from_value(parsed["membership"].clone()).map_err(|_| "membership_malformed")?;
+    let gossip =
+        serde_json::from_value(parsed["gossip"].clone()).map_err(|_| "gossip_malformed")?;
+    let (peers, payload) = restricted_peer_payload(&parsed)?;
+    Ok((membership, gossip, peers, payload))
+}
+
+fn restricted_peer_payload(parsed: &Value) -> Result<(Vec<Value>, Vec<u8>), &'static str> {
+    let peers = parsed["known_peers"]
+        .as_array()
+        .cloned()
+        .ok_or("malformed_exchange")?;
+    let payload = serde_jcs::to_vec(&serde_json::json!({"known_peers": peers}))
+        .map_err(|_| "malformed_exchange")?;
+    Ok((peers, payload))
 }
 
 fn unix_time() -> u64 {
@@ -599,6 +610,30 @@ fn unix_time() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn peer_info(
+    peer: &Value,
+    node_id: &str,
+    membership: Option<crate::restricted_membership::MembershipEnvelope>,
+    last_contact: Instant,
+) -> PeerInfo {
+    PeerInfo {
+        node_id: node_id.to_string(),
+        endpoint: peer["endpoint"].as_str().unwrap_or("").to_string(),
+        region: peer["region"].as_str().unwrap_or("").to_string(),
+        last_seen: peer["last_seen"].as_str().unwrap_or("").to_string(),
+        last_contact,
+        relay_capable: peer["relay_capable"].as_bool().unwrap_or(false),
+        relay_accept_port: peer["relay_accept_port"].as_u64().unwrap_or(9485) as u16,
+        relay_load: peer["relay_load"].as_f64().unwrap_or(0.0),
+        trust_domain_id: membership
+            .as_ref()
+            .map(|value| value.assertion.domain_id.clone()),
+        membership_generation: membership.as_ref().map(|value| value.assertion.generation),
+        membership_expires_at: membership.as_ref().map(|value| value.assertion.expires_at),
+        membership,
+    }
 }
 
 fn extract_known_peers(body: &[u8]) -> Option<Vec<Value>> {
@@ -616,25 +651,36 @@ fn valid_restricted_peer(peer: &Value) -> bool {
     let Ok(url) = reqwest::Url::parse(endpoint) else {
         return false;
     };
-    if !matches!(url.scheme(), "http" | "https")
-        || url.host_str().is_none()
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || url.fragment().is_some()
-    {
+    if !valid_peer_url(&url) {
         return false;
     }
-    if peer
-        .get("relay_accept_port")
+    if invalid_relay_port(peer) {
+        return false;
+    }
+    !invalid_relay_load(peer)
+}
+
+fn invalid_relay_port(peer: &Value) -> bool {
+    peer.get("relay_accept_port")
         .and_then(Value::as_u64)
         .is_some_and(|port| port == 0 || port > u16::MAX.into())
-    {
-        return false;
-    }
-    !peer
-        .get("relay_load")
+}
+
+fn invalid_relay_load(peer: &Value) -> bool {
+    peer.get("relay_load")
         .and_then(Value::as_f64)
         .is_some_and(|load| !load.is_finite() || load < 0.0)
+}
+
+fn valid_peer_url(url: &reqwest::Url) -> bool {
+    matches!(url.scheme(), "http" | "https")
+        && url.host_str().is_some()
+        && peer_url_has_no_credentials(url)
+        && url.fragment().is_none()
+}
+
+fn peer_url_has_no_credentials(url: &reqwest::Url) -> bool {
+    url.username().is_empty() && url.password().is_none()
 }
 
 #[cfg(test)]

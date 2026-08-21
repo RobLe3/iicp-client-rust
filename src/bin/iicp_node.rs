@@ -2293,26 +2293,9 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             serde_json::to_string(&findings).map_err(|error| error.to_string())?
         ));
     }
+    apply_restricted_peer_config(&config, &mut opts)?;
     if let Some(url) = config.directory.url {
         opts.directory_url = url;
-    }
-    if matches!(
-        config.mode,
-        OperatingMode::Private | OperatingMode::FederatedPrivate
-    ) {
-        let reference = config
-            .secret_refs
-            .get("restricted_peer_bundle")
-            .ok_or_else(|| {
-                "restricted_peer_bundle_required: restricted mode requires secret_refs.restricted_peer_bundle"
-                    .to_string()
-            })?;
-        let contents = resolve_restricted_peer_bundle(reference)?;
-        let bundle: iicp_client::restricted_membership::RestrictedPeerBundle =
-            serde_json::from_str(&contents)
-                .map_err(|_| "restricted_peer_bundle_malformed".to_string())?;
-        opts.restricted_peer_bundle = Some(bundle);
-        opts.enable_mesh = config.mesh.enabled;
     }
     if config.mode == OperatingMode::LocalOnly {
         opts.skip_registration = true;
@@ -2338,6 +2321,36 @@ fn resolve_restricted_peer_bundle(
         }
         _ => Err("restricted_peer_bundle_provider_unsupported".to_string()),
     }
+}
+
+fn apply_restricted_peer_config(
+    config: &iicp_client::runtime_config::RuntimeConfigV1,
+    opts: &mut ServeOpts,
+) -> Result<(), String> {
+    if !matches!(
+        config.mode,
+        iicp_client::runtime_config::OperatingMode::Private
+            | iicp_client::runtime_config::OperatingMode::FederatedPrivate
+    ) {
+        return Ok(());
+    }
+    opts.restricted_peer_bundle = Some(load_restricted_peer_bundle(config)?);
+    opts.enable_mesh = config.mesh.enabled;
+    Ok(())
+}
+
+fn load_restricted_peer_bundle(
+    config: &iicp_client::runtime_config::RuntimeConfigV1,
+) -> Result<iicp_client::restricted_membership::RestrictedPeerBundle, String> {
+    let reference = config
+        .secret_refs
+        .get("restricted_peer_bundle")
+        .ok_or_else(|| {
+            "restricted_peer_bundle_required: restricted mode requires secret_refs.restricted_peer_bundle"
+                .to_string()
+        })?;
+    let contents = resolve_restricted_peer_bundle(reference)?;
+    serde_json::from_str(&contents).map_err(|_| "restricted_peer_bundle_malformed".to_string())
 }
 
 fn configure_peer_admission(cfg: &mut NodeConfig, opts: &mut ServeOpts) -> Result<(), String> {
