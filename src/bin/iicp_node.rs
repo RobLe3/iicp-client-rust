@@ -246,6 +246,8 @@ struct ServeOpts {
     policy_manifest: String,
     /// Explicit operator receipt-profile opt-in; None allows saved-node fallback.
     receipt_profiles: Option<Vec<String>>,
+    restricted_peer_bundle: Option<iicp_client::restricted_membership::RestrictedPeerBundle>,
+    enable_mesh: bool,
 }
 
 fn resolve_receipt_profiles(values: &[String]) -> Result<Vec<String>, String> {
@@ -2159,6 +2161,8 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             Ok(value) => Some(resolve_receipt_profiles(&[value])?),
             Err(_) => None,
         },
+        restricted_peer_bundle: None,
+        enable_mesh: false,
     };
     let mut config_file = env::var("IICP_CONFIG_FILE").ok();
     let mut config_cli = ConfigOverrides::default();
@@ -2289,6 +2293,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             serde_json::to_string(&findings).map_err(|error| error.to_string())?
         ));
     }
+    apply_restricted_peer_config(&config, &mut opts)?;
     if let Some(url) = config.directory.url {
         opts.directory_url = url;
     }
@@ -2301,6 +2306,68 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         opts.external_ip_probe_url.clear();
     }
     Ok(opts)
+}
+
+fn resolve_restricted_peer_bundle(
+    reference: &iicp_client::runtime_config::SecretRef,
+) -> Result<String, String> {
+    use iicp_client::runtime_config::SecretRef;
+    match reference {
+        SecretRef::Environment { name } => {
+            std::env::var(name).map_err(|_| "restricted_peer_bundle_unavailable".to_string())
+        }
+        SecretRef::File { path } => {
+            fs::read_to_string(path).map_err(|_| "restricted_peer_bundle_unavailable".to_string())
+        }
+        _ => Err("restricted_peer_bundle_provider_unsupported".to_string()),
+    }
+}
+
+fn apply_restricted_peer_config(
+    config: &iicp_client::runtime_config::RuntimeConfigV1,
+    opts: &mut ServeOpts,
+) -> Result<(), String> {
+    if !matches!(
+        config.mode,
+        iicp_client::runtime_config::OperatingMode::Private
+            | iicp_client::runtime_config::OperatingMode::FederatedPrivate
+    ) {
+        return Ok(());
+    }
+    opts.restricted_peer_bundle = Some(load_restricted_peer_bundle(config)?);
+    opts.enable_mesh = config.mesh.enabled;
+    Ok(())
+}
+
+fn load_restricted_peer_bundle(
+    config: &iicp_client::runtime_config::RuntimeConfigV1,
+) -> Result<iicp_client::restricted_membership::RestrictedPeerBundle, String> {
+    let reference = config
+        .secret_refs
+        .get("restricted_peer_bundle")
+        .ok_or_else(|| {
+            "restricted_peer_bundle_required: restricted mode requires secret_refs.restricted_peer_bundle"
+                .to_string()
+        })?;
+    let contents = resolve_restricted_peer_bundle(reference)?;
+    serde_json::from_str(&contents).map_err(|_| "restricted_peer_bundle_malformed".to_string())
+}
+
+fn configure_peer_admission(cfg: &mut NodeConfig, opts: &mut ServeOpts) -> Result<(), String> {
+    cfg.enable_mesh = opts.enable_mesh;
+    let Some(bundle) = opts.restricted_peer_bundle.take() else {
+        return Ok(());
+    };
+    cfg.peer_admission = bundle
+        .into_admission(
+            &opts.node_id,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        )
+        .map_err(|reason| reason.code().to_string())?;
+    Ok(())
 }
 
 fn doctor_loopback_host(host: &str) -> String {
@@ -3292,6 +3359,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     );
 
     let mut cfg = NodeConfig::new(&opts.node_id, &opts.public_endpoint, &opts.intent);
+    configure_peer_admission(&mut cfg, &mut opts)?;
     cfg.supported_receipt_profiles = opts.receipt_profiles.clone().unwrap_or_default();
     cfg.model = Some(opts.model.clone());
     // Detect the backend server flavor (ollama/lmstudio/vllm/llamacpp/anthropic/custom)
@@ -5966,8 +6034,8 @@ mod tests {
     }
 
     #[test]
-    fn private_runtime_config_applies_cli_overrides() {
-        let options = parse_args(&[
+    fn private_runtime_config_requires_peer_verification_bundle() {
+        let error = match parse_args(&[
             "--mode".into(),
             "private".into(),
             "--trust-domain".into(),
@@ -5976,9 +6044,14 @@ mod tests {
             "did:key:directory".into(),
             "--directory-url".into(),
             "https://directory.example/api".into(),
-        ])
-        .unwrap();
-        assert_eq!(options.directory_url, "https://directory.example/api");
+        ]) {
+            Ok(_) => panic!("restricted mode must not start with accept-all peer admission"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "restricted_peer_bundle_required: restricted mode requires secret_refs.restricted_peer_bundle"
+        );
     }
 
     #[test]

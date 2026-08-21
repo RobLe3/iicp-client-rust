@@ -79,6 +79,7 @@ pub mod relay_ticket;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_worker_client;
 pub mod request_projection;
+pub mod restricted_membership;
 pub mod routing_policy;
 pub mod runtime_config;
 pub mod runtime_health;

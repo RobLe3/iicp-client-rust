@@ -35,6 +35,16 @@ in the main repo).
 
 ## [Unreleased]
 
+### Added — restricted peer-admission reference
+
+- Added opt-in, fail-closed membership verification for private and
+  federated-private peer bootstrap and gossip.
+- Added per-peer signed assertions, payload-bound authenticated gossip, replay
+  protection and immediate stale-generation eviction while preserving public
+  mesh compatibility.
+- Kept credentials behind protected secret references and documented the
+  remaining revocation-feed, federation, CIP and cross-SDK evidence gaps.
+
 ## [0.7.106] — 2026-08-20
 
 ### Fixed — retry-safe outcome metrics
