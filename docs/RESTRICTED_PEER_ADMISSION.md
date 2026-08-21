@@ -15,9 +15,19 @@ it must present its own valid assertion.
 
 Private and federated-private configurations name a
 `secret_refs.restricted_peer_bundle`. The reference must resolve through the
-existing environment or protected-file secret resolver. The portable runtime
-configuration contains only the reference, never the membership bearer,
-private signing seed or full assertion bundle.
+shared secret-resolution boundary. Environment variables and owner-only files
+are supported on every applicable host. macOS Keychain and Linux Secret
+Service references use the operating-system command interface when available;
+application-owned stores use the `ExternalSecretProvider` library interface.
+Windows Credential Manager references are represented but currently fail as
+unsupported until a native retrieval provider is linked. There is no fallback
+from a selected provider to plaintext storage.
+
+Protected files must be regular, non-symlink files owned by the effective user;
+on Unix they must not grant group or other permissions. Resolved values are
+zeroized on drop and always render as `[REDACTED]` through `Debug` or `Display`.
+The portable runtime configuration contains only the reference, never the
+membership bearer, private signing seed or full assertion bundle.
 
 The resolved JSON bundle contains four elements:
 
@@ -48,8 +58,11 @@ must not claim automatic revocation propagation.
 ## Current limits
 
 - This is a Rust reference implementation, not yet a cross-SDK guarantee.
-- Environment and protected-file secret references are supported for this
-  bundle. Other configured secret-provider types are not yet resolved here.
+- Windows Credential Manager still requires a native provider implementation;
+  selecting it fails before runtime network activity.
+- Legacy node records remain readable, but the current migration projection
+  only detects and omits plaintext material. Atomic transfer into a selected
+  provider remains required before legacy migration is complete.
 - Federation authorization and CIP worker inheritance require their own
   acceptance evidence.
 - No production deployment is implied by the presence of this code.

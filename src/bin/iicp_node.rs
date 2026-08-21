@@ -2311,16 +2311,9 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
 fn resolve_restricted_peer_bundle(
     reference: &iicp_client::runtime_config::SecretRef,
 ) -> Result<String, String> {
-    use iicp_client::runtime_config::SecretRef;
-    match reference {
-        SecretRef::Environment { name } => {
-            std::env::var(name).map_err(|_| "restricted_peer_bundle_unavailable".to_string())
-        }
-        SecretRef::File { path } => {
-            fs::read_to_string(path).map_err(|_| "restricted_peer_bundle_unavailable".to_string())
-        }
-        _ => Err("restricted_peer_bundle_provider_unsupported".to_string()),
-    }
+    iicp_client::secret_store::resolve(reference, None)
+        .map(|value| value.expose().to_owned())
+        .map_err(str::to_string)
 }
 
 fn apply_restricted_peer_config(
