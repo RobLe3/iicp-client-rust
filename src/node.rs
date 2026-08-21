@@ -343,6 +343,39 @@ fn metrics_batch_acknowledged(response: &Value, batch_id: &str) -> bool {
         .is_none_or(|accepted| accepted == batch_id)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingMetricBatch {
+    id: String,
+    tasks_success: usize,
+    tasks_failed: usize,
+    latency_total_ms: usize,
+}
+
+enum MetricBatchDelivery<'a> {
+    Failed,
+    Accepted(Option<&'a Value>),
+}
+
+fn reconcile_metric_batch(
+    pending: &mut Option<PendingMetricBatch>,
+    delivery: MetricBatchDelivery<'_>,
+) {
+    match delivery {
+        MetricBatchDelivery::Failed => {}
+        MetricBatchDelivery::Accepted(Some(response)) => {
+            if pending
+                .as_ref()
+                .is_some_and(|batch| metrics_batch_acknowledged(response, &batch.id))
+            {
+                *pending = None;
+            }
+        }
+        // A legacy successful directory response has no additive batch
+        // acknowledgement. Preserve the existing compatibility behavior.
+        MetricBatchDelivery::Accepted(None) => *pending = None,
+    }
+}
+
 fn effective_capability_models(capabilities: &[EffectiveCapability]) -> Vec<String> {
     capabilities
         .iter()
@@ -2641,7 +2674,7 @@ impl IicpNode {
                 let mut token = token;
                 let mut seq: u64 = 0;
                 let mut recovery_failures: u32 = 0;
-                let mut pending_metrics: Option<(String, usize, usize, usize)> = None;
+                let mut pending_metrics: Option<PendingMetricBatch> = None;
                 loop {
                     tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
                     hb_runtime_health.advance_supervisor();
@@ -2654,17 +2687,23 @@ impl IicpNode {
                         let fail = hb_tasks_failed.swap(0, Ordering::Relaxed);
                         let latency_total_ms = hb_tasks_latency_total_ms.swap(0, Ordering::Relaxed);
                         if ok > 0 || fail > 0 {
-                            pending_metrics = Some((
-                                uuid::Uuid::new_v4().to_string(),
-                                ok,
-                                fail,
+                            pending_metrics = Some(PendingMetricBatch {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                tasks_success: ok,
+                                tasks_failed: fail,
                                 latency_total_ms,
-                            ));
+                            });
                         }
                     }
                     let (ok, fail, latency_total_ms) = pending_metrics
                         .as_ref()
-                        .map(|(_, ok, fail, latency)| (*ok, *fail, *latency))
+                        .map(|batch| {
+                            (
+                                batch.tasks_success,
+                                batch.tasks_failed,
+                                batch.latency_total_ms,
+                            )
+                        })
                         .unwrap_or((0, 0, 0));
                     let metrics = if ok > 0 || fail > 0 {
                         let mut m = json!({"tasks_success": ok, "tasks_failed": fail});
@@ -2725,8 +2764,8 @@ impl IicpNode {
                         // avoid moving reputation on idle periods.
                         "metrics": metrics,
                     });
-                    if let Some((batch_id, ..)) = pending_metrics.as_ref() {
-                        hb_body["metrics_batch_id"] = json!(batch_id);
+                    if let Some(batch) = pending_metrics.as_ref() {
+                        hb_body["metrics_batch_id"] = json!(&batch.id);
                     }
                     attach_update_status(&mut hb_body);
                     // ADR-047 Part A (#411) — answer the directory's liveness
@@ -2778,16 +2817,15 @@ impl IicpNode {
                                     *hb_liveness_challenge.write().expect("poisoned") =
                                         Some(ch.to_string());
                                 }
-                                if let Some((batch_id, ..)) = pending_metrics.as_ref() {
-                                    let acknowledged = metrics_batch_acknowledged(&data, batch_id);
-                                    if acknowledged {
-                                        pending_metrics = None;
-                                    }
-                                }
+                                reconcile_metric_batch(
+                                    &mut pending_metrics,
+                                    MetricBatchDelivery::Accepted(Some(&data)),
+                                );
                             } else {
-                                // A legacy directory may return a successful response
-                                // without the additive acknowledgement field.
-                                pending_metrics = None;
+                                reconcile_metric_batch(
+                                    &mut pending_metrics,
+                                    MetricBatchDelivery::Accepted(None),
+                                );
                             }
                             // #494 — detect model drift; re-register when live set differs.
                             if let Some(live) = live_models {
@@ -3039,6 +3077,10 @@ impl IicpNode {
                             }
                         }
                         Ok(resp) => {
+                            reconcile_metric_batch(
+                                &mut pending_metrics,
+                                MetricBatchDelivery::Failed,
+                            );
                             hb_runtime_health.set_external(
                                 "directory",
                                 crate::runtime_health::SubsystemState::Unavailable,
@@ -3053,6 +3095,10 @@ impl IicpNode {
                             }
                         }
                         Err(e) => {
+                            reconcile_metric_batch(
+                                &mut pending_metrics,
+                                MetricBatchDelivery::Failed,
+                            );
                             hb_runtime_health.set_external(
                                 "directory",
                                 crate::runtime_health::SubsystemState::Unavailable,
@@ -3458,7 +3504,18 @@ mod task_rate_tests {
 
 #[cfg(test)]
 mod heartbeat_metrics_tests {
-    use super::metrics_batch_acknowledged;
+    use super::{
+        metrics_batch_acknowledged, reconcile_metric_batch, MetricBatchDelivery, PendingMetricBatch,
+    };
+
+    fn pending_batch() -> Option<PendingMetricBatch> {
+        Some(PendingMetricBatch {
+            id: "batch-1".to_string(),
+            tasks_success: 3,
+            tasks_failed: 1,
+            latency_total_ms: 400,
+        })
+    }
 
     #[test]
     fn metrics_batch_requires_matching_ack_when_present() {
@@ -3478,6 +3535,38 @@ mod heartbeat_metrics_tests {
             &serde_json::json!({"ok": true}),
             "batch-1"
         ));
+    }
+
+    #[test]
+    fn failed_delivery_retains_the_exact_pending_batch() {
+        let mut pending = pending_batch();
+        let original = pending.clone();
+
+        reconcile_metric_batch(&mut pending, MetricBatchDelivery::Failed);
+
+        assert_eq!(pending, original);
+    }
+
+    #[test]
+    fn mismatched_ack_retains_batch_until_matching_ack_arrives() {
+        let mut pending = pending_batch();
+        let original = pending.clone();
+        let mismatch = serde_json::json!({"metrics_batch_accepted": "batch-other"});
+        reconcile_metric_batch(&mut pending, MetricBatchDelivery::Accepted(Some(&mismatch)));
+        assert_eq!(pending, original);
+
+        let matching = serde_json::json!({"metrics_batch_accepted": "batch-1"});
+        reconcile_metric_batch(&mut pending, MetricBatchDelivery::Accepted(Some(&matching)));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn legacy_success_clears_pending_batch_for_compatibility() {
+        let mut pending = pending_batch();
+
+        reconcile_metric_batch(&mut pending, MetricBatchDelivery::Accepted(None));
+
+        assert!(pending.is_none());
     }
 }
 
