@@ -148,6 +148,7 @@ fn signing_seed(value: &str, expected_public_key: &str) -> Result<[u8; 32], Memb
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum MembershipRefusal {
     MalformedEvidence,
     UnsupportedEvidence,
@@ -168,23 +169,24 @@ pub enum MembershipRefusal {
 
 impl MembershipRefusal {
     pub const fn code(self) -> &'static str {
-        match self {
-            Self::MalformedEvidence => "membership_malformed",
-            Self::UnsupportedEvidence => "membership_unsupported",
-            Self::InvalidAuthority => "membership_authority_invalid",
-            Self::InvalidSignature => "membership_signature_invalid",
-            Self::WrongDomain => "membership_domain_mismatch",
-            Self::WrongSubject => "membership_subject_mismatch",
-            Self::Expired => "membership_expired",
-            Self::NotYetValid => "membership_not_yet_valid",
-            Self::RevokedGeneration => "membership_generation_revoked",
-            Self::MissingScope => "membership_scope_missing",
-            Self::InvalidPayloadBinding => "gossip_payload_mismatch",
-            Self::ReplayDetected => "gossip_replay",
-            Self::ReplayCapacity => "gossip_replay_capacity",
-            Self::StaleGossip => "gossip_stale",
-            Self::MissingDirectoryCredential => "directory_membership_missing",
-        }
+        const CODES: [&str; 15] = [
+            "membership_malformed",
+            "membership_unsupported",
+            "membership_authority_invalid",
+            "membership_signature_invalid",
+            "membership_domain_mismatch",
+            "membership_subject_mismatch",
+            "membership_expired",
+            "membership_not_yet_valid",
+            "membership_generation_revoked",
+            "membership_scope_missing",
+            "gossip_payload_mismatch",
+            "gossip_replay",
+            "gossip_replay_capacity",
+            "gossip_stale",
+            "directory_membership_missing",
+        ];
+        CODES[self as usize]
     }
 }
 
