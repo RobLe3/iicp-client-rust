@@ -14,6 +14,8 @@ use std::io::Write;
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use zeroize::{Zeroize, Zeroizing};
 
 pub const SECRET_UNAVAILABLE: &str = "secret_reference_unavailable";
@@ -103,6 +105,9 @@ pub fn store(
     }
     match reference {
         SecretRef::File { path } => write_protected_file(Path::new(path), value.as_bytes()),
+        SecretRef::LinuxSecretService { collection, label } => {
+            store_linux_secret_service(collection, label, value)
+        }
         SecretRef::External {
             provider,
             reference,
@@ -121,6 +126,9 @@ pub fn delete(
 ) -> Result<(), &'static str> {
     match reference {
         SecretRef::File { path } => delete_protected_file(Path::new(path)),
+        SecretRef::LinuxSecretService { collection, label } => {
+            delete_linux_secret_service(collection, label)
+        }
         SecretRef::External {
             provider,
             reference,
@@ -242,6 +250,90 @@ fn resolve_linux_secret_service(collection: &str, label: &str) -> Result<String,
         .output()
         .map_err(|_| SECRET_UNAVAILABLE)?;
     command_value(output)
+}
+
+#[cfg(target_os = "linux")]
+fn store_linux_secret_service(
+    collection: &str,
+    label: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    store_linux_secret_service_with("secret-tool", collection, label, value)
+}
+
+#[cfg(target_os = "linux")]
+fn store_linux_secret_service_with(
+    executable: &str,
+    collection: &str,
+    label: &str,
+    value: &str,
+) -> Result<(), &'static str> {
+    let mut child = Command::new(executable)
+        .args([
+            "store",
+            "--label",
+            label,
+            "collection",
+            collection,
+            "label",
+            label,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|_| SECRET_UNAVAILABLE)?;
+    let mut stdin = child.stdin.take().ok_or(SECRET_UNAVAILABLE)?;
+    stdin
+        .write_all(value.as_bytes())
+        .map_err(|_| SECRET_UNAVAILABLE)?;
+    stdin.write_all(b"\n").map_err(|_| SECRET_UNAVAILABLE)?;
+    drop(stdin);
+    let status = child.wait().map_err(|_| SECRET_UNAVAILABLE)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(SECRET_UNAVAILABLE)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn store_linux_secret_service(
+    _collection: &str,
+    _label: &str,
+    _value: &str,
+) -> Result<(), &'static str> {
+    Err(SECRET_PROVIDER_UNSUPPORTED)
+}
+
+#[cfg(target_os = "linux")]
+fn delete_linux_secret_service(collection: &str, label: &str) -> Result<(), &'static str> {
+    delete_linux_secret_service_with("secret-tool", collection, label)
+}
+
+#[cfg(target_os = "linux")]
+fn delete_linux_secret_service_with(
+    executable: &str,
+    collection: &str,
+    label: &str,
+) -> Result<(), &'static str> {
+    let status = Command::new(executable)
+        .args(["clear", "collection", collection, "label", label])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|_| SECRET_UNAVAILABLE)?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(SECRET_UNAVAILABLE)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn delete_linux_secret_service(_collection: &str, _label: &str) -> Result<(), &'static str> {
+    Err(SECRET_PROVIDER_UNSUPPORTED)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -509,6 +601,63 @@ mod tests {
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o722)).unwrap();
         assert_eq!(store(&reference, "unsafe", None), Err(SECRET_FILE_UNSAFE));
         assert!(!path.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_secret_service_sends_secret_only_over_stdin() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "iicp-secret-tool-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let executable = root.join("secret-tool-fixture");
+        let arguments = root.join("arguments");
+        let input = root.join("input");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\ncat > '{}'\n",
+                arguments.display(),
+                input.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        store_linux_secret_service_with(
+            executable.to_str().unwrap(),
+            "login",
+            "iicp-node-token",
+            "private-value",
+        )
+        .unwrap();
+        let stored_arguments = std::fs::read_to_string(&arguments).unwrap();
+        assert!(!stored_arguments.contains("private-value"));
+        assert_eq!(std::fs::read_to_string(&input).unwrap(), "private-value\n");
+        assert!(stored_arguments.lines().eq([
+            "store",
+            "--label",
+            "iicp-node-token",
+            "collection",
+            "login",
+            "label",
+            "iicp-node-token"
+        ]));
+
+        delete_linux_secret_service_with(executable.to_str().unwrap(), "login", "iicp-node-token")
+            .unwrap();
+        assert!(std::fs::read_to_string(&arguments).unwrap().lines().eq([
+            "clear",
+            "collection",
+            "login",
+            "label",
+            "iicp-node-token"
+        ]));
+        assert!(std::fs::read_to_string(&input).unwrap().is_empty());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
