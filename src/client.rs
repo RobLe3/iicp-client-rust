@@ -106,6 +106,79 @@ mod restricted_ticket_tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn chat_shaped_submit_composes_runtime_identity_at_provider_boundary() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
+        unsafe { std::env::set_var("IICP_CX_ALLOW_PLAINTEXT", "1") };
+        let mut directory = mockito::Server::new_async().await;
+        let mut provider = mockito::Server::new_async().await;
+        let discovery = directory
+            .mock("GET", mockito::Matcher::Regex(r"/v1/discover.*".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "count": 1,
+                    "nodes": [{
+                        "node_id": "provider-a",
+                        "endpoint": provider.url(),
+                        "score": 1.0,
+                        "load": 0.0,
+                        "available": true,
+                        "region": "eu",
+                        "models": ["model-a"]
+                    }]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let task = provider
+            .mock("POST", "/v1/task")
+            .match_body(mockito::Matcher::Regex(
+                r#"IICP-RUNTIME-CONTEXT/1.*This request reached you through IICP"#.into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"task_id":"identity-1","status":"success","result":{},"metrics":null}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = IicpClient::new(ClientConfig {
+            directory_url: directory.url(),
+            route_discovery_mode: "legacy".into(),
+            routing_strategy: "deterministic".into(),
+            ..ClientConfig::default()
+        })
+        .unwrap();
+        let response = client
+            .submit_chat_with_runtime_identity(
+                TaskRequest {
+                    task_id: "identity-1".into(),
+                    intent: crate::runtime_identity::RUNTIME_IDENTITY_CHAT_INTENT.into(),
+                    payload: serde_json::json!({
+                        "messages": [{"role": "user", "content": "What is IICP?"}]
+                    }),
+                    constraints: None,
+                    route_constraints: None,
+                    auth: None,
+                    source_node_id: Some("requester-a".into()),
+                    routing_policy: None,
+                },
+                Some(crate::runtime_identity::RuntimeIdentityOptions::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, "success");
+        discovery.assert_async().await;
+        task.assert_async().await;
+        unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
+        unsafe { std::env::remove_var("IICP_CX_ALLOW_PLAINTEXT") };
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn cip_candidate_constraint_binds_initial_and_retry_workers() {
         let _guard = env_lock();
         unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
@@ -736,6 +809,50 @@ impl IicpClient {
     /// Generates one W3C traceparent shared across discover + POST (SDK-06).
     pub async fn submit(&self, request: TaskRequest) -> Result<TaskResponse> {
         self.submit_internal(request, None, None).await
+    }
+
+    /// Submit an existing chat-shaped request with the bounded runtime identity context.
+    ///
+    /// This is intended for chat front ends, such as `iicp-node query`, that need to
+    /// preserve request-level routing policy or source-node metadata. Raw [`Self::submit`]
+    /// remains byte-preserving and never adds model-visible context.
+    pub async fn submit_chat_with_runtime_identity(
+        &self,
+        request: TaskRequest,
+        runtime_identity: Option<crate::runtime_identity::RuntimeIdentityOptions>,
+    ) -> Result<TaskResponse> {
+        if request.intent != crate::runtime_identity::RUNTIME_IDENTITY_CHAT_INTENT {
+            return Err(IicpError::Protocol {
+                code: "runtime_identity_not_applicable".into(),
+                message: "runtime identity composition is available only for llm:chat:v1".into(),
+                status: 400,
+            });
+        }
+        let messages = request
+            .payload
+            .get("messages")
+            .cloned()
+            .ok_or_else(|| IicpError::Protocol {
+                code: "runtime_identity_messages_missing".into(),
+                message: "chat runtime identity requires a messages array".into(),
+                status: 400,
+            })
+            .and_then(|value| {
+                serde_json::from_value(value).map_err(|error| IicpError::Protocol {
+                    code: "runtime_identity_messages_invalid".into(),
+                    message: format!("chat messages could not be decoded: {error}"),
+                    status: 400,
+                })
+            })?;
+        self.submit_internal(
+            request,
+            Some(RuntimeIdentityDispatch {
+                messages,
+                options: runtime_identity,
+            }),
+            None,
+        )
+        .await
     }
 
     /// Submit while restricting every initial and retry candidate to a
