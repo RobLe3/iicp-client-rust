@@ -300,6 +300,10 @@ pub struct IicpClient {
 }
 
 impl IicpClient {
+    pub(crate) fn restricted_directory_context(&self) -> Option<&RestrictedDirectoryContext> {
+        self.config.restricted_directory.as_ref()
+    }
+
     /// Construct a client. Enforces SDK-04 (timeout_ms ≤ 120 000).
     pub fn new(config: ClientConfig) -> Result<Self> {
         if config.timeout_ms > MAX_TIMEOUT_MS {

@@ -31,7 +31,10 @@ use crate::errors::IicpError;
 use crate::types::{TaskRequest, TaskResponse};
 
 pub mod cip;
-use cip::{cip_config_from_env, compute_cip_envelope, CipConfig, CipError};
+use cip::{
+    cip_config_from_env, compute_cip_envelope, CipConfig, CipError, CipTrustScope,
+    CipWorkerCandidate,
+};
 
 const INTENT: &str = "urn:iicp:intent:llm:chat:v1";
 /// The proxy self-identifies as `iicp-proxy` on every response (Server header).
@@ -55,8 +58,16 @@ pub trait ProxyBackend: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, ProxyDispatchError>> + Send + '_>>;
 
     /// Discover nodes for CIP eligibility (used only when CIP is enabled). Default: none.
-    fn discover(&self, _intent: String) -> Pin<Box<dyn Future<Output = Vec<Value>> + Send + '_>> {
+    fn discover(
+        &self,
+        _intent: String,
+    ) -> Pin<Box<dyn Future<Output = Vec<CipWorkerCandidate>> + Send + '_>> {
         Box::pin(async { Vec::new() })
+    }
+
+    /// Process-local restricted-domain expectation for CIP worker selection.
+    fn cip_trust_scope(&self) -> Option<CipTrustScope> {
+        None
     }
 }
 
@@ -84,23 +95,37 @@ impl ProxyBackend for IicpClient {
         })
     }
 
-    fn discover(&self, intent: String) -> Pin<Box<dyn Future<Output = Vec<Value>> + Send + '_>> {
+    fn discover(
+        &self,
+        intent: String,
+    ) -> Pin<Box<dyn Future<Output = Vec<CipWorkerCandidate>> + Send + '_>> {
         Box::pin(async move {
             match self.discover(&intent, None, None).await {
                 Ok(list) => list
                     .nodes
                     .into_iter()
-                    .map(|n| {
-                        serde_json::json!({
-                            "node_id": n.node_id,
-                            "allow_remote_inference": n.cip_policy.map(|c| c.allow_remote_inference).unwrap_or(false),
-                            "reputation_score": n.score,
-                        })
+                    .map(|n| CipWorkerCandidate {
+                        node_id: n.node_id,
+                        allow_remote_inference: n
+                            .cip_policy
+                            .map(|c| c.allow_remote_inference)
+                            .unwrap_or(false),
+                        reputation_score: n.score,
+                        restricted_eligibility: n.restricted_eligibility,
                     })
                     .collect(),
                 Err(_) => Vec::new(),
             }
         })
+    }
+
+    fn cip_trust_scope(&self) -> Option<CipTrustScope> {
+        self.restricted_directory_context()
+            .map(|context| CipTrustScope {
+                domain_id: context.domain_id.clone(),
+                authority_id: context.authority_id.clone(),
+                minimum_membership_generation: context.minimum_membership_generation,
+            })
     }
 }
 
@@ -250,7 +275,16 @@ async fn run_task(b: &Backend, messages: Value, model: &str, body: &Value) -> Ou
             .and_then(|x| x.get("consumer_balance"))
             .and_then(|v| v.as_f64());
         let qos = body.get("qos").and_then(|q| q.as_str());
-        match compute_cip_envelope(&nodes, body, &CIP_CONFIG, "cip-task", qos, balance) {
+        let trust_scope = b.cip_trust_scope();
+        match compute_cip_envelope(
+            &nodes,
+            body,
+            &CIP_CONFIG,
+            trust_scope.as_ref(),
+            "cip-task",
+            qos,
+            balance,
+        ) {
             Err(e) => return cip_outcome(&e),
             Ok(Some(env)) => {
                 if let (Some(obj), Some(eo)) = (payload.as_object_mut(), env.as_object()) {

@@ -10,6 +10,8 @@
 
 use serde_json::Value;
 
+use crate::types::RestrictedEligibility;
+
 const VALID_CIP_POLICIES: [&str; 3] = ["best_of_n", "majority_vote", "map_reduce"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +36,26 @@ pub struct CipConfig {
     pub send_sensitive_prompts: bool,
     pub trusted_peers: Vec<String>,
     pub min_reputation: f64,
+}
+
+/// A CIP worker candidate plus process-local directory eligibility provenance.
+///
+/// The provenance is produced only after the client validates a restricted
+/// directory response. It is never accepted from provider-controlled JSON.
+#[derive(Debug, Clone)]
+pub struct CipWorkerCandidate {
+    pub node_id: String,
+    pub allow_remote_inference: bool,
+    pub reputation_score: f64,
+    pub restricted_eligibility: Option<RestrictedEligibility>,
+}
+
+/// Expected trust boundary for a restricted CIP request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CipTrustScope {
+    pub domain_id: String,
+    pub authority_id: String,
+    pub minimum_membership_generation: u64,
 }
 
 impl Default for CipConfig {
@@ -163,9 +185,10 @@ pub fn build_cip_envelope(
 /// dispatch.compute_cip_envelope). Ok(None) for LOCAL/disabled/invalid; Err for the
 /// blocking errors (E036/E022).
 pub fn compute_cip_envelope(
-    nodes: &[Value],
+    nodes: &[CipWorkerCandidate],
     body: &Value,
     config: &CipConfig,
+    trust_scope: Option<&CipTrustScope>,
     task_id: &str,
     qos: Option<&str>,
     consumer_balance: Option<f64>,
@@ -176,24 +199,26 @@ pub fn compute_cip_envelope(
     if validate_cip_request_fields(body).is_some() {
         return Ok(None); // invalid cip fields → local fallback
     }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let mut eligible: Vec<String> = nodes
         .iter()
         .filter(|n| {
-            n.get("allow_remote_inference")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-                && n.get("node_id").and_then(|v| v.as_str()).is_some()
-                && n.get("reputation_score")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(0.0)
-                    >= config.min_reputation
+            n.allow_remote_inference
+                && !n.node_id.is_empty()
+                && n.reputation_score >= config.min_reputation
+                && trust_scope.is_none_or(|scope| {
+                    n.restricted_eligibility.as_ref().is_some_and(|proof| {
+                        proof.domain_id == scope.domain_id
+                            && proof.authority_id == scope.authority_id
+                            && proof.membership_generation >= scope.minimum_membership_generation
+                            && proof.membership_expires_at > now
+                    })
+                })
         })
-        .map(|n| {
-            n.get("node_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string()
-        })
+        .map(|n| n.node_id.clone())
         .collect();
     if !config.trusted_peers.is_empty() {
         eligible.retain(|id| config.trusted_peers.contains(id));
@@ -286,6 +311,15 @@ mod tests {
         }
     }
 
+    fn worker(node_id: &str) -> CipWorkerCandidate {
+        CipWorkerCandidate {
+            node_id: node_id.into(),
+            allow_remote_inference: true,
+            reputation_score: 0.9,
+            restricted_eligibility: None,
+        }
+    }
+
     #[test]
     fn gate_not_enabled_is_local() {
         let c = CipConfig {
@@ -355,13 +389,12 @@ mod tests {
 
     #[test]
     fn envelope_unaffordable_errs_e036() {
-        let nodes = vec![
-            serde_json::json!({"node_id": "n1", "allow_remote_inference": true, "reputation_score": 0.9}),
-        ];
+        let nodes = vec![worker("n1")];
         let err = compute_cip_envelope(
             &nodes,
             &serde_json::json!({}),
             &cfg(),
+            None,
             "t1",
             None,
             Some(0.0),
@@ -371,11 +404,14 @@ mod tests {
     }
     #[test]
     fn envelope_no_eligible_errs_e022() {
-        let nodes = vec![serde_json::json!({"node_id": "n1", "allow_remote_inference": false})];
+        let mut node = worker("n1");
+        node.allow_remote_inference = false;
+        let nodes = vec![node];
         let err = compute_cip_envelope(
             &nodes,
             &serde_json::json!({}),
             &cfg(),
+            None,
             "t1",
             None,
             Some(100.0),
@@ -385,13 +421,12 @@ mod tests {
     }
     #[test]
     fn envelope_remote_builds_worker() {
-        let nodes = vec![
-            serde_json::json!({"node_id": "n1", "allow_remote_inference": true, "reputation_score": 0.9}),
-        ];
+        let nodes = vec![worker("n1")];
         let env = compute_cip_envelope(
             &nodes,
             &serde_json::json!({}),
             &cfg(),
+            None,
             "parent-1",
             None,
             Some(100.0),
@@ -408,8 +443,133 @@ mod tests {
             ..cfg()
         };
         assert_eq!(
-            compute_cip_envelope(&[], &serde_json::json!({}), &c, "t1", None, None).unwrap(),
+            compute_cip_envelope(&[], &serde_json::json!({}), &c, None, "t1", None, None).unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn restricted_scope_rejects_missing_and_foreign_provenance() {
+        let scope = CipTrustScope {
+            domain_id: "domain-a".into(),
+            authority_id: "directory-a".into(),
+            minimum_membership_generation: 7,
+        };
+        for proof in [
+            None,
+            Some(RestrictedEligibility {
+                domain_id: "domain-b".into(),
+                authority_id: "directory-a".into(),
+                membership_generation: 7,
+                membership_expires_at: u64::MAX,
+            }),
+        ] {
+            let mut candidate = worker("n1");
+            candidate.restricted_eligibility = proof;
+            let err = compute_cip_envelope(
+                &[candidate],
+                &serde_json::json!({}),
+                &cfg(),
+                Some(&scope),
+                "t1",
+                None,
+                Some(100.0),
+            )
+            .unwrap_err();
+            assert_eq!(err, CipError::NoEligibleWorkers("IICP-E022".into()));
+        }
+    }
+
+    #[test]
+    fn restricted_scope_accepts_current_matching_provenance() {
+        let scope = CipTrustScope {
+            domain_id: "domain-a".into(),
+            authority_id: "directory-a".into(),
+            minimum_membership_generation: 7,
+        };
+        let mut candidate = worker("n1");
+        candidate.restricted_eligibility = Some(RestrictedEligibility {
+            domain_id: scope.domain_id.clone(),
+            authority_id: scope.authority_id.clone(),
+            membership_generation: 7,
+            membership_expires_at: u64::MAX,
+        });
+        assert!(compute_cip_envelope(
+            &[candidate],
+            &serde_json::json!({}),
+            &cfg(),
+            Some(&scope),
+            "t1",
+            None,
+            Some(100.0),
+        )
+        .unwrap()
+        .is_some());
+    }
+
+    #[test]
+    fn restricted_scope_rejects_expired_or_stale_generation() {
+        let scope = CipTrustScope {
+            domain_id: "domain-a".into(),
+            authority_id: "directory-a".into(),
+            minimum_membership_generation: 7,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        for (generation, expiry) in [(6, u64::MAX), (7, now)] {
+            let mut candidate = worker("n1");
+            candidate.restricted_eligibility = Some(RestrictedEligibility {
+                domain_id: scope.domain_id.clone(),
+                authority_id: scope.authority_id.clone(),
+                membership_generation: generation,
+                membership_expires_at: expiry,
+            });
+            assert_eq!(
+                compute_cip_envelope(
+                    &[candidate],
+                    &serde_json::json!({}),
+                    &cfg(),
+                    Some(&scope),
+                    "t1",
+                    None,
+                    Some(100.0),
+                )
+                .unwrap_err(),
+                CipError::NoEligibleWorkers("IICP-E022".into())
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_peers_only_narrows_verified_members() {
+        let scope = CipTrustScope {
+            domain_id: "domain-a".into(),
+            authority_id: "directory-a".into(),
+            minimum_membership_generation: 7,
+        };
+        let mut candidate = worker("verified-but-not-allowed");
+        candidate.restricted_eligibility = Some(RestrictedEligibility {
+            domain_id: scope.domain_id.clone(),
+            authority_id: scope.authority_id.clone(),
+            membership_generation: 7,
+            membership_expires_at: u64::MAX,
+        });
+        let mut config = cfg();
+        config.trusted_peers = vec!["another-node".into()];
+        assert_eq!(
+            compute_cip_envelope(
+                &[candidate],
+                &serde_json::json!({}),
+                &config,
+                Some(&scope),
+                "t1",
+                None,
+                Some(100.0),
+            )
+            .unwrap_err(),
+            CipError::NoEligibleWorkers("IICP-E022".into())
         );
     }
     #[test]
