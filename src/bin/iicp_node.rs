@@ -3898,11 +3898,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             attempt += 1;
             match node.register().await {
                 Ok(t) => {
-                    eprintln!(
-                        "[iicp-node] registered as {} (token={}…)",
-                        opts.node_id,
-                        t.chars().take(8).collect::<String>()
-                    );
+                    eprintln!("[iicp-node] registered as {}", opts.node_id);
                     if let Some(ref log) = node_log {
                         log.write(
                             "register_ok",

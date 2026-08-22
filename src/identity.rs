@@ -11,6 +11,7 @@
 //! creation so other local users can't read tokens / identity.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
@@ -388,7 +389,7 @@ pub fn save_operator(op: &OperatorIdentity) -> io::Result<PathBuf> {
     Ok(p)
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct NodeIdentity {
     pub node_id: String,
     pub operator_id: String,
@@ -422,9 +423,9 @@ pub struct NodeIdentity {
     #[serde(default)]
     pub supported_receipt_profiles: Vec<String>,
     /// #456 — node_token cached after register so read-only commands (`iicp-node credits`)
-    /// can authenticate without re-registering. Bearer credential, not a secret key;
-    /// stored in the chmod-600 config alongside the operator identity. Absent until the
-    /// node first registers (via `serve`).
+    /// can authenticate without re-registering. This bearer credential is secret
+    /// material even though it is not a cryptographic key. Legacy records retain it
+    /// only for the bounded migration path tracked by #106.
     #[serde(default)]
     pub node_token: Option<String>,
     /// TC-9c — HMAC key for CIPWorkerReceipt signing. Returned by the directory on
@@ -433,6 +434,42 @@ pub struct NodeIdentity {
     #[serde(default)]
     pub node_hmac_key: Option<String>,
     pub created_at: String,
+}
+
+impl fmt::Debug for NodeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("NodeIdentity")
+            .field("node_id", &self.node_id)
+            .field("operator_id", &self.operator_id)
+            .field("name", &self.name)
+            .field("backend_url", &self.backend_url)
+            .field("backend_type", &self.backend_type)
+            .field("model", &self.model)
+            .field("intent", &self.intent)
+            .field("region", &self.region)
+            .field("directory_url", &self.directory_url)
+            .field("max_concurrent", &self.max_concurrent)
+            .field("port", &self.port)
+            .field("host", &self.host)
+            .field("public_endpoint", &self.public_endpoint)
+            .field("auto_detect_nat", &self.auto_detect_nat)
+            .field("external_ip_probe_url", &self.external_ip_probe_url)
+            .field(
+                "supported_receipt_profiles",
+                &self.supported_receipt_profiles,
+            )
+            .field(
+                "node_token",
+                &self.node_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "node_hmac_key",
+                &self.node_hmac_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("created_at", &self.created_at)
+            .finish()
+    }
 }
 
 fn default_backend_type() -> String {
@@ -687,6 +724,25 @@ mod node_identity_tests {
             identity.region, "unknown",
             "missing region field must default to 'unknown', not 'eu-central' (#484)"
         );
+    }
+
+    #[test]
+    fn node_identity_debug_redacts_runtime_credentials() {
+        let mut identity = NodeIdentity {
+            name: "redaction-test".into(),
+            node_token: Some("node-token-secret".into()),
+            node_hmac_key: Some("node-hmac-secret".into()),
+            ..Default::default()
+        };
+        let debug = format!("{identity:?}");
+        assert!(!debug.contains("node-token-secret"));
+        assert!(!debug.contains("node-hmac-secret"));
+        assert_eq!(debug.matches("[REDACTED]").count(), 2);
+
+        identity.node_token = None;
+        identity.node_hmac_key = None;
+        let empty_debug = format!("{identity:?}");
+        assert!(!empty_debug.contains("[REDACTED]"));
     }
 
     #[test]
