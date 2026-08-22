@@ -35,6 +35,15 @@ in the main repo).
 
 ## [Unreleased]
 
+### Hardened — interruption-safe credential persistence
+
+- Operator and node identity records are now written to an owner-only temporary
+  file, synchronized and atomically replaced so an interrupted credential update
+  leaves the previous complete record in place rather than a partial JSON file.
+- The parent directory is synchronized on Unix after replacement. This is a
+  persistence prerequisite for the explicit legacy-secret migration tracked in
+  issue #106; it does not itself remove existing plaintext fields.
+
 ### Added — restricted peer-admission reference
 
 - Added opt-in, fail-closed membership verification for private and

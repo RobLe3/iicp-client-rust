@@ -12,7 +12,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -60,6 +61,132 @@ fn chmod_600(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 fn chmod_600(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+/// Replace a credential-bearing JSON file without exposing a partially written
+/// destination. The temporary file lives beside the destination so the final
+/// replacement cannot cross a filesystem boundary. Owner-only permissions are
+/// applied before any secret-bearing bytes are written.
+fn atomic_write_owner_only(path: &Path, contents: &[u8]) -> io::Result<()> {
+    atomic_write_owner_only_with_commit(path, contents, || Ok(()))
+}
+
+fn atomic_write_owner_only_with_commit<F>(
+    path: &Path,
+    contents: &[u8],
+    before_commit: F,
+) -> io::Result<()>
+where
+    F: FnOnce() -> io::Result<()>,
+{
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "configuration path has no parent",
+        )
+    })?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "configuration filename is invalid",
+            )
+        })?;
+    let temporary_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    let mut cleanup = TemporaryFile::new(temporary_path);
+    let mut temporary = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(cleanup.path())?;
+    chmod_600(cleanup.path())?;
+    temporary.write_all(contents)?;
+    temporary.sync_all()?;
+    before_commit()?;
+    drop(temporary);
+    replace_destination(cleanup.path(), path)?;
+    cleanup.disarm();
+    chmod_600(path)?;
+    sync_parent_directory(parent)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_destination(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(target_os = "windows")]
+fn replace_destination(temporary: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::ptr::null;
+    use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_WRITE_THROUGH};
+
+    if !destination.exists() {
+        return fs::rename(temporary, destination);
+    }
+    let wide = |path: &Path| {
+        path.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>()
+    };
+    let replacement = wide(temporary);
+    let replaced = wide(destination);
+    // SAFETY: both paths are NUL-terminated and live through the call. No
+    // backup file or extended attribute buffers are supplied.
+    let ok = unsafe {
+        ReplaceFileW(
+            replaced.as_ptr(),
+            replacement.as_ptr(),
+            null(),
+            REPLACEFILE_WRITE_THROUGH,
+            null(),
+            null(),
+        )
+    };
+    if ok == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+struct TemporaryFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl TemporaryFile {
+    fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for TemporaryFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -257,8 +384,7 @@ pub fn save_operator(op: &OperatorIdentity) -> io::Result<PathBuf> {
     let p = operator_path()?;
     let json = serde_json::to_string_pretty(op)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(&p, format!("{json}\n"))?;
-    let _ = chmod_600(&p);
+    atomic_write_owner_only(&p, format!("{json}\n").as_bytes())?;
     Ok(p)
 }
 
@@ -381,8 +507,7 @@ pub fn save_node(node: &NodeIdentity) -> io::Result<PathBuf> {
     let p = node_path(&node.name)?;
     let json = serde_json::to_string_pretty(node)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    fs::write(&p, format!("{json}\n"))?;
-    let _ = chmod_600(&p);
+    atomic_write_owner_only(&p, format!("{json}\n").as_bytes())?;
     Ok(p)
 }
 
@@ -535,7 +660,22 @@ mod operator_identity_tests {
 
 #[cfg(test)]
 mod node_identity_tests {
-    use super::NodeIdentity;
+    use super::{atomic_write_owner_only_with_commit, NodeIdentity};
+    use std::{fs, io};
+
+    struct TestDirectory(std::path::PathBuf);
+
+    impl TestDirectory {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn node_identity_region_default_is_unknown() {
@@ -547,6 +687,48 @@ mod node_identity_tests {
             identity.region, "unknown",
             "missing region field must default to 'unknown', not 'eu-central' (#484)"
         );
+    }
+
+    #[test]
+    fn atomic_secret_file_replacement_never_exposes_partial_destination() {
+        let directory = test_directory();
+        let destination = directory.path().join("node.json");
+        fs::write(&destination, b"old-complete-record\n").unwrap();
+
+        let error =
+            atomic_write_owner_only_with_commit(&destination, b"new-complete-record\n", || {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "fixture interruption",
+                ))
+            })
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(fs::read(&destination).unwrap(), b"old-complete-record\n");
+
+        atomic_write_owner_only_with_commit(&destination, b"new-complete-record\n", || Ok(()))
+            .unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), b"new-complete-record\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_secret_file_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = test_directory();
+        let destination = directory.path().join("node.json");
+        atomic_write_owner_only_with_commit(&destination, b"secret\n", || Ok(())).unwrap();
+        assert_eq!(
+            fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    fn test_directory() -> TestDirectory {
+        let path = std::env::temp_dir().join(format!("iicp-identity-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&path).unwrap();
+        TestDirectory(path)
     }
 }
 
