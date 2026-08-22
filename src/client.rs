@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+use std::collections::HashSet;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -40,6 +41,13 @@ enum TicketRouteError {
 mod restricted_ticket_tests {
     use super::*;
     use crate::runtime_config::SecretRef;
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
 
     fn secret_file() -> std::path::PathBuf {
         let path = std::env::temp_dir().join(format!("iicp-ticket-{}", uuid::Uuid::new_v4()));
@@ -94,6 +102,87 @@ mod restricted_ticket_tests {
             .is_err());
         mock.assert_async().await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn cip_candidate_constraint_binds_initial_and_retry_workers() {
+        let _guard = env_lock();
+        unsafe { std::env::set_var("IICP_PROXY_ALLOW_LOOPBACK_NODES", "1") };
+        unsafe { std::env::set_var("IICP_CX_ALLOW_PLAINTEXT", "1") };
+        let mut directory = mockito::Server::new_async().await;
+        let mut rejected = mockito::Server::new_async().await;
+        let mut retry = mockito::Server::new_async().await;
+        let mut success = mockito::Server::new_async().await;
+        let discovery = directory
+            .mock("GET", mockito::Matcher::Regex(r"/v1/discover.*".into()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "count": 3,
+                    "nodes": [
+                        {"node_id":"rejected","endpoint":rejected.url(),"score":1.0,"load":0.0,"available":true,"region":"eu"},
+                        {"node_id":"retry","endpoint":retry.url(),"score":0.9,"load":0.0,"available":true,"region":"eu"},
+                        {"node_id":"success","endpoint":success.url(),"score":0.8,"load":0.0,"available":true,"region":"eu"}
+                    ]
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let rejected_task = rejected
+            .mock("POST", "/v1/task")
+            .expect(0)
+            .create_async()
+            .await;
+        let retry_task = retry
+            .mock("POST", "/v1/task")
+            .with_status(503)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"error":{"code":"backend_unavailable"}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        let success_task = success
+            .mock("POST", "/v1/task")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"task_id":"cip-1","status":"success","result":{},"metrics":null}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = IicpClient::new(ClientConfig {
+            directory_url: directory.url(),
+            route_discovery_mode: "legacy".into(),
+            routing_strategy: "deterministic".into(),
+            ..ClientConfig::default()
+        })
+        .unwrap();
+        let response = client
+            .submit_to_node_ids(
+                TaskRequest {
+                    task_id: "cip-1".into(),
+                    intent: "urn:iicp:intent:llm:chat:v1".into(),
+                    payload: serde_json::json!({}),
+                    constraints: None,
+                    route_constraints: None,
+                    auth: None,
+                    source_node_id: None,
+                    routing_policy: None,
+                },
+                HashSet::from(["retry".into(), "success".into()]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, "success");
+        discovery.assert_async().await;
+        rejected_task.assert_async().await;
+        retry_task.assert_async().await;
+        success_task.assert_async().await;
+        unsafe { std::env::remove_var("IICP_PROXY_ALLOW_LOOPBACK_NODES") };
+        unsafe { std::env::remove_var("IICP_CX_ALLOW_PLAINTEXT") };
     }
 }
 
@@ -646,13 +735,25 @@ impl IicpClient {
     /// Retries up to MAX_RETRIES on transient errors (SDK-05).
     /// Generates one W3C traceparent shared across discover + POST (SDK-06).
     pub async fn submit(&self, request: TaskRequest) -> Result<TaskResponse> {
-        self.submit_internal(request, None).await
+        self.submit_internal(request, None, None).await
+    }
+
+    /// Submit while restricting every initial and retry candidate to a
+    /// process-local set produced by an already validated CIP discovery.
+    pub(crate) async fn submit_to_node_ids(
+        &self,
+        request: TaskRequest,
+        allowed_node_ids: HashSet<String>,
+    ) -> Result<TaskResponse> {
+        self.submit_internal(request, None, Some(&allowed_node_ids))
+            .await
     }
 
     async fn submit_internal(
         &self,
         mut request: TaskRequest,
         runtime_identity: Option<RuntimeIdentityDispatch>,
+        allowed_node_ids: Option<&HashSet<String>>,
     ) -> Result<TaskResponse> {
         self.validate_intent(&request.intent)?;
         if request.task_id.is_empty() {
@@ -703,6 +804,9 @@ impl IicpClient {
             .nodes
             .into_iter()
             .filter(|n| {
+                if allowed_node_ids.is_some_and(|allowed| !allowed.contains(&n.node_id)) {
+                    return false;
+                }
                 if !is_ssrf_safe(&n.endpoint) {
                     eprintln!(
                         "[iicp-client] SSRF guard: skipping node {} — endpoint {} is not publicly routable",
@@ -717,6 +821,12 @@ impl IicpClient {
                 true
             })
             .collect();
+
+        if allowed_node_ids.is_some() && pre_policy_nodes.is_empty() {
+            return Err(IicpError::NoNodes {
+                intent: request.intent.clone(),
+            });
+        }
 
         let request_policy = request
             .routing_policy
@@ -1099,6 +1209,7 @@ impl IicpClient {
                     messages: original_messages,
                     options: runtime_identity,
                 }),
+                None,
             )
             .await?;
         let node_id = task_resp.metrics.as_ref().and_then(|m| m.node_id.clone());

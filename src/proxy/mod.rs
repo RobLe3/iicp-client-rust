@@ -10,6 +10,7 @@
 //! (402 IICP-E036 / 503 IICP-E022) require porting the proxy CIP dispatch and are
 //! tracked under the conformance issue (#482).
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -69,6 +70,21 @@ pub trait ProxyBackend: Send + Sync {
     fn cip_trust_scope(&self) -> Option<CipTrustScope> {
         None
     }
+
+    /// Submit a remote CIP request while keeping initial and retry selection
+    /// inside the already eligible worker set.
+    fn submit_to_candidates(
+        &self,
+        _intent: String,
+        _payload: Value,
+        _allowed_node_ids: HashSet<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, ProxyDispatchError>> + Send + '_>> {
+        Box::pin(async {
+            Err(ProxyDispatchError::Cip(CipError::NoEligibleWorkers(
+                "IICP-E022".into(),
+            )))
+        })
+    }
 }
 
 impl ProxyBackend for IicpClient {
@@ -126,6 +142,36 @@ impl ProxyBackend for IicpClient {
                 authority_id: context.authority_id.clone(),
                 minimum_membership_generation: context.minimum_membership_generation,
             })
+    }
+
+    fn submit_to_candidates(
+        &self,
+        intent: String,
+        payload: Value,
+        allowed_node_ids: HashSet<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<TaskResponse, ProxyDispatchError>> + Send + '_>> {
+        Box::pin(async move {
+            self.submit_to_node_ids(
+                TaskRequest {
+                    task_id: String::new(),
+                    intent,
+                    payload,
+                    constraints: None,
+                    route_constraints: None,
+                    auth: None,
+                    source_node_id: None,
+                    routing_policy: None,
+                },
+                allowed_node_ids,
+            )
+            .await
+            .map_err(|error| match error {
+                IicpError::NoNodes { .. } => {
+                    ProxyDispatchError::Cip(CipError::NoEligibleWorkers("IICP-E022".into()))
+                }
+                other => ProxyDispatchError::Iicp(other),
+            })
+        })
     }
 }
 
@@ -268,6 +314,7 @@ async fn run_task(b: &Backend, messages: Value, model: &str, body: &Value) -> Ou
     }
     // CIP consumer gating (§2.2) — only when enabled; surfaces 402 (E036) / 503 (E022),
     // else returns an envelope to attach. Pure consumer → Gate-4 local-first is skipped.
+    let mut cip_allowed_node_ids: Option<HashSet<String>> = None;
     if CIP_CONFIG.enabled {
         let nodes = b.discover(INTENT.to_string()).await;
         let balance = body
@@ -286,15 +333,23 @@ async fn run_task(b: &Backend, messages: Value, model: &str, body: &Value) -> Ou
             balance,
         ) {
             Err(e) => return cip_outcome(&e),
-            Ok(Some(env)) => {
-                if let (Some(obj), Some(eo)) = (payload.as_object_mut(), env.as_object()) {
-                    obj.insert("cip".to_string(), Value::Object(eo.clone()));
+            Ok(plan) => {
+                cip_allowed_node_ids = plan.allowed_node_ids.map(|ids| ids.into_iter().collect());
+                if let Some(env) = plan.envelope {
+                    if let (Some(obj), Some(eo)) = (payload.as_object_mut(), env.as_object()) {
+                        obj.insert("cip".to_string(), Value::Object(eo.clone()));
+                    }
                 }
             }
-            Ok(None) => {}
         }
     }
-    match b.submit(INTENT.to_string(), payload).await {
+    let submitted = if let Some(allowed) = cip_allowed_node_ids {
+        b.submit_to_candidates(INTENT.to_string(), payload, allowed)
+            .await
+    } else {
+        b.submit(INTENT.to_string(), payload).await
+    };
+    match submitted {
         Ok(resp) if resp.status == "success" || resp.status == "completed" => Outcome::Ok(resp),
         Ok(resp) => {
             let code = resp
