@@ -155,6 +155,7 @@ fn write_protected_file(path: &Path, value: &[u8]) -> Result<(), &'static str> {
     if !parent_metadata.is_dir()
         || parent_metadata.file_type().is_symlink()
         || parent_metadata.uid() != unsafe { libc::geteuid() }
+        || parent_metadata.mode() & 0o022 != 0
     {
         return Err(SECRET_FILE_UNSAFE);
     }
@@ -504,6 +505,10 @@ mod tests {
         delete(&reference, None).unwrap();
         assert_eq!(resolve(&reference, None).unwrap_err(), SECRET_UNAVAILABLE);
         delete(&reference, None).unwrap();
+
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o722)).unwrap();
+        assert_eq!(store(&reference, "unsafe", None), Err(SECRET_FILE_UNSAFE));
+        assert!(!path.exists());
         std::fs::remove_dir_all(root).unwrap();
     }
 }
