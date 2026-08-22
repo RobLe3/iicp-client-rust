@@ -35,6 +35,11 @@ in the main repo).
 
 ## [Unreleased]
 
+- Redact legacy node credentials from `NodeIdentity` diagnostics and stop
+  printing bearer-token prefixes after registration. This closes two disclosure
+  paths while the explicit plaintext-to-reference migration in #106 remains in
+  progress.
+
 ### Hardened — interruption-safe credential persistence
 
 - Operator and node identity records are now written to an owner-only temporary
