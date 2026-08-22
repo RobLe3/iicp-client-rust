@@ -433,6 +433,10 @@ pub struct NodeIdentity {
     /// waiting for the next re-registration cycle. Absent until first `serve`.
     #[serde(default)]
     pub node_hmac_key: Option<String>,
+    /// Typed locations for runtime credentials. References contain no secret
+    /// material and supersede the legacy plaintext fields when present.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub secret_refs: std::collections::BTreeMap<String, crate::runtime_config::SecretRef>,
     pub created_at: String,
 }
 
@@ -466,6 +470,10 @@ impl fmt::Debug for NodeIdentity {
             .field(
                 "node_hmac_key",
                 &self.node_hmac_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field(
+                "secret_ref_names",
+                &self.secret_refs.keys().collect::<Vec<_>>(),
             )
             .field("created_at", &self.created_at)
             .finish()
@@ -605,6 +613,7 @@ pub fn generate_node(
         supported_receipt_profiles: Vec::new(),
         node_token: None,    // cached on first register (#456)
         node_hmac_key: None, // cached on first register (TC-9c)
+        secret_refs: std::collections::BTreeMap::new(),
         created_at: now_iso(),
     })
 }

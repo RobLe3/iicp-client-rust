@@ -27,6 +27,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::PathBuf;
 use std::process;
 use std::time::Duration;
+use subtle::ConstantTimeEq;
 
 use iicp_client::backends::invoke_backend;
 use iicp_client::backends::openai_compat::OpenAiCompatOptions;
@@ -740,17 +741,23 @@ fn config_environment_overrides() -> Result<iicp_client::runtime_config::ConfigO
 }
 
 fn run_config(args: &[String]) -> Result<i32, String> {
-    use iicp_client::runtime_config::{ConfigOverrides, OperatingMode, RuntimeConfigV1};
-
     let Some(action) = args.first().map(String::as_str) else {
-        return Err("config requires schema, validate, effective or migrate-node".into());
+        return Err(
+            "config requires schema, validate, effective, migrate-node or migrate-node-secrets"
+                .into(),
+        );
     };
     match action {
-        "schema" => return run_config_schema(args),
-        "migrate-node" => return run_config_migration(args),
-        "validate" | "effective" => {}
-        _ => return Err(format!("unknown config action: {action}")),
+        "schema" => run_config_schema(args),
+        "migrate-node" => run_config_migration(args),
+        "migrate-node-secrets" => run_node_secret_migration(args),
+        "validate" | "effective" => run_resolved_config_action(action, args),
+        _ => Err(format!("unknown config action: {action}")),
     }
+}
+
+fn run_resolved_config_action(action: &str, args: &[String]) -> Result<i32, String> {
+    use iicp_client::runtime_config::{ConfigOverrides, OperatingMode, RuntimeConfigV1};
 
     let mut file = None;
     let mut cli = ConfigOverrides::default();
@@ -846,6 +853,199 @@ fn run_config_migration(args: &[String]) -> Result<i32, String> {
         serde_json::to_string_pretty(&migration.config).map_err(|error| error.to_string())?
     );
     Ok(0)
+}
+
+fn run_node_secret_migration(args: &[String]) -> Result<i32, String> {
+    use iicp_client::runtime_config::RuntimeConfigV1;
+
+    let mut node_name = None;
+    let mut config_file = None;
+    let mut i = 1;
+    while i < args.len() {
+        let option = args[i].as_str();
+        if i + 1 >= args.len() {
+            return Err(format!("{option} requires a value"));
+        }
+        match option {
+            "--node" => node_name = Some(args[i + 1].clone()),
+            "--file" => config_file = Some(args[i + 1].clone()),
+            _ => return Err(format!("unknown migrate-node-secrets option: {option}")),
+        }
+        i += 2;
+    }
+    let node_name = node_name
+        .ok_or("usage: iicp-node config migrate-node-secrets --node NAME --file CONFIG")?;
+    let config_file = config_file
+        .ok_or("usage: iicp-node config migrate-node-secrets --node NAME --file CONFIG")?;
+    let config = RuntimeConfigV1::from_json(
+        &fs::read_to_string(&config_file)
+            .map_err(|error| format!("read runtime config {config_file}: {error}"))?,
+    )?;
+    let mut node = load_node(&node_name)
+        .map_err(|error| format!("load saved node: {error}"))?
+        .ok_or_else(|| format!("saved node {node_name:?} does not exist"))?;
+    migrate_node_secret_values(&mut node, &config.secret_refs, |updated| {
+        save_node(updated)
+            .map(|_| ())
+            .map_err(|_| "credential migration commit failed".to_string())
+    })?;
+    println!("Migrated saved node {node_name:?} to protected secret references.");
+    Ok(0)
+}
+
+#[derive(Clone)]
+struct SecretRollback {
+    reference: iicp_client::runtime_config::SecretRef,
+    previous: Option<String>,
+}
+
+fn migrate_node_secret_values<F>(
+    node: &mut NodeIdentity,
+    configured_refs: &BTreeMap<String, iicp_client::runtime_config::SecretRef>,
+    commit: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&NodeIdentity) -> Result<(), String>,
+{
+    let original = node.clone();
+    let values = [
+        ("node_token", node.node_token.clone()),
+        ("node_hmac_key", node.node_hmac_key.clone()),
+    ];
+    let mut applied = Vec::new();
+    for (name, value) in values {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if let Err(error) =
+            apply_secret_migration_entry(node, name, &value, configured_refs, &mut applied)
+        {
+            rollback_secret_writes(&applied);
+            *node = original;
+            return Err(error);
+        }
+    }
+    if node.node_token.is_some() || node.node_hmac_key.is_some() {
+        rollback_secret_writes(&applied);
+        *node = original;
+        return Err("legacy secret migration remained incomplete".into());
+    }
+    if let Err(error) = commit(node) {
+        rollback_secret_writes(&applied);
+        *node = original;
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn apply_secret_migration_entry(
+    node: &mut NodeIdentity,
+    name: &str,
+    value: &str,
+    configured_refs: &BTreeMap<String, iicp_client::runtime_config::SecretRef>,
+    applied: &mut Vec<SecretRollback>,
+) -> Result<(), String> {
+    let reference = configured_refs
+        .get(name)
+        .ok_or_else(|| format!("missing required secret_refs.{name}"))?
+        .clone();
+    let previous = match iicp_client::secret_store::resolve(&reference, None) {
+        Ok(value) => Some(value.expose().to_string()),
+        Err(iicp_client::secret_store::SECRET_UNAVAILABLE) => None,
+        Err(error) => return Err(format!("secret provider unavailable for {name}: {error}")),
+    };
+    applied.push(SecretRollback {
+        reference: reference.clone(),
+        previous,
+    });
+    iicp_client::secret_store::store(&reference, value, None)
+        .map_err(|_| format!("secret write failed for {name}"))?;
+    let verified = iicp_client::secret_store::resolve(&reference, None)
+        .map_err(|_| format!("secret write verification failed for {name}"))?;
+    if verified
+        .expose()
+        .as_bytes()
+        .ct_eq(value.as_bytes())
+        .unwrap_u8()
+        != 1
+    {
+        return Err(format!("secret write verification failed for {name}"));
+    }
+    node.secret_refs.insert(name.to_string(), reference);
+    match name {
+        "node_token" => node.node_token = None,
+        "node_hmac_key" => node.node_hmac_key = None,
+        _ => return Err("unsupported saved credential class".into()),
+    }
+    Ok(())
+}
+
+fn rollback_secret_writes(applied: &[SecretRollback]) {
+    for entry in applied.iter().rev() {
+        if let Some(previous) = &entry.previous {
+            let _ = iicp_client::secret_store::store(&entry.reference, previous, None);
+        } else {
+            let _ = iicp_client::secret_store::delete(&entry.reference, None);
+        }
+    }
+}
+
+fn resolve_identity_credential(
+    node: &NodeIdentity,
+    name: &str,
+    legacy: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(reference) = node.secret_refs.get(name) {
+        return iicp_client::secret_store::resolve(reference, None)
+            .map(|value| Some(value.expose().to_string()))
+            .map_err(|error| format!("saved credential reference {name} unavailable: {error}"));
+    }
+    Ok(legacy.filter(|value| !value.is_empty()).map(str::to_string))
+}
+
+fn identity_has_credential(node: &NodeIdentity, name: &str, legacy: Option<&str>) -> bool {
+    node.secret_refs.contains_key(name) || legacy.is_some_and(|value| !value.is_empty())
+}
+
+fn persist_registered_identity_credentials(
+    node: &mut NodeIdentity,
+    token: &str,
+    hmac_key: Option<&str>,
+) -> Result<(), String> {
+    for (name, value) in [("node_token", Some(token)), ("node_hmac_key", hmac_key)] {
+        let Some(value) = value.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        if let Some(reference) = node.secret_refs.get(name) {
+            iicp_client::secret_store::store(reference, value, None)
+                .map_err(|_| format!("protected credential persistence failed for {name}"))?;
+            let verified = iicp_client::secret_store::resolve(reference, None)
+                .map_err(|_| format!("protected credential verification failed for {name}"))?;
+            if verified
+                .expose()
+                .as_bytes()
+                .ct_eq(value.as_bytes())
+                .unwrap_u8()
+                != 1
+            {
+                return Err(format!(
+                    "protected credential verification failed for {name}"
+                ));
+            }
+            match name {
+                "node_token" => node.node_token = None,
+                "node_hmac_key" => node.node_hmac_key = None,
+                _ => unreachable!(),
+            }
+        } else {
+            match name {
+                "node_token" => node.node_token = Some(value.to_string()),
+                "node_hmac_key" => node.node_hmac_key = Some(value.to_string()),
+                _ => unreachable!(),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn emit_resolved_config(
@@ -1984,11 +2184,17 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
         } else {
             let default_node = saved.iter().find(|n| n.name == "default");
             match default_node {
-                Some(d) if d.node_token.is_some() => Some(d.name.clone()),
+                Some(d) if identity_has_credential(d, "node_token", d.node_token.as_deref()) => {
+                    Some(d.name.clone())
+                }
                 Some(d) => {
                     // Default exists but has no cached token — prefer a node that does.
-                    let with_token: Vec<_> =
-                        saved.iter().filter(|n| n.node_token.is_some()).collect();
+                    let with_token: Vec<_> = saved
+                        .iter()
+                        .filter(|n| {
+                            identity_has_credential(n, "node_token", n.node_token.as_deref())
+                        })
+                        .collect();
                     match with_token.len() {
                         0 => Some(d.name.clone()), // fall through; "run serve" error fires below
                         1 => {
@@ -2008,7 +2214,14 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                                     (
                                         n.name.clone(),
                                         n.node_id.clone(),
-                                        n.node_token.clone().unwrap_or_default(),
+                                        resolve_identity_credential(
+                                            n,
+                                            "node_token",
+                                            n.node_token.as_deref(),
+                                        )
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or_default(),
                                         n.directory_url.clone(),
                                     )
                                 })
@@ -2080,7 +2293,11 @@ async fn run_credits(args: &[String]) -> Result<(), String> {
                 directory_url.get_or_insert(ni.directory_url.clone());
                 node_id.get_or_insert(ni.node_id.clone());
                 if token.is_none() {
-                    token = ni.node_token.clone();
+                    token = resolve_identity_credential(
+                        &ni,
+                        "node_token",
+                        ni.node_token.as_deref(),
+                    )?;
                 }
             }
             Ok(None) => {
@@ -3134,7 +3351,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     if node_supplied {
         match load_node(&opts.node).map_err(|e| e.to_string())? {
             Some(saved) => {
-                saved_node_token = saved.node_token.clone();
+                saved_node_token =
+                    resolve_identity_credential(&saved, "node_token", saved.node_token.as_deref())?;
                 apply_saved_node(&mut opts, &saved);
             }
             None => {
@@ -3467,7 +3685,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // without waiting for the first re-registration cycle.
     if !opts.node.is_empty() {
         if let Ok(Some(ni)) = load_node(&opts.node) {
-            if let Some(k) = ni.node_hmac_key {
+            if let Some(k) =
+                resolve_identity_credential(&ni, "node_hmac_key", ni.node_hmac_key.as_deref())?
+            {
                 if !k.is_empty() {
                     cfg.node_hmac_key = k;
                 }
@@ -3911,12 +4131,17 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                     // immediately on restart (best-effort).
                     if !opts.node.is_empty() {
                         if let Ok(Some(mut ni)) = load_node(&opts.node) {
-                            ni.node_token = Some(t.clone());
                             let hmac_key = node.node_hmac_key();
-                            if !hmac_key.is_empty() {
-                                ni.node_hmac_key = Some(hmac_key);
+                            persist_registered_identity_credentials(
+                                &mut ni,
+                                &t,
+                                Some(hmac_key.as_str()).filter(|value| !value.is_empty()),
+                            )?;
+                            if let Err(error) = save_node(&ni) {
+                                return Err(format!(
+                                    "could not commit protected saved credentials: {error}"
+                                ));
                             }
-                            let _ = save_node(&ni);
                         }
                     }
                     if !opts.node.is_empty() {
@@ -6011,6 +6236,114 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(unix)]
+    fn secret_migration_fixture() -> (
+        std::path::PathBuf,
+        BTreeMap<String, iicp_client::runtime_config::SecretRef>,
+    ) {
+        let root = std::env::temp_dir().join(format!(
+            "iicp-node-secret-migration-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let refs = BTreeMap::from([
+            (
+                "node_token".to_string(),
+                iicp_client::runtime_config::SecretRef::File {
+                    path: root.join("node-token").to_string_lossy().to_string(),
+                },
+            ),
+            (
+                "node_hmac_key".to_string(),
+                iicp_client::runtime_config::SecretRef::File {
+                    path: root.join("node-hmac-key").to_string_lossy().to_string(),
+                },
+            ),
+        ]);
+        (root, refs)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_secret_migration_commits_references_only_after_verification() {
+        let (root, refs) = secret_migration_fixture();
+        let mut node = NodeIdentity {
+            name: "migration-test".into(),
+            node_token: Some("private-token".into()),
+            node_hmac_key: Some("private-hmac".into()),
+            ..Default::default()
+        };
+        migrate_node_secret_values(&mut node, &refs, |_| Ok(())).unwrap();
+        assert!(node.node_token.is_none());
+        assert!(node.node_hmac_key.is_none());
+        assert_eq!(node.secret_refs, refs);
+        let serialized = serde_json::to_string(&node).unwrap();
+        assert!(!serialized.contains("private-token"));
+        assert!(!serialized.contains("private-hmac"));
+        assert_eq!(
+            fs::read_to_string(root.join("node-token")).unwrap(),
+            "private-token"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("node-hmac-key")).unwrap(),
+            "private-hmac"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_secret_migration_rolls_back_an_earlier_write_when_a_reference_is_missing() {
+        let (root, mut refs) = secret_migration_fixture();
+        refs.remove("node_hmac_key");
+        let mut node = NodeIdentity {
+            name: "migration-partial".into(),
+            node_token: Some("new-token".into()),
+            node_hmac_key: Some("new-hmac".into()),
+            ..Default::default()
+        };
+        let error = migrate_node_secret_values(&mut node, &refs, |_| Ok(())).unwrap_err();
+        assert_eq!(error, "missing required secret_refs.node_hmac_key");
+        assert_eq!(node.node_token.as_deref(), Some("new-token"));
+        assert_eq!(node.node_hmac_key.as_deref(), Some("new-hmac"));
+        assert!(node.secret_refs.is_empty());
+        assert!(!root.join("node-token").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn node_secret_migration_restores_provider_and_identity_on_commit_failure() {
+        let (root, refs) = secret_migration_fixture();
+        iicp_client::secret_store::store(&refs["node_token"], "prior-token", None).unwrap();
+        iicp_client::secret_store::store(&refs["node_hmac_key"], "prior-hmac", None).unwrap();
+        let mut node = NodeIdentity {
+            name: "migration-rollback".into(),
+            node_token: Some("new-token".into()),
+            node_hmac_key: Some("new-hmac".into()),
+            ..Default::default()
+        };
+        let error = migrate_node_secret_values(&mut node, &refs, |_| {
+            Err("simulated identity commit failure".into())
+        })
+        .unwrap_err();
+        assert_eq!(error, "simulated identity commit failure");
+        assert_eq!(node.node_token.as_deref(), Some("new-token"));
+        assert_eq!(node.node_hmac_key.as_deref(), Some("new-hmac"));
+        assert!(node.secret_refs.is_empty());
+        assert_eq!(
+            fs::read_to_string(root.join("node-token")).unwrap(),
+            "prior-token"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("node-hmac-key")).unwrap(),
+            "prior-hmac"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn private_runtime_config_fails_before_serve_when_incomplete() {

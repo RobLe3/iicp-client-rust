@@ -24,6 +24,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use socket2::{Domain, Protocol, Socket, Type};
+use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 
@@ -179,11 +180,44 @@ fn update_saved_identity_credentials(
     identity: &mut crate::identity::NodeIdentity,
     token: &str,
     hmac_key: Option<&str>,
-) {
-    identity.node_token = Some(token.to_string());
+) -> std::result::Result<(), &'static str> {
+    persist_identity_credential(identity, "node_token", token)?;
     if let Some(key) = hmac_key.filter(|k| !k.is_empty()) {
-        identity.node_hmac_key = Some(key.to_string());
+        persist_identity_credential(identity, "node_hmac_key", key)?;
     }
+    Ok(())
+}
+
+fn persist_identity_credential(
+    identity: &mut crate::identity::NodeIdentity,
+    name: &str,
+    value: &str,
+) -> std::result::Result<(), &'static str> {
+    if let Some(reference) = identity.secret_refs.get(name) {
+        crate::secret_store::store(reference, value, None)?;
+        let verified = crate::secret_store::resolve(reference, None)?;
+        if verified
+            .expose()
+            .as_bytes()
+            .ct_eq(value.as_bytes())
+            .unwrap_u8()
+            != 1
+        {
+            return Err(crate::secret_store::SECRET_UNAVAILABLE);
+        }
+        match name {
+            "node_token" => identity.node_token = None,
+            "node_hmac_key" => identity.node_hmac_key = None,
+            _ => return Err(crate::secret_store::SECRET_UNAVAILABLE),
+        }
+    } else {
+        match name {
+            "node_token" => identity.node_token = Some(value.to_string()),
+            "node_hmac_key" => identity.node_hmac_key = Some(value.to_string()),
+            _ => return Err(crate::secret_store::SECRET_UNAVAILABLE),
+        }
+    }
+    Ok(())
 }
 
 fn persist_saved_credentials(saved_node_name: Option<&str>, token: &str, hmac_key: Option<&str>) {
@@ -195,7 +229,12 @@ fn persist_saved_credentials(saved_node_name: Option<&str>, token: &str, hmac_ke
     }
     match crate::identity::load_node(name) {
         Ok(Some(mut identity)) => {
-            update_saved_identity_credentials(&mut identity, token, hmac_key);
+            if update_saved_identity_credentials(&mut identity, token, hmac_key).is_err() {
+                tracing::warn!(
+                    "could not persist refreshed protected credentials for saved node {name}"
+                );
+                return;
+            }
             if let Err(err) = crate::identity::save_node(&identity) {
                 tracing::warn!(
                     "could not persist refreshed node credentials for saved node {name}: {err}"
@@ -3795,13 +3834,59 @@ mod reregister_tests {
             supported_receipt_profiles: Vec::new(),
             node_token: Some("old-token".to_string()),
             node_hmac_key: Some("old-hmac".to_string()),
+            secret_refs: std::collections::BTreeMap::new(),
             created_at: "2026-07-09T00:00:00Z".to_string(),
         };
 
-        update_saved_identity_credentials(&mut node, "new-token", Some("new-hmac"));
+        update_saved_identity_credentials(&mut node, "new-token", Some("new-hmac")).unwrap();
 
         assert_eq!(node.node_token.as_deref(), Some("new-token"));
         assert_eq!(node.node_hmac_key.as_deref(), Some("new-hmac"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn update_saved_identity_credentials_uses_references_without_plaintext_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!(
+            "iicp-refreshed-credentials-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut node = crate::identity::NodeIdentity {
+            name: "protected-refresh".into(),
+            node_token: Some("legacy-token".into()),
+            node_hmac_key: Some("legacy-hmac".into()),
+            secret_refs: std::collections::BTreeMap::from([
+                (
+                    "node_token".into(),
+                    crate::runtime_config::SecretRef::File {
+                        path: root.join("token").to_string_lossy().to_string(),
+                    },
+                ),
+                (
+                    "node_hmac_key".into(),
+                    crate::runtime_config::SecretRef::File {
+                        path: root.join("hmac").to_string_lossy().to_string(),
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        update_saved_identity_credentials(&mut node, "new-token", Some("new-hmac")).unwrap();
+        assert!(node.node_token.is_none());
+        assert!(node.node_hmac_key.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.join("token")).unwrap(),
+            "new-token"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("hmac")).unwrap(),
+            "new-hmac"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]
