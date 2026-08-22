@@ -1009,7 +1009,7 @@ dependencies = [
 
 [[package]]
 name = "iicp-client"
-version = "0.7.106"
+version = "0.7.107"
 dependencies = [
  "aes-gcm",
  "async-stream",
