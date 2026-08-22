@@ -67,6 +67,48 @@ impl HttpClient {
         Ok(serde_json::from_value(body)?)
     }
 
+    /// Authenticated request to one configured restricted-directory authority.
+    /// Redirects are disabled so membership evidence cannot cross an authority
+    /// boundary. The caller validates the returned decision projection.
+    pub(crate) async fn get_restricted_json(
+        &self,
+        url: &str,
+        membership: &str,
+        subject_id: &str,
+        traceparent: Option<&str>,
+    ) -> Result<Value> {
+        let tp = traceparent
+            .map(str::to_owned)
+            .unwrap_or_else(make_traceparent);
+        let client = Client::builder()
+            .timeout(Duration::from_millis(self.timeout_ms))
+            .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let resp = client
+            .get(url)
+            .header("traceparent", tp)
+            .header("X-IICP-Membership", membership)
+            .header("X-IICP-Subject-Id", subject_id)
+            .send()
+            .await?;
+        if resp.status().is_redirection() {
+            return Err(IicpError::EndpointRefused(
+                "restricted directory redirect is not allowed".into(),
+            ));
+        }
+        let status = resp.status().as_u16();
+        let body: Value = resp.json().await?;
+        if status >= 400 {
+            return Err(IicpError::Protocol {
+                code: body["error"]["code"].as_str().unwrap_or("unknown").into(),
+                message: body["error"]["message"].as_str().unwrap_or("").into(),
+                status,
+            });
+        }
+        Ok(body)
+    }
+
     /// Expose the inner `Client` for consumer token acquisition.
     pub(crate) fn inner(&self) -> &Client {
         &self.inner
