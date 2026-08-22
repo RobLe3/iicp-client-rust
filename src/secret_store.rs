@@ -12,7 +12,7 @@ use std::fs::OpenOptions;
 #[cfg(unix)]
 use std::io::Write;
 use std::path::Path;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 use std::process::Command;
 #[cfg(target_os = "linux")]
 use std::process::Stdio;
@@ -108,6 +108,9 @@ pub fn store(
         SecretRef::LinuxSecretService { collection, label } => {
             store_linux_secret_service(collection, label, value)
         }
+        SecretRef::MacosKeychain { service, account } => {
+            store_macos_keychain(service, account, value)
+        }
         SecretRef::WindowsCredential { target } => store_windows_credential(target, value),
         SecretRef::External {
             provider,
@@ -130,6 +133,7 @@ pub fn delete(
         SecretRef::LinuxSecretService { collection, label } => {
             delete_linux_secret_service(collection, label)
         }
+        SecretRef::MacosKeychain { service, account } => delete_macos_keychain(service, account),
         SecretRef::WindowsCredential { target } => delete_windows_credential(target),
         SecretRef::External {
             provider,
@@ -233,15 +237,39 @@ fn delete_protected_file(path: &Path) -> Result<(), &'static str> {
 
 #[cfg(target_os = "macos")]
 fn resolve_macos_keychain(service: &str, account: &str) -> Result<String, &'static str> {
-    let output = Command::new("/usr/bin/security")
-        .args(["find-generic-password", "-w", "-s", service, "-a", account])
-        .output()
-        .map_err(|_| SECRET_UNAVAILABLE)?;
-    command_value(output)
+    let bytes = Zeroizing::new(
+        security_framework::passwords::generic_password(
+            security_framework::passwords::PasswordOptions::new_generic_password(service, account),
+        )
+        .map_err(|_| SECRET_UNAVAILABLE)?,
+    );
+    String::from_utf8(bytes.to_vec()).map_err(|_| SECRET_UNAVAILABLE)
 }
 
 #[cfg(not(target_os = "macos"))]
 fn resolve_macos_keychain(_service: &str, _account: &str) -> Result<String, &'static str> {
+    Err(SECRET_PROVIDER_UNSUPPORTED)
+}
+
+#[cfg(target_os = "macos")]
+fn store_macos_keychain(service: &str, account: &str, value: &str) -> Result<(), &'static str> {
+    security_framework::passwords::set_generic_password(service, account, value.as_bytes())
+        .map_err(|_| SECRET_UNAVAILABLE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn store_macos_keychain(_service: &str, _account: &str, _value: &str) -> Result<(), &'static str> {
+    Err(SECRET_PROVIDER_UNSUPPORTED)
+}
+
+#[cfg(target_os = "macos")]
+fn delete_macos_keychain(service: &str, account: &str) -> Result<(), &'static str> {
+    security_framework::passwords::delete_generic_password(service, account)
+        .map_err(|_| SECRET_UNAVAILABLE)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn delete_macos_keychain(_service: &str, _account: &str) -> Result<(), &'static str> {
     Err(SECRET_PROVIDER_UNSUPPORTED)
 }
 
@@ -447,7 +475,7 @@ fn decode_windows_credential_blob(bytes: Vec<u8>) -> Result<String, &'static str
     String::from_utf8(bytes).map_err(|_| SECRET_UNAVAILABLE)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "linux")]
 fn command_value(output: std::process::Output) -> Result<String, &'static str> {
     if !output.status.success() {
         return Err(SECRET_UNAVAILABLE);
@@ -659,6 +687,23 @@ mod tests {
         assert_eq!(store(&reference, "unsafe", None), Err(SECRET_FILE_UNSAFE));
         assert!(!path.exists());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "uses the current user's macOS Keychain"]
+    fn macos_keychain_store_rotate_resolve_and_delete() {
+        let unique = uuid::Uuid::new_v4().to_string();
+        let reference = SecretRef::MacosKeychain {
+            service: format!("network.iicp.secret-store-test.{unique}"),
+            account: "iicp-test".to_string(),
+        };
+        store(&reference, "first-value", None).unwrap();
+        assert_eq!(resolve(&reference, None).unwrap().expose(), "first-value");
+        store(&reference, "rotated-value", None).unwrap();
+        assert_eq!(resolve(&reference, None).unwrap().expose(), "rotated-value");
+        delete(&reference, None).unwrap();
+        assert!(matches!(resolve(&reference, None), Err(SECRET_UNAVAILABLE)));
     }
 
     #[cfg(target_os = "linux")]
