@@ -13,7 +13,7 @@ back to a plaintext field.
 | Owner-only file | Unix | Unix, using a same-directory atomic replacement |
 | macOS Keychain | Yes on macOS | Not yet implemented |
 | Windows Credential Manager | Yes on Windows | Not yet implemented |
-| Linux Secret Service | Yes on Linux | Not yet implemented |
+| Linux Secret Service | Yes on Linux | Linux, using `secret-tool` with secret input on stdin |
 | External provider | Provider-defined | Provider-defined through the mutation interface |
 
 The file source rejects symbolic links, non-files, files owned by another user
