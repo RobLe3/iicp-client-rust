@@ -248,6 +248,7 @@ struct ServeOpts {
     /// Explicit operator receipt-profile opt-in; None allows saved-node fallback.
     receipt_profiles: Option<Vec<String>>,
     restricted_peer_bundle: Option<iicp_client::restricted_membership::RestrictedPeerBundle>,
+    restricted_directory_context: Option<iicp_client::RestrictedDirectoryContext>,
     enable_mesh: bool,
 }
 
@@ -2379,6 +2380,7 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
             Err(_) => None,
         },
         restricted_peer_bundle: None,
+        restricted_directory_context: None,
         enable_mesh: false,
     };
     let mut config_file = env::var("IICP_CONFIG_FILE").ok();
@@ -2544,7 +2546,33 @@ fn apply_restricted_peer_config(
     ) {
         return Ok(());
     }
-    opts.restricted_peer_bundle = Some(load_restricted_peer_bundle(config)?);
+    let bundle = load_restricted_peer_bundle(config)?;
+    let domain_id = config.trust_domain_id.clone().ok_or_else(|| {
+        "restricted_trust_domain_required: private mode requires trust_domain_id".to_string()
+    })?;
+    let authority_id = config.directory.authority_id.clone().ok_or_else(|| {
+        "restricted_directory_authority_required: private mode requires directory.authority_id"
+            .to_string()
+    })?;
+    if bundle.policy.domain_id != domain_id || bundle.policy.authority_id != authority_id {
+        return Err(
+            "restricted_directory_context_mismatch: configuration and membership bundle differ"
+                .to_string(),
+        );
+    }
+    let credential = config.membership.credential.clone().ok_or_else(|| {
+        "restricted_membership_reference_required: private mode requires membership.credential"
+            .to_string()
+    })?;
+    opts.restricted_directory_context = Some(iicp_client::RestrictedDirectoryContext {
+        domain_id,
+        authority_id,
+        subject_id: bundle.membership.assertion.subject.id.clone(),
+        subject_kind: "node".into(),
+        minimum_membership_generation: bundle.policy.minimum_generation,
+        membership_credential: credential,
+    });
+    opts.restricted_peer_bundle = Some(bundle);
     opts.enable_mesh = config.mesh.enabled;
     Ok(())
 }
@@ -2577,6 +2605,12 @@ fn configure_peer_admission(cfg: &mut NodeConfig, opts: &mut ServeOpts) -> Resul
                 .as_secs(),
         )
         .map_err(|reason| reason.code().to_string())?;
+    if let iicp_client::peer_manager::PeerAdmissionMode::Restricted(restricted) =
+        &mut cfg.peer_admission
+    {
+        restricted.directory_context = opts.restricted_directory_context.clone();
+    }
+    cfg.restricted_directory = opts.restricted_directory_context.clone();
     Ok(())
 }
 

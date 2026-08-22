@@ -124,6 +124,7 @@ impl RestrictedPeerBundle {
             Box::new(crate::peer_manager::RestrictedPeerAdmission {
                 policy: self.policy,
                 directory_membership_bearer: self.directory_membership_bearer,
+                directory_context: None,
                 local: Some(crate::peer_manager::RestrictedLocalIdentity {
                     membership: self.membership,
                     signing_seed,

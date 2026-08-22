@@ -148,12 +148,38 @@ async fn reregister(
     http: &Client,
     url: &str,
     payload: &serde_json::Value,
+    restricted: Option<&crate::types::RestrictedDirectoryContext>,
+    timeout_ms: u64,
 ) -> Option<RegistrationCredentials> {
-    let resp = http.post(url).json(payload).send().await.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let data = resp.json::<serde_json::Value>().await.ok()?;
+    let data = if let Some(context) = restricted {
+        crate::restricted_directory::validate_context(context).ok()?;
+        let membership = crate::secret_store::resolve(&context.membership_credential, None).ok()?;
+        let client = crate::http::HttpClient::new(timeout_ms, None).ok()?;
+        let (status, data) = client
+            .post_restricted_json(
+                url,
+                payload,
+                membership.expose(),
+                &context.subject_id,
+                None,
+                None,
+            )
+            .await
+            .ok()?;
+        if !(200..300).contains(&status)
+            || crate::restricted_directory::validate_decision(&data, context, "registration")
+                .is_err()
+        {
+            return None;
+        }
+        data
+    } else {
+        let resp = http.post(url).json(payload).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()?
+    };
     let token = data["node_token"]
         .as_str()
         .or_else(|| data["token"].as_str())?;
@@ -440,6 +466,8 @@ pub struct NodeConfig {
     pub region: Option<String>,
     pub capabilities: Vec<String>,
     pub directory_url: String,
+    /// Authenticated private-directory boundary. `None` preserves public mode.
+    pub restricted_directory: Option<crate::types::RestrictedDirectoryContext>,
     pub timeout_ms: u64,
     /// Maximum concurrent tasks; excess requests receive 429 IICP-E021.
     pub max_concurrent: usize,
@@ -555,6 +583,7 @@ impl NodeConfig {
             region: None,
             capabilities: vec![],
             directory_url: DEFAULT_DIRECTORY.into(),
+            restricted_directory: None,
             timeout_ms: 5_000,
             max_concurrent: 4,
             tokens_per_min: 10_000,
@@ -1973,7 +2002,15 @@ impl IicpNode {
             "{}/v1/register",
             self.cfg.directory_url.trim_end_matches('/')
         );
-        if let Some(credentials) = reregister(&self.http, &url, &new_payload).await {
+        if let Some(credentials) = reregister(
+            &self.http,
+            &url,
+            &new_payload,
+            self.cfg.restricted_directory.as_ref(),
+            self.cfg.timeout_ms,
+        )
+        .await
+        {
             if models_changed {
                 *self.registered_models.write().expect("poisoned") = live.clone();
                 *self.public_models.write().expect("poisoned") = live;
@@ -2285,28 +2322,51 @@ impl IicpNode {
 
     pub async fn register(&self) -> Result<String> {
         let payload = self.build_register_payload();
-
-        let resp = self
-            .http
-            .post(format!(
-                "{}/v1/register",
-                self.cfg.directory_url.trim_end_matches('/')
-            ))
-            .json(&payload)
-            .send()
-            .await
-            .map_err(|e| IicpError::Node(e.to_string()))?;
-
-        if !resp.status().is_success() {
-            return Err(IicpError::Node(format!(
-                "register failed: {}",
-                resp.status()
-            )));
-        }
-        let data: Value = resp
-            .json()
-            .await
-            .map_err(|e| IicpError::Node(e.to_string()))?;
+        let url = format!(
+            "{}/v1/register",
+            self.cfg.directory_url.trim_end_matches('/')
+        );
+        let data: Value = if let Some(context) = &self.cfg.restricted_directory {
+            crate::restricted_directory::validate_context(context)?;
+            let membership = crate::secret_store::resolve(&context.membership_credential, None)
+                .map_err(|_| IicpError::PolicyRefused {
+                    code: "restricted_membership_unavailable".into(),
+                    message: "restricted directory membership credential is unavailable".into(),
+                })?;
+            let client = crate::http::HttpClient::new(self.cfg.timeout_ms, None)?;
+            let (status, data) = client
+                .post_restricted_json(
+                    &url,
+                    &payload,
+                    membership.expose(),
+                    &context.subject_id,
+                    None,
+                    None,
+                )
+                .await?;
+            if !(200..300).contains(&status) {
+                return Err(IicpError::Node(format!("register failed: {status}")));
+            }
+            crate::restricted_directory::validate_decision(&data, context, "registration")?;
+            data
+        } else {
+            let resp = self
+                .http
+                .post(&url)
+                .json(&payload)
+                .send()
+                .await
+                .map_err(|e| IicpError::Node(e.to_string()))?;
+            if !resp.status().is_success() {
+                return Err(IicpError::Node(format!(
+                    "register failed: {}",
+                    resp.status()
+                )));
+            }
+            resp.json()
+                .await
+                .map_err(|e| IicpError::Node(e.to_string()))?
+        };
         let token = data["node_token"]
             .as_str()
             .or_else(|| data["token"].as_str())
@@ -2684,6 +2744,8 @@ impl IicpNode {
             let hb_token_arc = Arc::clone(&self.runtime_token);
             let hb_saved_node_name = self.saved_node_name.clone();
             let hb_register_url = format!("{}/v1/register", dir.trim_end_matches('/'));
+            let hb_restricted_directory = self.cfg.restricted_directory.clone();
+            let hb_directory_timeout_ms = self.cfg.timeout_ms;
             // #494 — model drift detection: capture backend probe config + registered models.
             let hb_backend_url = self.cfg.backend_url.clone();
             let hb_backend_api_key = self.cfg.backend_api_key.clone();
@@ -2886,8 +2948,14 @@ impl IicpNode {
                                         );
                                         new_payload["capabilities"] =
                                             serde_json::to_value(&new_caps).unwrap_or(json!([]));
-                                        if let Some(credentials) =
-                                            reregister(&http, &hb_register_url, &new_payload).await
+                                        if let Some(credentials) = reregister(
+                                            &http,
+                                            &hb_register_url,
+                                            &new_payload,
+                                            hb_restricted_directory.as_ref(),
+                                            hb_directory_timeout_ms,
+                                        )
+                                        .await
                                         {
                                             *hb_registered_models.write().expect("poisoned") =
                                                 live.clone();
@@ -2922,8 +2990,14 @@ impl IicpNode {
                                     let mut new_payload = hb_register_payload.clone();
                                     new_payload["endpoint"] = json!(ep);
                                     new_payload["current_node_token"] = json!(token);
-                                    if let Some(credentials) =
-                                        reregister(&http, &hb_register_url, &new_payload).await
+                                    if let Some(credentials) = reregister(
+                                        &http,
+                                        &hb_register_url,
+                                        &new_payload,
+                                        hb_restricted_directory.as_ref(),
+                                        hb_directory_timeout_ms,
+                                    )
+                                    .await
                                     {
                                         *hb_registered_endpoint.write().expect("poisoned") =
                                             ep.clone();
@@ -3021,8 +3095,14 @@ impl IicpNode {
                                             new_payload["endpoint"] = json!(ep);
                                         }
                                         new_payload["current_node_token"] = json!(token);
-                                        match reregister(&http, &hb_register_url, &new_payload)
-                                            .await
+                                        match reregister(
+                                            &http,
+                                            &hb_register_url,
+                                            &new_payload,
+                                            hb_restricted_directory.as_ref(),
+                                            hb_directory_timeout_ms,
+                                        )
+                                        .await
                                         {
                                             Some(credentials) => {
                                                 if let Some(ep) = new_payload["endpoint"].as_str() {
@@ -3087,7 +3167,15 @@ impl IicpNode {
                             tracing::warn!(
                                 "heartbeat rejected ({code}) — node unknown to directory; re-registering"
                             );
-                            match reregister(&http, &hb_register_url, &hb_register_payload).await {
+                            match reregister(
+                                &http,
+                                &hb_register_url,
+                                &hb_register_payload,
+                                hb_restricted_directory.as_ref(),
+                                hb_directory_timeout_ms,
+                            )
+                            .await
+                            {
                                 Some(credentials) => {
                                     token = apply_runtime_credentials(
                                         &hb_token_arc,
@@ -3213,6 +3301,8 @@ impl IicpNode {
             let intent = self.cfg.intent.clone();
             let models = self.cfg.model.clone().map(|m| vec![m]).unwrap_or_default();
             let relay_register_payload = self.build_register_payload();
+            let relay_restricted_directory = self.cfg.restricted_directory.clone();
+            let relay_directory_timeout_ms = self.cfg.timeout_ms;
             let relay_register_url = format!(
                 "{}/v1/register",
                 self.cfg.directory_url.trim_end_matches('/')
@@ -3349,6 +3439,7 @@ impl IicpNode {
                     let saved_node_name = relay_saved_node_name.clone();
                     let registered_endpoint = Arc::clone(&relay_registered_endpoint);
                     let relay_bound = Arc::clone(&relay_bound_arc);
+                    let restricted_directory = relay_restricted_directory.clone();
                     Box::pin(async move {
                         // Binding succeeded before directory convergence. Keep this
                         // separate from registration so recovery can preserve the
@@ -3369,7 +3460,15 @@ impl IicpNode {
                         if !current_token.is_empty() {
                             payload["current_node_token"] = json!(current_token);
                         }
-                        match reregister(&http, &url, &payload).await {
+                        match reregister(
+                            &http,
+                            &url,
+                            &payload,
+                            restricted_directory.as_ref(),
+                            relay_directory_timeout_ms,
+                        )
+                        .await
+                        {
                             Some(credentials) => {
                                 if let Some(ep) = payload["endpoint"].as_str() {
                                     *registered_endpoint.write().expect("poisoned") =
@@ -3802,7 +3901,7 @@ mod reregister_tests {
         let http = reqwest::Client::new();
         let payload = json!({"endpoint": "https://x", "region": "r"});
         let url = format!("{}/v1/register", server.url());
-        let tok = reregister(&http, &url, &payload).await;
+        let tok = reregister(&http, &url, &payload, None, 5_000).await;
         assert_eq!(
             tok,
             Some(super::RegistrationCredentials {
@@ -3899,7 +3998,7 @@ mod reregister_tests {
             .await;
         let http = reqwest::Client::new();
         let url = format!("{}/v1/register", server.url());
-        let tok = reregister(&http, &url, &json!({})).await;
+        let tok = reregister(&http, &url, &json!({}), None, 5_000).await;
         assert_eq!(tok, None);
     }
 

@@ -109,6 +109,47 @@ impl HttpClient {
         Ok(body)
     }
 
+    pub(crate) async fn post_restricted_json<B: serde::Serialize>(
+        &self,
+        url: &str,
+        body: &B,
+        membership: &str,
+        subject_id: &str,
+        auth_override: Option<&str>,
+        traceparent: Option<&str>,
+    ) -> Result<(u16, Value)> {
+        let tp = traceparent
+            .map(str::to_owned)
+            .unwrap_or_else(make_traceparent);
+        let client = Client::builder()
+            .timeout(Duration::from_millis(self.timeout_ms))
+            .use_rustls_tls()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?;
+        let mut request = client
+            .post(url)
+            .header("traceparent", tp)
+            .header("X-IICP-Membership", membership)
+            .header("X-IICP-Subject-Id", subject_id)
+            .json(body);
+        request = match auth_override {
+            Some(token) => request.bearer_auth(token),
+            None => match &self.token {
+                Some(token) => request.bearer_auth(token),
+                None => request,
+            },
+        };
+        let response = request.send().await?;
+        if response.status().is_redirection() {
+            return Err(IicpError::EndpointRefused(
+                "restricted directory redirect is not allowed".into(),
+            ));
+        }
+        let status = response.status().as_u16();
+        let response_body: Value = response.json().await?;
+        Ok((status, response_body))
+    }
+
     /// Expose the inner `Client` for consumer token acquisition.
     pub(crate) fn inner(&self) -> &Client {
         &self.inner
