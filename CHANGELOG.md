@@ -35,6 +35,11 @@ in the main repo).
 
 ## [Unreleased]
 
+### Fixed — CLI runtime self-description
+
+- `iicp-node query` now uses the default-auto runtime identity path for `llm:chat:v1` instead of bypassing it through raw task submission.
+- Custom non-chat intents and the public `submit()` method remain unchanged.
+
 - Redact legacy node credentials from `NodeIdentity` diagnostics and stop
   printing bearer-token prefixes after registration. This closes two disclosure
   paths while the explicit plaintext-to-reference migration in #106 remains in

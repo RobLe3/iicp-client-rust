@@ -96,6 +96,11 @@ them. The context is rebuilt on fallback, never includes endpoints, tokens,
 node identities, candidate sets or scores, and is not a prompt-injection
 security boundary.
 
+The `iicp-node query` command uses the same context for its default
+`llm:chat:v1` intent while preserving its routing policy and source-node
+metadata. A custom non-chat `--intent` remains a raw task and receives no
+injected text.
+
 Raw `submit()` calls and non-chat intents are unchanged. Use
 `chat_with_runtime_identity` when an application must disable the context or
 require a supported system-instruction channel:

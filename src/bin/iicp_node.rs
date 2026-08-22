@@ -453,7 +453,8 @@ fn print_serve_help() {
 fn print_query_help() {
     print!(
         "usage: iicp-node query <prompt> [options]\n\n\
-         Discover mesh nodes for an intent and submit a chat task.\n\n\
+         Discover mesh nodes for an intent and submit a chat task. The default chat intent\n\
+         adds bounded IICP runtime identity context; custom non-chat intents remain raw.\n\n\
          Options:\n\
          \x20 --directory-url URL   IICP_DIRECTORY_URL (default https://iicp.network/api)\n\
          \x20 --intent URN          IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
@@ -1557,6 +1558,13 @@ fn print_init_help() {
     );
 }
 
+fn query_runtime_identity_options(
+    intent: &str,
+) -> Option<iicp_client::runtime_identity::RuntimeIdentityOptions> {
+    (intent == iicp_client::runtime_identity::RUNTIME_IDENTITY_CHAT_INTENT)
+        .then(iicp_client::runtime_identity::RuntimeIdentityOptions::default)
+}
+
 async fn run_query(args: &[String]) -> Result<(), String> {
     if wants_help(args) {
         print_query_help();
@@ -1688,7 +1696,14 @@ async fn run_query(args: &[String]) -> Result<(), String> {
              use --routing-profile sensitive for fail-closed no-remote dispatch."
         );
     }
-    let resp = client.submit(request).await.map_err(|e| format!("{e}"))?;
+    let resp = if let Some(runtime_identity) = query_runtime_identity_options(&intent) {
+        client
+            .submit_chat_with_runtime_identity(request, Some(runtime_identity))
+            .await
+    } else {
+        client.submit(request).await
+    }
+    .map_err(|e| format!("{e}"))?;
 
     // Spec iicp-dir.md §task response: terminal success status is "success" (was "completed";
     // the node + adapter emit "success"). Accept both so the CLI doesn't reject a successful task.
@@ -6564,6 +6579,15 @@ mod tests {
     }
 
     // CLI-friction fixes — every command's `-h`/`--help` is detected before its parse loop.
+    #[test]
+    fn query_runtime_identity_is_chat_only() {
+        assert!(query_runtime_identity_options(
+            iicp_client::runtime_identity::RUNTIME_IDENTITY_CHAT_INTENT
+        )
+        .is_some());
+        assert!(query_runtime_identity_options("urn:iicp:intent:llm:embedding:v1").is_none());
+    }
+
     #[test]
     fn wants_help_detects_short_and_long() {
         assert!(wants_help(&["-h".to_string()]));
