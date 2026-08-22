@@ -85,6 +85,7 @@ pub mod runtime_config;
 pub mod runtime_health;
 pub mod runtime_identity;
 pub mod scheduler;
+pub mod secret_store;
 pub mod selection;
 pub mod service_lifecycle;
 pub mod service_lifecycle_accounting;

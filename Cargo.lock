@@ -1035,6 +1035,7 @@ dependencies = [
  "unicode-normalization",
  "uuid",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]
