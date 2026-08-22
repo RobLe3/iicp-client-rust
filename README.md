@@ -685,3 +685,5 @@ federated-private modes. It verifies per-peer membership rather than treating
 directory selection or gossip introduction as authority. See
 [`docs/RESTRICTED_PEER_ADMISSION.md`](docs/RESTRICTED_PEER_ADMISSION.md) for the
 secret-reference boundary, refusal behavior and current limitations.
+Provider-specific read and mutation support is listed in
+[`docs/SECRET_REFERENCES.md`](docs/SECRET_REFERENCES.md).
