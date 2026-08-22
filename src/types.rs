@@ -3,6 +3,31 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
+/// Configuration for requests to a restricted trust-domain directory.
+///
+/// The membership value is a provider reference, never portable secret
+/// material. Constructing [`crate::IicpClient`] resolves it before any network
+/// request can be made.
+#[derive(Debug, Clone)]
+pub struct RestrictedDirectoryContext {
+    pub domain_id: String,
+    pub authority_id: String,
+    pub subject_id: String,
+    pub subject_kind: String,
+    pub minimum_membership_generation: u64,
+    pub membership_credential: crate::runtime_config::SecretRef,
+}
+
+/// Local provenance proving that a candidate projection passed the configured
+/// restricted-directory checks. It is deliberately never serialized.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestrictedEligibility {
+    pub domain_id: String,
+    pub authority_id: String,
+    pub membership_generation: u64,
+    pub membership_expires_at: u64,
+}
+
 /// Client-side remote-routing profile (#585).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -73,6 +98,8 @@ pub struct ClientConfig {
     /// Route endpoint migration mode: auto | ticketed | legacy.
     pub route_discovery_mode: String,
     pub profile_request: Option<ProfileRequest>,
+    /// Required authenticated directory boundary for private operation.
+    pub restricted_directory: Option<RestrictedDirectoryContext>,
 }
 
 impl Default for ClientConfig {
@@ -118,6 +145,7 @@ impl Default for ClientConfig {
                 .filter(|s| matches!(s.as_str(), "auto" | "ticketed" | "legacy"))
                 .unwrap_or_else(|| "auto".into()),
             profile_request: None,
+            restricted_directory: None,
         }
     }
 }
@@ -215,6 +243,8 @@ pub struct Node {
     /// Phase-1 compliance: public, self-attested node policy manifest.
     pub node_policy_manifest: Option<Value>,
     pub dispatch_ticket_id_prefix: Option<String>,
+    /// Process-local eligibility provenance; never accepted from the wire.
+    pub restricted_eligibility: Option<RestrictedEligibility>,
 }
 
 #[derive(Deserialize)]
@@ -286,6 +316,7 @@ impl From<NodeWire> for Node {
             sdk_release: wire.sdk_release,
             node_policy_manifest: wire.node_policy_manifest,
             dispatch_ticket_id_prefix: None,
+            restricted_eligibility: None,
         }
     }
 }
@@ -314,6 +345,8 @@ pub struct NodeList {
     pub profile_negotiation: Option<ProfileNegotiation>,
     #[serde(default)]
     pub diversity_evidence: Option<Value>,
+    #[serde(skip)]
+    pub restricted_eligibility: Option<RestrictedEligibility>,
 }
 
 /// IICP task request body.

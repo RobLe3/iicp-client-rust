@@ -259,6 +259,22 @@ impl IicpClient {
                 message: "consumer_auth_mode must be optional, required, or disabled".into(),
             });
         }
+        if let Some(context) = &config.restricted_directory {
+            crate::restricted_directory::validate_context(context)?;
+            if !matches!(config.profile_request.as_ref(), Some(profile) if profile.required && profile.profile_id == crate::restricted_directory::PROFILE_ID)
+            {
+                return Err(IicpError::PolicyRefused {
+                    code: "unsupported_pre_normative_profile".into(),
+                    message: "restricted directory context requires the canonical Profile request"
+                        .into(),
+                });
+            }
+            let _preflight = crate::secret_store::resolve(&context.membership_credential, None)
+                .map_err(|_| IicpError::PolicyRefused {
+                    code: "restricted_membership_unavailable".into(),
+                    message: "restricted directory membership credential is unavailable".into(),
+                })?;
+        }
         let http = HttpClient::new(config.timeout_ms, config.node_token.clone())?;
         Ok(Self {
             config,
@@ -332,7 +348,27 @@ impl IicpClient {
             }
         }
         url.push_str(&format!("&limit={}", opts.limit.unwrap_or(10)));
-        let mut list: NodeList = self.http.get_json(&url, traceparent).await?;
+        let mut list: NodeList = if let Some(context) = &self.config.restricted_directory {
+            let membership = crate::secret_store::resolve(&context.membership_credential, None)
+                .map_err(|_| IicpError::PolicyRefused {
+                    code: "restricted_membership_unavailable".into(),
+                    message: "restricted directory membership credential is unavailable".into(),
+                })?;
+            let body = self
+                .http
+                .get_restricted_json(&url, membership.expose(), &context.subject_id, traceparent)
+                .await?;
+            let eligibility =
+                crate::restricted_directory::validate_decision(&body, context, "discovery")?;
+            let mut parsed: NodeList = serde_json::from_value(body)?;
+            for node in &mut parsed.nodes {
+                node.restricted_eligibility = Some(eligibility.clone());
+            }
+            parsed.restricted_eligibility = Some(eligibility);
+            parsed
+        } else {
+            self.http.get_json(&url, traceparent).await?
+        };
         if opts.profile_request.as_ref().is_some_and(|p| p.required)
             && !matches!(list.profile_negotiation.as_ref(), Some(n) if n.status.as_deref() == Some("compatible") && n.dispatch_allowed == Some(true))
         {
@@ -517,6 +553,7 @@ impl IicpClient {
                     nodes,
                     profile_negotiation: None,
                     diversity_evidence: None,
+                    restricted_eligibility: None,
                 },
                 Err(TicketRouteError::LegacyRequired)
                     if self.config.route_discovery_mode == "auto" =>

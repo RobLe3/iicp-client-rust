@@ -79,6 +79,7 @@ pub mod relay_ticket;
 #[cfg(feature = "iicp-tcp")]
 pub mod relay_worker_client;
 pub mod request_projection;
+mod restricted_directory;
 pub mod restricted_membership;
 pub mod routing_policy;
 pub mod runtime_config;
@@ -124,6 +125,7 @@ pub use selection::{
 };
 pub use types::{
     ChatChoice, ChatMessage, ChatOptions, ChatResponse, ChatUsage, ClientConfig, CxPublicKey,
-    DiscoverOptions, Node, NodeList, ProfileRequest, RouteConstraints, RoutingPolicy,
-    RoutingProfile, TaskAuth, TaskConstraints, TaskRequest, TaskResponse,
+    DiscoverOptions, Node, NodeList, ProfileRequest, RestrictedDirectoryContext,
+    RestrictedEligibility, RouteConstraints, RoutingPolicy, RoutingProfile, TaskAuth,
+    TaskConstraints, TaskRequest, TaskResponse,
 };

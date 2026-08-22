@@ -218,6 +218,7 @@ mod tests {
             sdk_release: None,
             node_policy_manifest: None,
             dispatch_ticket_id_prefix: None,
+            restricted_eligibility: None,
         }
     }
 
