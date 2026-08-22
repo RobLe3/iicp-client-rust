@@ -22,8 +22,23 @@ temporary file beside the destination, synchronizes it, replaces the destination
 and synchronizes the parent directory. Rotation therefore does not expose a
 partially written destination. Deletion also refuses unsafe paths.
 
-Portable legacy migration is not complete. Existing node identity files remain
-readable for migration, but operators should not delete them until a migration
-command has stored each secret, verified retrieval and atomically replaced the
-legacy value with its reference. Rust issue #106 tracks that remaining work and
-the native mutation paths for the three operating-system stores.
+## Migrating a saved node
+
+Add mutable `node_token` and `node_hmac_key` entries to the canonical runtime
+configuration's `secret_refs`, then run:
+
+```text
+iicp-node config migrate-node-secrets --node NAME --file runtime-config.json
+```
+
+The command snapshots any previous provider values, writes both legacy values,
+verifies retrieval, and only then atomically replaces the saved identity with
+references. A provider or identity-commit failure restores the previous provider
+values and leaves the legacy identity unchanged. Environment-variable references
+cannot be migration destinations because the process cannot safely mutate its
+parent environment.
+
+After migration, start the node with the same canonical configuration. Refreshed
+registration credentials rotate through the stored references and are not added
+back to the saved identity as plaintext. Keep the original protected identity
+backup until the first supervised restart and registration cycle has passed.
