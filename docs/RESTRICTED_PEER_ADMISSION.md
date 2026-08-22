@@ -19,9 +19,8 @@ shared secret-resolution boundary. Environment variables and owner-only files
 are supported on every applicable host. macOS Keychain and Linux Secret
 Service references use the operating-system command interface when available;
 application-owned stores use the `ExternalSecretProvider` library interface.
-Windows Credential Manager references are represented but currently fail as
-unsupported until a native retrieval provider is linked. There is no fallback
-from a selected provider to plaintext storage.
+Windows Credential Manager references use the native `CredReadW` interface.
+There is no fallback from a selected provider to plaintext storage.
 
 Protected files must be regular, non-symlink files owned by the effective user;
 on Unix they must not grant group or other permissions. Resolved values are
@@ -58,8 +57,6 @@ must not claim automatic revocation propagation.
 ## Current limits
 
 - This is a Rust reference implementation, not yet a cross-SDK guarantee.
-- Windows Credential Manager still requires a native provider implementation;
-  selecting it fails before runtime network activity.
 - Legacy node records remain readable, but the current migration projection
   only detects and omits plaintext material. Atomic transfer into a selected
   provider remains required before legacy migration is complete.

@@ -120,11 +120,53 @@ fn resolve_linux_secret_service(_collection: &str, _label: &str) -> Result<Strin
     Err(SECRET_PROVIDER_UNSUPPORTED)
 }
 
-// Windows Credential Manager has no safe built-in retrieval CLI. A native
-// implementation is intentionally required rather than passing secrets through
-// PowerShell or argv. Until linked, selecting it fails before side effects.
+#[cfg(target_os = "windows")]
+fn resolve_windows_credential(target: &str) -> Result<String, &'static str> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Security::Credentials::{
+        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+
+    let mut wide_target: Vec<u16> = target.encode_utf16().collect();
+    wide_target.push(0);
+    let mut credential: *mut CREDENTIALW = null_mut();
+    // SAFETY: the target is NUL terminated, `credential` is an out pointer,
+    // and a successful result is released exactly once with CredFree.
+    let found = unsafe { CredReadW(wide_target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) };
+    if found == 0 || credential.is_null() {
+        return Err(SECRET_UNAVAILABLE);
+    }
+    // SAFETY: CredentialBlob and its byte count belong to the live credential
+    // allocation. Copy before releasing the allocation.
+    let bytes = unsafe {
+        let record = &*credential;
+        std::slice::from_raw_parts(record.CredentialBlob, record.CredentialBlobSize as usize)
+            .to_vec()
+    };
+    // SAFETY: `credential` was allocated by CredReadW and is no longer used.
+    unsafe { CredFree(credential.cast()) };
+    decode_windows_credential_blob(bytes)
+}
+
+#[cfg(not(target_os = "windows"))]
 fn resolve_windows_credential(_target: &str) -> Result<String, &'static str> {
     Err(SECRET_PROVIDER_UNSUPPORTED)
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn decode_windows_credential_blob(bytes: Vec<u8>) -> Result<String, &'static str> {
+    if bytes.contains(&0) {
+        if bytes.len() % 2 != 0 {
+            return Err(SECRET_UNAVAILABLE);
+        }
+        let words = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|word| *word != 0)
+            .collect::<Vec<_>>();
+        return String::from_utf16(&words).map_err(|_| SECRET_UNAVAILABLE);
+    }
+    String::from_utf8(bytes).map_err(|_| SECRET_UNAVAILABLE)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -171,6 +213,20 @@ mod tests {
     }
 
     #[test]
+    fn environment_rotation_and_deletion_are_observed_without_a_secret_cache() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let reference = SecretRef::Environment {
+            name: "IICP_TEST_ROTATING_SECRET_REF".into(),
+        };
+        std::env::set_var("IICP_TEST_ROTATING_SECRET_REF", "first");
+        assert_eq!(resolve(&reference, None).unwrap().expose(), "first");
+        std::env::set_var("IICP_TEST_ROTATING_SECRET_REF", "second");
+        assert_eq!(resolve(&reference, None).unwrap().expose(), "second");
+        std::env::remove_var("IICP_TEST_ROTATING_SECRET_REF");
+        assert_eq!(resolve(&reference, None).unwrap_err(), SECRET_UNAVAILABLE);
+    }
+
+    #[test]
     fn external_provider_is_explicit() {
         let reference = SecretRef::External {
             provider: "fixture".into(),
@@ -185,6 +241,22 @@ mod tests {
                 .unwrap()
                 .expose(),
             "external-secret"
+        );
+    }
+
+    #[test]
+    fn windows_credential_blob_accepts_utf8_and_utf16le() {
+        assert_eq!(
+            decode_windows_credential_blob(b"utf8-secret".to_vec()).unwrap(),
+            "utf8-secret"
+        );
+        let utf16 = "wide-secret"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_windows_credential_blob(utf16).unwrap(),
+            "wide-secret"
         );
     }
 
