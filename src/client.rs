@@ -6,7 +6,9 @@ use rand::Rng;
 use regex::Regex;
 
 use crate::confidentiality::{decrypt_response, encrypt_payload_with_context};
-use crate::consumer_token::{acquire_consumer_token, ConsumerTokenCache};
+use crate::consumer_token::{
+    acquire_consumer_token, acquire_restricted_consumer_token, ConsumerTokenCache,
+};
 use crate::dispatch_ticket::{policy_manifest_binding_matches, verify_dispatch_route_ticket};
 use crate::errors::{IicpError, Result};
 use crate::http::{make_traceparent, HttpClient};
@@ -32,6 +34,67 @@ const MAX_RETRIES: u32 = 3;
 enum TicketRouteError {
     LegacyRequired,
     Iicp(IicpError),
+}
+
+#[cfg(test)]
+mod restricted_ticket_tests {
+    use super::*;
+    use crate::runtime_config::SecretRef;
+
+    fn secret_file() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("iicp-ticket-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "member-token").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn restricted_ticket_rejects_missing_decision_without_legacy_fallback() {
+        let path = secret_file();
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/v1/dispatch/ticket")
+            .match_header("x-iicp-membership", "member-token")
+            .match_header("x-iicp-subject-id", "client-a")
+            .with_status(201)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"node_id":"must-not-be-used"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        let client = IicpClient::new(ClientConfig {
+            directory_url: server.url(),
+            route_discovery_mode: "ticketed".into(),
+            profile_request: Some(ProfileRequest {
+                profile_id: crate::restricted_directory::PROFILE_ID.into(),
+                profile_version: "0.1.0-draft".into(),
+                profile_fixture_sha256: "a".repeat(64),
+                required: true,
+            }),
+            restricted_directory: Some(RestrictedDirectoryContext {
+                domain_id: "domain-a".into(),
+                authority_id: "did:iicp:test:directory-a".into(),
+                subject_id: "client-a".into(),
+                subject_kind: "client".into(),
+                minimum_membership_generation: 7,
+                membership_credential: SecretRef::File {
+                    path: path.display().to_string(),
+                },
+            }),
+            ..ClientConfig::default()
+        })
+        .unwrap();
+        assert!(client
+            .ticketed_candidates_for_test("urn:iicp:intent:llm:chat:v1")
+            .await
+            .is_err());
+        mock.assert_async().await;
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 #[derive(Clone)]
@@ -417,26 +480,68 @@ impl IicpClient {
         let mut candidates = Vec::new();
         for _ in 0..MAX_RETRIES {
             request["exclude_node_id_prefixes"] = serde_json::json!(excluded);
-            let response = self
-                .http
-                .inner()
-                .post(&url)
-                .header("traceparent", traceparent)
-                .json(&request)
-                .send()
-                .await
-                .map_err(|e| TicketRouteError::Iicp(IicpError::Http(e)))?;
-            let status = response.status().as_u16();
+            let restricted = self.config.restricted_directory.as_ref();
+            let (status, body) = if let Some(context) = restricted {
+                let membership = crate::secret_store::resolve(&context.membership_credential, None)
+                    .map_err(|_| {
+                        TicketRouteError::Iicp(IicpError::PolicyRefused {
+                            code: "restricted_membership_unavailable".into(),
+                            message: "restricted directory membership credential is unavailable"
+                                .into(),
+                        })
+                    })?;
+                self.http
+                    .post_restricted_json(
+                        &url,
+                        &request,
+                        membership.expose(),
+                        &context.subject_id,
+                        None,
+                        Some(traceparent),
+                    )
+                    .await
+                    .map_err(TicketRouteError::Iicp)?
+            } else {
+                let response = self
+                    .http
+                    .inner()
+                    .post(&url)
+                    .header("traceparent", traceparent)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|e| TicketRouteError::Iicp(IicpError::Http(e)))?;
+                let status = response.status().as_u16();
+                if matches!(status, 405 | 501) {
+                    return Err(TicketRouteError::LegacyRequired);
+                }
+                let body = response
+                    .json()
+                    .await
+                    .map_err(|e| TicketRouteError::Iicp(IicpError::Http(e)))?;
+                (status, body)
+            };
             if matches!(status, 405 | 501) {
-                return Err(TicketRouteError::LegacyRequired);
+                return Err(TicketRouteError::Iicp(IicpError::PolicyRefused {
+                    code: "restricted_directory_operation_unsupported".into(),
+                    message: "restricted dispatch-ticket operation is unavailable".into(),
+                }));
             }
-            let body: serde_json::Value = response
-                .json()
-                .await
-                .map_err(|e| TicketRouteError::Iicp(IicpError::Http(e)))?;
             let error_code = body["error"]["code"].as_str();
 
             if status == 201 {
+                let eligibility = if let Some(context) = restricted {
+                    Some(
+                        crate::restricted_directory::validate_decision(
+                            &body,
+                            context,
+                            "dispatch_ticket",
+                        )
+                        .map_err(TicketRouteError::Iicp)?,
+                    )
+                } else {
+                    None
+                };
                 let node_id = body["node_id"].as_str().unwrap_or("");
                 // Never hold a std::sync::MutexGuard across an await. Besides
                 // blocking parallel dispatches, that makes the proxy feature's
@@ -494,6 +599,7 @@ impl IicpClient {
                     .map_err(|e| TicketRouteError::Iicp(IicpError::Serde(e)))?;
                 node.dispatch_ticket_id_prefix =
                     body["ticket_id_prefix"].as_str().map(str::to_owned);
+                node.restricted_eligibility = eligibility;
                 excluded.push(node_short_id(&node.node_id).to_string());
                 candidates.push(node);
                 continue;
@@ -501,10 +607,10 @@ impl IicpClient {
             if status == 404 && error_code == Some("no_route_available") {
                 break;
             }
-            if status == 404 {
+            if status == 404 && restricted.is_none() {
                 return Err(TicketRouteError::LegacyRequired);
             }
-            if status == 503 && error_code == Some("not_configured") {
+            if status == 503 && error_code == Some("not_configured") && restricted.is_none() {
                 return Err(TicketRouteError::LegacyRequired);
             }
             return Err(TicketRouteError::Iicp(IicpError::Protocol {
@@ -517,6 +623,19 @@ impl IicpClient {
             }));
         }
         Ok(candidates)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn ticketed_candidates_for_test(&self, intent: &str) -> Result<Vec<Node>> {
+        self.ticketed_candidates(intent, &DiscoverOptions::default(), &make_traceparent())
+            .await
+            .map_err(|error| match error {
+                TicketRouteError::LegacyRequired => IicpError::PolicyRefused {
+                    code: "legacy_route_required".into(),
+                    message: "legacy route required".into(),
+                },
+                TicketRouteError::Iicp(error) => error,
+            })
     }
 
     /// Discover → select best node → submit task (SDK-01/02).
@@ -539,7 +658,7 @@ impl IicpClient {
         let tp = make_traceparent(); // SDK-06: shared across discover + node POST
         let discover_options = project_route_options(&request, &self.config);
         let nodes = if self.config.route_discovery_mode == "legacy"
-            || self.config.profile_request.is_some()
+            || (self.config.profile_request.is_some() && self.config.restricted_directory.is_none())
         {
             self.discover(&request.intent, Some(discover_options.clone()), Some(&tp))
                 .await?
@@ -757,16 +876,29 @@ impl IicpClient {
             let consumer_token: Option<String> = if self.config.consumer_auth_mode == "disabled" {
                 None
             } else if let Some(ref tok) = self.config.node_token {
-                acquire_consumer_token(
-                    &self.ct_cache,
-                    self.http.inner(),
-                    &self.config.directory_url,
-                    tok,
-                    &node.node_id,
-                    &request.intent,
-                    5.0,
-                )
-                .await
+                if let Some(context) = &self.config.restricted_directory {
+                    acquire_restricted_consumer_token(
+                        &self.ct_cache,
+                        &self.http,
+                        &self.config.directory_url,
+                        tok,
+                        &node.node_id,
+                        &request.intent,
+                        context,
+                    )
+                    .await?
+                } else {
+                    acquire_consumer_token(
+                        &self.ct_cache,
+                        self.http.inner(),
+                        &self.config.directory_url,
+                        tok,
+                        &node.node_id,
+                        &request.intent,
+                        5.0,
+                    )
+                    .await
+                }
             } else {
                 None
             };

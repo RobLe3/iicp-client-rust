@@ -688,11 +688,11 @@ secret-reference boundary, refusal behavior and current limitations.
 Provider-specific read and mutation support is listed in
 [`docs/SECRET_REFERENCES.md`](docs/SECRET_REFERENCES.md).
 
-The research client API also supports authenticated restricted-directory
-**discovery** through `ClientConfig::restricted_directory`. The context accepts
-only a typed `SecretRef`, requires the canonical Profile request, refuses
-redirects, validates the directory's bounded decision projection, and marks
-returned candidates with non-serialized eligibility provenance. This is an
-incremental pre-normative surface: protected registration, bootstrap,
-dispatch-ticket and consumer-token paths are not yet covered by this client
-context and must not be claimed as complete restricted-domain support.
+The research client and runtime APIs support authenticated restricted-directory
+discovery, registration, bootstrap, dispatch-ticket and consumer-token
+operations. The shared context accepts only a typed `SecretRef`, requires the
+canonical Profile request for client routing, refuses redirects, validates each
+operation's bounded directory-decision projection and marks returned candidates
+with non-serialized eligibility provenance. This remains a pre-normative,
+opt-in surface: complete CUG support still requires directory lifecycle parity,
+CIP inheritance, cross-SDK parity and black-box isolation evidence.

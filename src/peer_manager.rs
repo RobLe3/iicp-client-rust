@@ -96,6 +96,7 @@ pub struct RestrictedLocalIdentity {
 pub struct RestrictedPeerAdmission {
     pub policy: crate::restricted_membership::MembershipPolicy,
     pub directory_membership_bearer: String,
+    pub directory_context: Option<crate::types::RestrictedDirectoryContext>,
     pub local: Option<RestrictedLocalIdentity>,
 }
 
@@ -109,7 +110,8 @@ impl std::fmt::Debug for PeerAdmissionMode {
                 .field("local_identity_configured", &restricted.local.is_some())
                 .field(
                     "directory_membership_configured",
-                    &!restricted.directory_membership_bearer.is_empty(),
+                    &(restricted.directory_context.is_some()
+                        || !restricted.directory_membership_bearer.is_empty()),
                 )
                 .finish(),
         }
@@ -157,6 +159,7 @@ impl PeerManager {
         node_token: impl Into<String>,
         opts: PeerManagerOpts,
     ) -> Self {
+        let restricted_transport = matches!(&opts.admission, PeerAdmissionMode::Restricted(_));
         let minimum_generation = match &opts.admission {
             PeerAdmissionMode::Public => 0,
             PeerAdmissionMode::Restricted(restricted) => restricted.policy.minimum_generation,
@@ -172,7 +175,14 @@ impl PeerManager {
             minimum_generation: AtomicU64::new(minimum_generation),
             peers: Mutex::new(HashMap::new()),
             replay_ids: Mutex::new(HashMap::new()),
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .redirect(if restricted_transport {
+                    reqwest::redirect::Policy::none()
+                } else {
+                    reqwest::redirect::Policy::limited(10)
+                })
+                .build()
+                .expect("failed to build peer manager HTTP client"),
         }
     }
 
@@ -464,11 +474,23 @@ impl PeerManager {
             .timeout(Duration::from_secs(5));
         if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
             let local = restricted.local.as_ref()?;
-            if restricted.directory_membership_bearer.is_empty() {
+            let resolved;
+            let membership = if let Some(context) = &restricted.directory_context {
+                if crate::restricted_directory::validate_context(context).is_err()
+                    || context.subject_id != local.membership.assertion.subject.id
+                {
+                    return None;
+                }
+                resolved =
+                    crate::secret_store::resolve(&context.membership_credential, None).ok()?;
+                resolved.expose()
+            } else if !restricted.directory_membership_bearer.is_empty() {
+                restricted.directory_membership_bearer.as_str()
+            } else {
                 return None;
-            }
+            };
             request = request
-                .header("X-IICP-Membership", &restricted.directory_membership_bearer)
+                .header("X-IICP-Membership", membership)
                 .header("X-IICP-Subject-Id", &local.membership.assertion.subject.id);
         }
         Some(request)
@@ -479,6 +501,15 @@ impl PeerManager {
             return;
         }
         if let Ok(body) = response.json::<Value>().await {
+            if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
+                if let Some(context) = &restricted.directory_context {
+                    if crate::restricted_directory::validate_decision(&body, context, "bootstrap")
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
             if let Some(peers) = body.get("peers").and_then(Value::as_array) {
                 self.merge_peers_for_scope(peers, "bootstrap");
             }
@@ -689,6 +720,9 @@ mod tests {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
+    use std::sync::Arc;
+
+    type BootstrapTestState = (Arc<Mutex<Option<(String, String)>>>, Value);
 
     fn issued_membership(
         authority: &SigningKey,
@@ -746,6 +780,108 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn restricted_bootstrap_requires_decision_and_uses_secret_reference() {
+        use crate::runtime_config::SecretRef;
+        use axum::{extract::State, http::HeaderMap, routing::get, Json, Router};
+        let now = unix_time();
+        let authority = SigningKey::from_bytes(&[41; 32]);
+        let local_key = SigningKey::from_bytes(&[42; 32]);
+        let peer_key = SigningKey::from_bytes(&[43; 32]);
+        let local_membership = issued_membership(
+            &authority,
+            &local_key,
+            "node-a",
+            "00000000-0000-4000-8000-000000000001",
+            now,
+        );
+        let peer_membership = issued_membership(
+            &authority,
+            &peer_key,
+            "node-b",
+            "00000000-0000-4000-8000-000000000002",
+            now,
+        );
+        crate::restricted_membership::verify_membership(
+            &peer_membership,
+            &policy_for(&authority),
+            "node-b",
+            "bootstrap",
+            now,
+        )
+        .unwrap();
+        let observed = Arc::new(Mutex::new(None::<(String, String)>));
+        let response = json!({
+            "peers":[{"node_id":"node-b","endpoint":"https://node-b.example/task","membership":peer_membership}],
+            "restricted_domain_decision": {
+                "schema":"iicp.restricted-trust-domain.directory-decision.v0",
+                "profile":"urn:iicp:profile:restricted-trust-domain:v1",
+                "decision":"eligible", "operation":"bootstrap",
+                "domain_id":"domain-a", "authority_id":"directory-a",
+                "subject_kind":"node", "membership_generation":3,
+                "membership_expires_at":now + 300
+            }
+        });
+        let app = Router::new()
+            .route(
+                "/v1/bootstrap",
+                get(
+                    |State((observed, body)): State<BootstrapTestState>,
+                     headers: HeaderMap| async move {
+                        *observed.lock().unwrap() = Some((
+                            headers["x-iicp-membership"].to_str().unwrap().into(),
+                            headers["x-iicp-subject-id"].to_str().unwrap().into(),
+                        ));
+                        Json(body)
+                    },
+                ),
+            )
+            .with_state((Arc::clone(&observed), response));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path = std::env::temp_dir().join(format!("iicp-bootstrap-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "member-token").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let manager = PeerManager::with_opts(
+            format!("http://{address}"),
+            "",
+            PeerManagerOpts {
+                admission: PeerAdmissionMode::Restricted(Box::new(RestrictedPeerAdmission {
+                    policy: policy_for(&authority),
+                    directory_membership_bearer: String::new(),
+                    directory_context: Some(crate::types::RestrictedDirectoryContext {
+                        domain_id: "domain-a".into(),
+                        authority_id: "directory-a".into(),
+                        subject_id: "node-a".into(),
+                        subject_kind: "node".into(),
+                        minimum_membership_generation: 3,
+                        membership_credential: SecretRef::File {
+                            path: path.display().to_string(),
+                        },
+                    }),
+                    local: Some(RestrictedLocalIdentity {
+                        membership: local_membership,
+                        signing_seed: local_key.to_bytes(),
+                    }),
+                })),
+                ..PeerManagerOpts::default()
+            },
+        );
+        manager.bootstrap().await;
+        assert_eq!(
+            observed.lock().unwrap().clone(),
+            Some(("member-token".into(), "node-a".into()))
+        );
+        assert_eq!(manager.get_peers().len(), 1);
+        server.abort();
+        let _ = std::fs::remove_file(path);
+    }
+
     fn restricted_pm() -> PeerManager {
         let fixture: Value = serde_json::from_str(include_str!(
             "../tests/fixtures/restricted-trust-domain-membership-v0.json"
@@ -770,6 +906,7 @@ mod tests {
                         maximum_clock_skew_seconds: 60,
                     },
                     directory_membership_bearer: "test-bearer".into(),
+                    directory_context: None,
                     local: None,
                 })),
             },
@@ -956,6 +1093,7 @@ mod tests {
                 admission: PeerAdmissionMode::Restricted(Box::new(RestrictedPeerAdmission {
                     policy: policy_for(&authority),
                     directory_membership_bearer: "bearer".into(),
+                    directory_context: None,
                     local: None,
                 })),
             },
