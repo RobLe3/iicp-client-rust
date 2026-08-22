@@ -108,6 +108,7 @@ pub fn store(
         SecretRef::LinuxSecretService { collection, label } => {
             store_linux_secret_service(collection, label, value)
         }
+        SecretRef::WindowsCredential { target } => store_windows_credential(target, value),
         SecretRef::External {
             provider,
             reference,
@@ -129,6 +130,7 @@ pub fn delete(
         SecretRef::LinuxSecretService { collection, label } => {
             delete_linux_secret_service(collection, label)
         }
+        SecretRef::WindowsCredential { target } => delete_windows_credential(target),
         SecretRef::External {
             provider,
             reference,
@@ -367,6 +369,61 @@ fn resolve_windows_credential(target: &str) -> Result<String, &'static str> {
     // SAFETY: `credential` was allocated by CredReadW and is no longer used.
     unsafe { CredFree(credential.cast()) };
     decode_windows_credential_blob(bytes)
+}
+
+#[cfg(target_os = "windows")]
+fn store_windows_credential(target: &str, value: &str) -> Result<(), &'static str> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Security::Credentials::{
+        CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+
+    let mut wide_target: Vec<u16> = target.encode_utf16().collect();
+    wide_target.push(0);
+    let mut blob = Zeroizing::new(value.as_bytes().to_vec());
+    let blob_size = u32::try_from(blob.len()).map_err(|_| SECRET_UNAVAILABLE)?;
+    // SAFETY: every field starts at the Windows API-defined zero value. The
+    // borrowed target and blob buffers remain live for the CredWriteW call.
+    let mut credential: CREDENTIALW = unsafe { std::mem::zeroed() };
+    credential.Type = CRED_TYPE_GENERIC;
+    credential.TargetName = wide_target.as_mut_ptr();
+    credential.CredentialBlobSize = blob_size;
+    credential.CredentialBlob = blob.as_mut_ptr();
+    credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    credential.UserName = null_mut();
+    // SAFETY: `credential` points only to buffers that remain valid until the
+    // synchronous call returns. Windows copies the credential on success.
+    let written = unsafe { CredWriteW(&credential, 0) };
+    if written == 0 {
+        Err(SECRET_UNAVAILABLE)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn store_windows_credential(_target: &str, _value: &str) -> Result<(), &'static str> {
+    Err(SECRET_PROVIDER_UNSUPPORTED)
+}
+
+#[cfg(target_os = "windows")]
+fn delete_windows_credential(target: &str) -> Result<(), &'static str> {
+    use windows_sys::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
+
+    let mut wide_target: Vec<u16> = target.encode_utf16().collect();
+    wide_target.push(0);
+    // SAFETY: the target is NUL terminated and remains live for the call.
+    let deleted = unsafe { CredDeleteW(wide_target.as_ptr(), CRED_TYPE_GENERIC, 0) };
+    if deleted == 0 {
+        Err(SECRET_UNAVAILABLE)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn delete_windows_credential(_target: &str) -> Result<(), &'static str> {
+    Err(SECRET_PROVIDER_UNSUPPORTED)
 }
 
 #[cfg(not(target_os = "windows"))]

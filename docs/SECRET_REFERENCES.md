@@ -12,7 +12,7 @@ back to a plaintext field.
 | Environment variable | Yes | No; the parent environment remains externally managed |
 | Owner-only file | Unix | Unix, using a same-directory atomic replacement |
 | macOS Keychain | Yes on macOS | Not yet implemented |
-| Windows Credential Manager | Yes on Windows | Not yet implemented |
+| Windows Credential Manager | Yes on Windows | Windows, using the native Credential Manager API |
 | Linux Secret Service | Yes on Linux | Linux, using `secret-tool` with secret input on stdin |
 | External provider | Provider-defined | Provider-defined through the mutation interface |
 
