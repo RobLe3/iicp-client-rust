@@ -7,6 +7,10 @@
 
 use crate::runtime_config::SecretRef;
 use std::fmt;
+#[cfg(unix)]
+use std::fs::OpenOptions;
+#[cfg(unix)]
+use std::io::Write;
 use std::path::Path;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
@@ -15,6 +19,7 @@ use zeroize::{Zeroize, Zeroizing};
 pub const SECRET_UNAVAILABLE: &str = "secret_reference_unavailable";
 pub const SECRET_PROVIDER_UNSUPPORTED: &str = "secret_provider_unsupported";
 pub const SECRET_FILE_UNSAFE: &str = "secret_file_unsafe";
+pub const SECRET_MUTATION_UNSUPPORTED: &str = "secret_mutation_unsupported";
 
 /// A resolved secret whose debug/display representations never reveal it and
 /// whose allocation is cleared when dropped.
@@ -53,6 +58,14 @@ impl fmt::Display for SecretValue {
 /// The reference locator is not the secret itself.
 pub trait ExternalSecretProvider {
     fn resolve(&self, provider: &str, reference: &str) -> Result<String, &'static str>;
+
+    fn store(&self, _provider: &str, _reference: &str, _value: &str) -> Result<(), &'static str> {
+        Err(SECRET_MUTATION_UNSUPPORTED)
+    }
+
+    fn delete(&self, _provider: &str, _reference: &str) -> Result<(), &'static str> {
+        Err(SECRET_MUTATION_UNSUPPORTED)
+    }
 }
 
 pub fn resolve(
@@ -77,6 +90,47 @@ pub fn resolve(
     SecretValue::new(value)
 }
 
+/// Store or rotate a secret through the provider selected by the portable
+/// reference. Environment references are deliberately read-only: mutating a
+/// parent process environment is neither reliable nor a durable secret store.
+pub fn store(
+    reference: &SecretRef,
+    value: &str,
+    external: Option<&dyn ExternalSecretProvider>,
+) -> Result<(), &'static str> {
+    if value.is_empty() {
+        return Err(SECRET_UNAVAILABLE);
+    }
+    match reference {
+        SecretRef::File { path } => write_protected_file(Path::new(path), value.as_bytes()),
+        SecretRef::External {
+            provider,
+            reference,
+        } => external
+            .ok_or(SECRET_PROVIDER_UNSUPPORTED)?
+            .store(provider, reference, value),
+        _ => Err(SECRET_MUTATION_UNSUPPORTED),
+    }
+}
+
+/// Remove a secret owned by the selected provider. Missing files are treated
+/// as already deleted, while unsafe paths fail closed.
+pub fn delete(
+    reference: &SecretRef,
+    external: Option<&dyn ExternalSecretProvider>,
+) -> Result<(), &'static str> {
+    match reference {
+        SecretRef::File { path } => delete_protected_file(Path::new(path)),
+        SecretRef::External {
+            provider,
+            reference,
+        } => external
+            .ok_or(SECRET_PROVIDER_UNSUPPORTED)?
+            .delete(provider, reference),
+        _ => Err(SECRET_MUTATION_UNSUPPORTED),
+    }
+}
+
 fn read_protected_file(path: &Path) -> Result<String, &'static str> {
     let metadata = std::fs::symlink_metadata(path).map_err(|_| SECRET_UNAVAILABLE)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -90,6 +144,80 @@ fn read_protected_file(path: &Path) -> Result<String, &'static str> {
         }
     }
     std::fs::read_to_string(path).map_err(|_| SECRET_UNAVAILABLE)
+}
+
+#[cfg(unix)]
+fn write_protected_file(path: &Path, value: &[u8]) -> Result<(), &'static str> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let parent = path.parent().ok_or(SECRET_FILE_UNSAFE)?;
+    let parent_metadata = std::fs::symlink_metadata(parent).map_err(|_| SECRET_FILE_UNSAFE)?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.file_type().is_symlink()
+        || parent_metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err(SECRET_FILE_UNSAFE);
+    }
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink()
+            || !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(SECRET_FILE_UNSAFE);
+        }
+    }
+
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or(SECRET_FILE_UNSAFE)?;
+    let temporary = parent.join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|_| SECRET_FILE_UNSAFE)?;
+        file.write_all(value).map_err(|_| SECRET_UNAVAILABLE)?;
+        file.sync_all().map_err(|_| SECRET_UNAVAILABLE)?;
+        drop(file);
+        std::fs::rename(&temporary, path).map_err(|_| SECRET_UNAVAILABLE)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| SECRET_FILE_UNSAFE)?;
+        std::fs::File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| SECRET_UNAVAILABLE)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn write_protected_file(_path: &Path, _value: &[u8]) -> Result<(), &'static str> {
+    Err(SECRET_MUTATION_UNSUPPORTED)
+}
+
+fn delete_protected_file(path: &Path) -> Result<(), &'static str> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(SECRET_UNAVAILABLE),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(SECRET_FILE_UNSAFE);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
+            return Err(SECRET_FILE_UNSAFE);
+        }
+    }
+    std::fs::remove_file(path).map_err(|_| SECRET_UNAVAILABLE)
 }
 
 #[cfg(target_os = "macos")]
@@ -195,6 +323,32 @@ mod tests {
         }
     }
 
+    struct MutableFixtureProvider(Mutex<Option<String>>);
+    impl ExternalSecretProvider for MutableFixtureProvider {
+        fn resolve(&self, provider: &str, reference: &str) -> Result<String, &'static str> {
+            if provider != "fixture" || reference != "node-token" {
+                return Err(SECRET_UNAVAILABLE);
+            }
+            self.0.lock().unwrap().clone().ok_or(SECRET_UNAVAILABLE)
+        }
+
+        fn store(&self, provider: &str, reference: &str, value: &str) -> Result<(), &'static str> {
+            if provider != "fixture" || reference != "node-token" {
+                return Err(SECRET_UNAVAILABLE);
+            }
+            *self.0.lock().unwrap() = Some(value.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, provider: &str, reference: &str) -> Result<(), &'static str> {
+            if provider != "fixture" || reference != "node-token" {
+                return Err(SECRET_UNAVAILABLE);
+            }
+            *self.0.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
     #[test]
     fn environment_resolution_is_redacted() {
         let _guard = ENV_LOCK.lock().unwrap();
@@ -245,6 +399,34 @@ mod tests {
     }
 
     #[test]
+    fn external_provider_mutation_is_explicit_and_observable() {
+        let provider = MutableFixtureProvider(Mutex::new(None));
+        let reference = SecretRef::External {
+            provider: "fixture".into(),
+            reference: "node-token".into(),
+        };
+        assert_eq!(
+            store(&reference, "first", None),
+            Err(SECRET_PROVIDER_UNSUPPORTED)
+        );
+        store(&reference, "first", Some(&provider)).unwrap();
+        assert_eq!(
+            resolve(&reference, Some(&provider)).unwrap().expose(),
+            "first"
+        );
+        store(&reference, "second", Some(&provider)).unwrap();
+        assert_eq!(
+            resolve(&reference, Some(&provider)).unwrap().expose(),
+            "second"
+        );
+        delete(&reference, Some(&provider)).unwrap();
+        assert_eq!(
+            resolve(&reference, Some(&provider)).unwrap_err(),
+            SECRET_UNAVAILABLE
+        );
+    }
+
+    #[test]
     fn windows_credential_blob_accepts_utf8_and_utf16le() {
         assert_eq!(
             decode_windows_credential_blob(b"utf8-secret".to_vec()).unwrap(),
@@ -289,6 +471,39 @@ mod tests {
             .unwrap_err(),
             SECRET_FILE_UNSAFE
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_provider_store_rotate_and_delete_are_atomic_and_owner_only() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = std::env::temp_dir().join(format!(
+            "iicp-secret-lifecycle-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("node-token");
+        let reference = SecretRef::File {
+            path: path.to_string_lossy().into_owned(),
+        };
+
+        store(&reference, "first", None).unwrap();
+        assert_eq!(resolve(&reference, None).unwrap().expose(), "first");
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        store(&reference, "second", None).unwrap();
+        assert_eq!(resolve(&reference, None).unwrap().expose(), "second");
+        assert!(std::fs::read_dir(&root).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+
+        delete(&reference, None).unwrap();
+        assert_eq!(resolve(&reference, None).unwrap_err(), SECRET_UNAVAILABLE);
+        delete(&reference, None).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }
