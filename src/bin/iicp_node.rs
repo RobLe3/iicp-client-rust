@@ -6271,6 +6271,13 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
+    fn systemd_env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap()
+    }
+
     #[cfg(unix)]
     fn secret_migration_fixture() -> (
         std::path::PathBuf,
@@ -6602,6 +6609,7 @@ mod tests {
 
     #[test]
     fn systemd_service_runs_foreground_serve_with_hourly_auto_update() {
+        let _guard = systemd_env_lock();
         env::remove_var("IICP_AUTO_UPDATE");
         env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
         env::remove_var("IICP_SYSTEMD_NOTIFY");
@@ -6629,6 +6637,7 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
     #[test]
     fn systemd_notify_is_explicit_and_does_not_guess_a_watchdog_timeout() {
+        let _guard = systemd_env_lock();
         env::set_var("IICP_SYSTEMD_NOTIFY", "1");
         let unit = render_systemd_service("notify-node", None, "/tmp/iicp-node").unwrap();
         env::remove_var("IICP_SYSTEMD_NOTIFY");

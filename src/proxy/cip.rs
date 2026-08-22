@@ -79,6 +79,23 @@ pub enum DispatchResult {
     Error(String), // error code
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct CipDispatchPlan {
+    pub envelope: Option<Value>,
+    /// Present only for remote CIP dispatch. Initial and replacement workers
+    /// must remain within this process-local set.
+    pub allowed_node_ids: Option<Vec<String>>,
+}
+
+impl CipDispatchPlan {
+    fn local() -> Self {
+        Self {
+            envelope: None,
+            allowed_node_ids: None,
+        }
+    }
+}
+
 /// Parse-time validation of cip.policy / cip.replicas / cip.quorum (S.12 §5.2).
 pub fn validate_cip_request_fields(body: &Value) -> Option<String> {
     let cip = body.get("cip")?;
@@ -192,12 +209,12 @@ pub fn compute_cip_envelope(
     task_id: &str,
     qos: Option<&str>,
     consumer_balance: Option<f64>,
-) -> Result<Option<Value>, CipError> {
+) -> Result<CipDispatchPlan, CipError> {
     if !config.enabled || qos == Some("realtime") {
-        return Ok(None);
+        return Ok(CipDispatchPlan::local());
     }
     if validate_cip_request_fields(body).is_some() {
-        return Ok(None); // invalid cip fields → local fallback
+        return Ok(CipDispatchPlan::local()); // invalid cip fields → local fallback
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -248,7 +265,10 @@ pub fn compute_cip_envelope(
         }
         _ => {
             let session_key = format!("cip-sess-{task_id}");
-            Ok(build_cip_envelope(&decision, task_id, &session_key))
+            Ok(CipDispatchPlan {
+                envelope: build_cip_envelope(&decision, task_id, &session_key),
+                allowed_node_ids: (decision == DispatchResult::Remote).then_some(eligible),
+            })
         }
     }
 }
@@ -422,7 +442,7 @@ mod tests {
     #[test]
     fn envelope_remote_builds_worker() {
         let nodes = vec![worker("n1")];
-        let env = compute_cip_envelope(
+        let plan = compute_cip_envelope(
             &nodes,
             &serde_json::json!({}),
             &cfg(),
@@ -431,10 +451,11 @@ mod tests {
             None,
             Some(100.0),
         )
-        .unwrap()
         .unwrap();
+        let env = plan.envelope.unwrap();
         assert_eq!(env["cip_role"], "worker");
         assert_eq!(env["cip_parent_task_id"], "parent-1");
+        assert_eq!(plan.allowed_node_ids, Some(vec!["n1".into()]));
     }
     #[test]
     fn envelope_disabled_is_none() {
@@ -442,10 +463,9 @@ mod tests {
             enabled: false,
             ..cfg()
         };
-        assert_eq!(
-            compute_cip_envelope(&[], &serde_json::json!({}), &c, None, "t1", None, None).unwrap(),
-            None
-        );
+        let plan =
+            compute_cip_envelope(&[], &serde_json::json!({}), &c, None, "t1", None, None).unwrap();
+        assert_eq!(plan, CipDispatchPlan::local());
     }
 
     #[test]
@@ -494,7 +514,7 @@ mod tests {
             membership_generation: 7,
             membership_expires_at: u64::MAX,
         });
-        assert!(compute_cip_envelope(
+        let plan = compute_cip_envelope(
             &[candidate],
             &serde_json::json!({}),
             &cfg(),
@@ -503,8 +523,9 @@ mod tests {
             None,
             Some(100.0),
         )
-        .unwrap()
-        .is_some());
+        .unwrap();
+        assert!(plan.envelope.is_some());
+        assert_eq!(plan.allowed_node_ids, Some(vec!["n1".into()]));
     }
 
     #[test]
