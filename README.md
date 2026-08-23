@@ -740,6 +740,13 @@ document and the configured directory authority, then selects deterministically.
 The first implementation binds HTTPS to the locally observed addresses and
 accepts only an API endpoint on that same discovered origin; it does not follow
 redirects or use multicast discovery as trust.
+Verified results are cached only in the current process and never beyond the
+descriptor expiry or five minutes. The cache key includes the operating mode
+and pinned directory authority, so a trust-policy change cannot reuse an entry.
+The DNS-SD library does not expose received record TTLs; no longer lifetime is
+inferred from DNS-SD, and a future resolver change must shorten the bound when a
+record TTL becomes available. CLI output reports the discovery, verification,
+trust and selection stages without printing descriptor or address metadata.
 An explicit directory URL suppresses multicast. Private mode fails closed when
 no trusted candidate is available; local-only mode never performs the query.
 The feature is compiled into the standard CLI but remains disabled by default.

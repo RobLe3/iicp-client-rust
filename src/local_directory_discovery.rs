@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -49,6 +50,34 @@ pub struct DirectoryResolution {
     pub observed_addresses: Vec<String>,
     pub descriptor_sha256: Option<String>,
     pub expires_at: Option<i64>,
+    /// True only when this result was reused from the bounded in-process cache.
+    pub cache_hit: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CacheKey {
+    mode: u8,
+    trusted_directory_did: String,
+}
+
+#[derive(Clone, Debug)]
+struct CachedResolution {
+    resolution: DirectoryResolution,
+    expires_at: i64,
+}
+
+type ResolutionCache = tokio::sync::Mutex<BTreeMap<CacheKey, CachedResolution>>;
+
+fn resolution_cache() -> &'static ResolutionCache {
+    static CACHE: OnceLock<ResolutionCache> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Invalidate all locally cached candidates after a trust-policy or revocation
+/// update. The current CLI resolves only during startup, so configuration
+/// reloads naturally start a new process; embedded runtimes can call this hook.
+pub async fn invalidate_cache() {
+    resolution_cache().lock().await.clear();
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +135,7 @@ pub async fn resolve(
             observed_addresses: Vec::new(),
             descriptor_sha256: None,
             expires_at: None,
+            cache_hit: false,
         }));
     }
     if !request.enabled {
@@ -119,6 +149,20 @@ pub async fn resolve(
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .ok_or(LocalDirectoryError::MissingTrustAnchor)?;
+    let cache_key = CacheKey {
+        mode: mode_cache_key(request.mode),
+        trusted_directory_did: trusted_did.to_owned(),
+    };
+    let now = chrono::Utc::now().timestamp();
+    {
+        let mut cache = resolution_cache().lock().await;
+        cache.retain(|_, entry| entry.expires_at > now);
+        if let Some(entry) = cache.get(&cache_key) {
+            let mut resolution = entry.resolution.clone();
+            resolution.cache_hit = true;
+            return Ok(Some(resolution));
+        }
+    }
     let window = request
         .collection_window_ms
         .clamp(1, MAX_COLLECTION_WINDOW_MS);
@@ -137,7 +181,18 @@ pub async fn resolve(
             .then_with(|| left.endpoint.cmp(&right.endpoint))
     });
     match verified.into_iter().next() {
-        Some(candidate) => Ok(Some(candidate)),
+        Some(candidate) => {
+            if let Some(expires_at) = candidate.expires_at.filter(|expiry| *expiry > now) {
+                resolution_cache().lock().await.insert(
+                    cache_key,
+                    CachedResolution {
+                        resolution: candidate.clone(),
+                        expires_at,
+                    },
+                );
+            }
+            Ok(Some(candidate))
+        }
         None if request.mode == OperatingMode::Public && request.allow_public_fallback => Ok(None),
         None => Err(LocalDirectoryError::NoTrustedCandidate),
     }
@@ -298,7 +353,18 @@ async fn verify_candidate(
                 .expires_at
                 .min(chrono::Utc::now().timestamp() + MAX_CACHE_SECONDS),
         ),
+        cache_hit: false,
     })
+}
+
+fn mode_cache_key(mode: OperatingMode) -> u8 {
+    match mode {
+        OperatingMode::Public => 0,
+        OperatingMode::Private => 1,
+        OperatingMode::FederatedPrivate => 2,
+        OperatingMode::LocalOnly => 3,
+        OperatingMode::Custom => 4,
+    }
 }
 
 async fn validate_descriptor(
@@ -352,6 +418,14 @@ async fn validate_descriptor(
             "DID document identity mismatch".into(),
         ));
     }
+    verify_descriptor_signature(descriptor, value, &did)
+}
+
+fn verify_descriptor_signature(
+    descriptor: &Descriptor,
+    value: &Value,
+    did: &Value,
+) -> Result<(), LocalDirectoryError> {
     let public_key = did["verificationMethod"]
         .as_array()
         .and_then(|methods| {
@@ -421,6 +495,11 @@ fn txt_contains_secret(txt: &BTreeMap<String, String>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    const SHARED_FIXTURE: &str =
+        include_str!("../tests/fixtures/local-directory-discovery-v0.json");
 
     #[tokio::test]
     async fn explicit_directory_suppresses_multicast() {
@@ -469,5 +548,223 @@ mod tests {
         txt.insert("pv".into(), "0".into());
         txt.insert("membership_token".into(), "private".into());
         assert!(txt_contains_secret(&txt));
+    }
+
+    #[test]
+    fn descriptor_signature_accepts_valid_and_rejects_tampered_content() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let did_id = "did:web:directory.local";
+        let mut unsigned = serde_json::json!({
+            "schema": "iicp.local-directory-descriptor.v0",
+            "profile": "urn:iicp:profile:local-directory-discovery:v1",
+            "profile_version": "0",
+            "directory_did": did_id,
+            "role": "standalone",
+            "api_endpoints": ["https://directory.local:8443/api"],
+            "issued_at": 1000,
+            "expires_at": 1200
+        });
+        let canonical = serde_jcs::to_vec(&unsigned).unwrap();
+        let mut message = SIGNATURE_DOMAIN.to_vec();
+        message.extend_from_slice(&canonical);
+        let signature = signing_key.sign(&message);
+        unsigned["signature"] = serde_json::json!({
+            "algorithm": "Ed25519",
+            "key_id": format!("{did_id}#key-1"),
+            "value": hex::encode(signature.to_bytes())
+        });
+        let descriptor: Descriptor = serde_json::from_value(unsigned.clone()).unwrap();
+        let did = serde_json::json!({
+            "id": did_id,
+            "verificationMethod": [{
+                "id": format!("{did_id}#key-1"),
+                "publicKeyJwk": {"x": URL_SAFE_NO_PAD.encode(signing_key.verifying_key().to_bytes())}
+            }]
+        });
+        verify_descriptor_signature(&descriptor, &unsigned, &did).unwrap();
+
+        let mut tampered = unsigned;
+        tampered["role"] = Value::String("replica".into());
+        assert!(verify_descriptor_signature(&descriptor, &tampered, &did).is_err());
+    }
+
+    #[tokio::test]
+    async fn cache_is_bounded_and_keyed_by_trust_policy() {
+        resolution_cache().lock().await.clear();
+        let now = chrono::Utc::now().timestamp();
+        let key = CacheKey {
+            mode: mode_cache_key(OperatingMode::Private),
+            trusted_directory_did: "did:web:trusted.local".into(),
+        };
+        resolution_cache().lock().await.insert(
+            key.clone(),
+            CachedResolution {
+                resolution: DirectoryResolution {
+                    endpoint: "https://trusted.local/api".into(),
+                    directory_did: Some(key.trusted_directory_did.clone()),
+                    source: ResolutionSource::Mdns,
+                    observed_hostname: Some("trusted.local".into()),
+                    observed_addresses: vec!["192.168.1.10".into()],
+                    descriptor_sha256: Some("a".repeat(64)),
+                    expires_at: Some(now + 30),
+                    cache_hit: false,
+                },
+                expires_at: now + 30,
+            },
+        );
+        let cached = resolve(ResolveRequest {
+            enabled: true,
+            mode: OperatingMode::Private,
+            explicit_directory: None,
+            trusted_directory_did: Some(key.trusted_directory_did.clone()),
+            allow_public_fallback: false,
+            collection_window_ms: 1,
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(cached.cache_hit);
+
+        resolution_cache()
+            .lock()
+            .await
+            .get_mut(&key)
+            .unwrap()
+            .expires_at = now;
+        let expired = resolution_cache().lock().await.remove(&key).unwrap();
+        assert!(expired.expires_at <= now);
+        assert!(!resolution_cache().lock().await.contains_key(&CacheKey {
+            mode: mode_cache_key(OperatingMode::Private),
+            trusted_directory_did: "did:web:other.local".into(),
+        }));
+    }
+
+    #[test]
+    fn shared_positive_and_adversarial_profile_cases_are_pinned() {
+        assert_eq!(
+            hex::encode(Sha256::digest(SHARED_FIXTURE.as_bytes())),
+            "490bcc1a70153745a28299ff9680dc185312676ef06384789667174e61f374ed"
+        );
+        let fixture: Value = serde_json::from_str(SHARED_FIXTURE).unwrap();
+        assert_eq!(fixture["service_type"], SERVICE_TYPE);
+        assert_eq!(fixture["defaults"]["maximum_txt_bytes"], MAX_TXT_BYTES);
+        assert_eq!(
+            fixture["defaults"]["maximum_cache_seconds"],
+            MAX_CACHE_SECONDS
+        );
+        for case in fixture["cases"].as_array().unwrap() {
+            let actual = evaluate_shared_case(&case["input"]);
+            assert_eq!(
+                actual,
+                case["expected"],
+                "shared local-discovery case {}",
+                case["id"].as_str().unwrap()
+            );
+        }
+    }
+
+    fn evaluate_shared_case(input: &Value) -> Value {
+        let mode = input["mode"].as_str().unwrap();
+        let client_kind = input["client_kind"].as_str().unwrap();
+        let enabled = input["profile_enabled"].as_bool().unwrap();
+        let mdns = input["mdns"].as_str().unwrap();
+        let fallback = input["genesis_fallback_allowed"].as_bool().unwrap();
+        let now = input["now"].as_i64().unwrap();
+        if let Some(explicit) = input["explicit_directory"].as_str() {
+            return fixture_result("explicit", Some(explicit), "explicit_configuration", false);
+        }
+        if !enabled {
+            return fixture_result(
+                "genesis",
+                Some("https://iicp.network/api"),
+                "profile_disabled",
+                false,
+            );
+        }
+        if client_kind == "browser" {
+            return fixture_result(
+                "genesis",
+                Some("https://iicp.network/api"),
+                "browser_local_discovery_unsupported",
+                false,
+            );
+        }
+        if mode == "local_only" {
+            return fixture_result("none", None, "local_only_external_forbidden", false);
+        }
+        if mdns == "timeout" {
+            return fixture_result(
+                "genesis",
+                Some("https://iicp.network/api"),
+                "local_discovery_unavailable",
+                true,
+            );
+        }
+        if mdns == "ssdp_only" {
+            return fixture_result(
+                "genesis",
+                Some("https://iicp.network/api"),
+                "ssdp_not_supported",
+                true,
+            );
+        }
+        let mut accepted = input["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|candidate| {
+                let txt = candidate["txt"].as_object().unwrap();
+                let txt_safe = !txt.keys().any(|key| {
+                    ["token", "secret", "credential", "membership"]
+                        .iter()
+                        .any(|word| key.contains(word))
+                });
+                candidate["txt_bytes"].as_u64().unwrap() <= MAX_TXT_BYTES as u64
+                    && txt_safe
+                    && candidate["descriptor_signature_valid"] == true
+                    && candidate["descriptor_expires_at"].as_i64().unwrap() > now
+                    && candidate["cache_expires_at"].as_i64().unwrap() > now
+                    && txt
+                        .get("did")
+                        .is_none_or(|did| did == &candidate["descriptor_did"])
+                    && matches!(
+                        candidate["trust"].as_str(),
+                        Some("pinned" | "domain" | "federation")
+                    )
+            })
+            .collect::<Vec<_>>();
+        accepted.sort_by(|left, right| {
+            left["descriptor_did"]
+                .as_str()
+                .cmp(&right["descriptor_did"].as_str())
+                .then_with(|| left["endpoint"].as_str().cmp(&right["endpoint"].as_str()))
+        });
+        if let Some(candidate) = accepted.first() {
+            return fixture_result(
+                "mdns",
+                candidate["endpoint"].as_str(),
+                "verified_local_candidate",
+                true,
+            );
+        }
+        if mode == "public" && fallback {
+            fixture_result(
+                "genesis",
+                Some("https://iicp.network/api"),
+                "local_candidates_rejected",
+                true,
+            )
+        } else {
+            fixture_result("none", None, "no_verified_directory", true)
+        }
+    }
+
+    fn fixture_result(source: &str, selected: Option<&str>, reason: &str, query: bool) -> Value {
+        serde_json::json!({
+            "source": source,
+            "selected": selected,
+            "reason": reason,
+            "mdns_query": query
+        })
     }
 }

@@ -3683,9 +3683,16 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         if let Some(resolution) = resolution {
             if resolution.source == iicp_client::local_directory_discovery::ResolutionSource::Mdns {
                 eprintln!(
-                    "[iicp-node] selected verified local directory {} ({})",
-                    resolution.endpoint,
-                    resolution.directory_did.as_deref().unwrap_or("unknown DID")
+                    "[iicp-node] local directory: discovered -> verified -> trusted -> selected{}",
+                    if resolution.cache_hit {
+                        " (bounded cache)"
+                    } else {
+                        ""
+                    }
+                );
+                eprintln!(
+                    "[iicp-node] selected local directory {}",
+                    resolution.endpoint
                 );
                 opts.directory_url = resolution.endpoint;
             }
