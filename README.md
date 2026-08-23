@@ -37,7 +37,7 @@ iicp-client = "0.7.107"
 Install the CLI and ask the mesh:
 
 ```bash
-cargo install iicp-client
+cargo install iicp-client --version 0.7.107 --locked
 iicp-node query "Hello, mesh."
 ```
 
@@ -210,7 +210,7 @@ let reply = client.chat(
 Existing OpenAI-compatible tools:
 
 ```bash
-cargo install iicp-client --features proxy
+cargo install iicp-client --version 0.7.107 --locked --features proxy
 iicp-node proxy
 export OPENAI_BASE_URL=http://127.0.0.1:9483/v1
 ```
@@ -229,7 +229,7 @@ no-retention policy manifest is required.
 Provider nodes run an hourly official-registry check by default
 (`IICP_AUTO_UPDATE=1`, `IICP_AUTO_UPDATE_INTERVAL_S=3600`; minimum 300s).
 When crates.io publishes a newer stable release, `serve` installs it with
-`cargo install iicp-client --force --features nat,iicp-tcp` and re-execs the
+`cargo install iicp-client --version X.Y.Z --locked --force --registry crates-io --features nat,iicp-tcp` and re-execs the
 node so identity and cached node tokens are preserved.
 
 If an older supervised node does not update itself, perform one manual upgrade
@@ -300,7 +300,7 @@ Run a local gateway that speaks the OpenAI, Ollama, and Anthropic HTTP APIs and 
 every request across the IICP mesh — point any tool you already use at it, no code changes.
 
 ```bash
-cargo install iicp-client --features proxy
+cargo install iicp-client --version 0.7.107 --locked --features proxy
 iicp-node proxy                       # → http://127.0.0.1:9483
 
 export OPENAI_BASE_URL=http://127.0.0.1:9483/v1   # OpenAI SDK / LangChain / Cursor / liteLLM

@@ -31,6 +31,8 @@ jobs:
         with:
           toolchain: 1.86.0
           components: rustfmt, clippy
+      - name: Install pinned security scanner
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Verify, test and package
         shell: bash
         run: |
@@ -39,13 +41,25 @@ jobs:
           expected="${expected#v}"
           actual=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
           test "$actual" = "$expected"
+          python3 scripts/check_dependency_policy.py
+          cargo audit
           cargo fmt --check
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features
           cargo package --locked
       - name: Clean-install smoke
+        shell: bash
         run: |
-          cargo install --locked --path . --features nat --root /tmp/iicp-release-smoke
+          set -euo pipefail
+          version="${{ inputs.version }}"
+          version="${version#v}"
+          crate="target/package/iicp-client-${version}.crate"
+          test -f "$crate"
+          tar -tzf "$crate" | grep -Eq '/Cargo.lock$'
+          mkdir -p /tmp/iicp-release-source /tmp/iicp-release-smoke
+          tar -xzf "$crate" -C /tmp/iicp-release-source
+          package=$(find /tmp/iicp-release-source -mindepth 1 -maxdepth 1 -type d -print -quit)
+          cargo install --locked --path "$package" --features nat --root /tmp/iicp-release-smoke
           /tmp/iicp-release-smoke/bin/iicp-node --version
       - name: Publish to crates.io
         env:

@@ -5,7 +5,7 @@
 //! `iicp-node update` still supports the safe read-only version check, but
 //! normal long-running `iicp-node serve` processes now also run a default-on
 //! background loop: check crates.io hourly (first check within five minutes),
-//! `cargo install --force` when a newer stable release exists, and re-exec the
+//! install that exact release with its published lockfile, and re-exec the
 //! process so the node comes back on the new binary in covered service paths.
 //! The loop is failure-isolated and opt-out via `IICP_AUTO_UPDATE=0`.
 
@@ -32,40 +32,72 @@ fn update_status() -> &'static Mutex<UpdateStatus> {
 
 /// Parse a dotted version into a comparable vec; truncate at the first
 /// non-numeric segment ("1.2.3-rc1" → [1,2,3]).
-pub fn parse_version(v: &str) -> Vec<u64> {
-    let mut out = Vec::new();
-    for part in v.trim().trim_start_matches(['v', 'V']).split('.') {
-        let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-        if digits.is_empty() {
-            break;
-        }
-        match digits.parse::<u64>() {
-            Ok(n) => out.push(n),
-            Err(_) => break,
-        }
+pub fn parse_version(v: &str) -> Option<[u64; 3]> {
+    let value = v.trim();
+    if value.is_empty() || value.starts_with(['v', 'V']) || value.contains(['-', '+']) {
+        return None;
     }
-    out
+    let parts: Vec<&str> = value.split('.').collect();
+    if parts.len() != 3
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || (part.len() > 1 && part.starts_with('0')))
+    {
+        return None;
+    }
+    Some([
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ])
 }
 
 /// True when `latest` is strictly newer than `current` (numeric, not lex).
 pub fn is_outdated(current: &str, latest: &str) -> bool {
-    let a = parse_version(current);
-    let b = parse_version(latest);
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        let x = a.get(i).copied().unwrap_or(0);
-        let y = b.get(i).copied().unwrap_or(0);
-        if y > x {
-            return true;
-        }
-        if y < x {
-            return false;
-        }
-    }
-    false
+    matches!((parse_version(current), parse_version(latest)), (Some(a), Some(b)) if b > a)
 }
 
-pub const UPGRADE_COMMAND: &str = "cargo install iicp-client --force";
+pub fn upgrade_command(version: &str, features: &str) -> Option<Vec<String>> {
+    parse_version(version)?;
+    Some(
+        [
+            "install",
+            "iicp-client",
+            "--version",
+            version,
+            "--locked",
+            "--force",
+            "--registry",
+            "crates-io",
+            "--features",
+            features,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    )
+}
+
+pub fn enabled_runtime_features() -> String {
+    let mut features = Vec::new();
+    for (enabled, name) in [
+        (cfg!(feature = "nat"), "nat"),
+        (cfg!(feature = "iicp-tcp"), "iicp-tcp"),
+        (cfg!(feature = "metrics"), "metrics"),
+        (cfg!(feature = "proxy"), "proxy"),
+        (cfg!(feature = "lifecycle-sqlite"), "lifecycle-sqlite"),
+        (
+            cfg!(feature = "dispatch-admission-sqlite"),
+            "dispatch-admission-sqlite",
+        ),
+        (cfg!(feature = "systemd-notify"), "systemd-notify"),
+    ] {
+        if enabled {
+            features.push(name);
+        }
+    }
+    features.join(",")
+}
 
 /// The unattended host updater and generated supervisor units use this Cargo
 /// installation by default.  It is deliberately separate from whichever
@@ -152,7 +184,7 @@ pub async fn latest_crates_version(timeout_secs: u64) -> Option<String> {
 
 // ── P2 — background self-updater (#521) ─────────────────────────────────────────
 // A node running `serve` periodically checks crates.io and, on a newer release,
-// `cargo install --force`s and re-execs onto it. Removes the manual-upgrade
+// installs that exact version with `--locked` and re-execs onto it. Removes the manual-upgrade
 // dependency on manual upgrades in covered service paths. Nodes older than the
 // hardened 0.7.67 serve wiring may need one manual upgrade/restart first.
 // Default-on; opt out with IICP_AUTO_UPDATE=0. Loop-safe (post-upgrade running == latest) + failure-isolated.
@@ -207,11 +239,14 @@ pub fn auto_update_initial_delay_secs(interval: u64) -> u64 {
     interval.min(300)
 }
 
-/// `cargo install iicp-client --force --features <features>`. True on success.
+/// Install the exact validated stable candidate with its published lockfile.
 /// Blocking (recompiles) — call from a blocking context.
-pub fn perform_self_update(features: &str) -> bool {
+pub fn perform_self_update(version: &str, features: &str) -> bool {
+    let Some(args) = upgrade_command(version, features) else {
+        return false;
+    };
     std::process::Command::new("cargo")
-        .args(["install", "iicp-client", "--force", "--features", features])
+        .args(args)
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -347,13 +382,37 @@ mod tests {
         assert!(!is_outdated("0.7.57", "0.7.56"));
         assert!(is_outdated("0.7.9", "0.7.10")); // not lexicographic
         assert!(!is_outdated("1.0.0", "0.9.9"));
-        assert!(is_outdated("v0.7.56", "0.7.57")); // leading v tolerated
+        assert!(!is_outdated("v0.7.56", "0.7.57"));
     }
 
     #[test]
-    fn parse_truncates_prerelease() {
-        assert_eq!(parse_version("1.2.3-rc1"), vec![1, 2, 3]);
-        assert_eq!(parse_version("0.7.57"), vec![0, 7, 57]);
+    fn stable_version_validation_fails_closed() {
+        assert_eq!(parse_version("0.7.57"), Some([0, 7, 57]));
+        for value in ["1.2.3-rc1", "v1.2.3", "1.2", "1.2.3.4", "01.2.3", ""] {
+            assert_eq!(parse_version(value), None, "{value}");
+        }
+    }
+
+    #[test]
+    fn cargo_update_is_exact_locked_and_registry_bound() {
+        let args = upgrade_command("0.7.108", "nat,iicp-tcp,proxy").unwrap();
+        assert_eq!(
+            args,
+            [
+                "install",
+                "iicp-client",
+                "--version",
+                "0.7.108",
+                "--locked",
+                "--force",
+                "--registry",
+                "crates-io",
+                "--features",
+                "nat,iicp-tcp,proxy"
+            ]
+        );
+        assert!(upgrade_command("0.7.108-rc.1", "nat").is_none());
+        assert!(!args.iter().any(|arg| arg == "latest"));
     }
 
     #[test]

@@ -4243,7 +4243,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
 
     // #521 P2 — background self-updater. Default-on; IICP_AUTO_UPDATE=0 opts out. Once a
     // node reaches the first release carrying this updater, every future release
-    // self-propagates (cargo install --force + re-exec). Loop-safe + failure-isolated.
+    // self-propagates (exact locked Cargo install + re-exec). Loop-safe + failure-isolated.
     // The Rust upgrade recompiles, so it can take a few minutes; the node keeps serving
     // until the re-exec. Features default to the recommended `nat,iicp-tcp`.
     if iicp_client::updater::auto_update_enabled() {
@@ -4272,8 +4272,10 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                         "[iicp-node] auto-update: newer release {} available (running {current}) — upgrading via cargo install (may take a few minutes)…",
                         latest.as_deref().unwrap_or("?")
                     );
-                    let ok = tokio::task::spawn_blocking(|| {
-                        iicp_client::updater::perform_self_update("nat,iicp-tcp")
+                    let candidate = latest.expect("validated update candidate");
+                    let features = iicp_client::updater::enabled_runtime_features();
+                    let ok = tokio::task::spawn_blocking(move || {
+                        iicp_client::updater::perform_self_update(&candidate, &features)
                     })
                     .await
                     .unwrap_or(false);
@@ -6190,7 +6192,9 @@ async fn main() {
         }
         // #521 P1 — read-only version check. Exit 10 when a newer release
         // exists (cron/scripts can act), 0 when current/unreachable. No install.
-        use iicp_client::updater::{is_outdated, latest_crates_version, UPGRADE_COMMAND};
+        use iicp_client::updater::{
+            enabled_runtime_features, is_outdated, latest_crates_version, upgrade_command,
+        };
         print_managed_binary_notice();
         let current = env!("CARGO_PKG_VERSION");
         match latest_crates_version(5).await {
@@ -6199,8 +6203,11 @@ async fn main() {
                 process::exit(0);
             }
             Some(latest) if is_outdated(current, &latest) => {
+                let command = upgrade_command(&latest, &enabled_runtime_features())
+                    .expect("outdated candidate was already validated")
+                    .join(" ");
                 println!(
-                    "iicp-client {current} — a newer release is available: {latest}\n  upgrade:  {UPGRADE_COMMAND}"
+                    "iicp-client {current} — a newer release is available: {latest}\n  upgrade:  cargo {command}"
                 );
                 process::exit(10);
             }
