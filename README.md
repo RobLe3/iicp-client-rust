@@ -671,6 +671,33 @@ Apache 2.0 · [iicp.network](https://iicp.network)
 
 ### Canonical runtime configuration (development candidate)
 
+Generate and validate the same canonical configuration through the headless
+wizard:
+
+```bash
+# Public preset, printed as a machine-readable report
+iicp-node config wizard --mode public
+
+# Private trust domain; the credential remains in the referenced environment
+# variable and is never copied into the configuration file
+iicp-node config wizard \
+  --mode private \
+  --directory-url https://directory.example/api \
+  --directory-authority did:key:directory \
+  --trust-domain example.internal \
+  --membership-env IICP_MEMBERSHIP \
+  --output ~/.iicp/runtime-private.json
+
+# Prompted mode uses the same projection and validator
+iicp-node config wizard --interactive
+```
+
+Invalid private and local-only combinations are reported before a file is
+written. Federated-private configuration can be inspected, but remains invalid
+for execution until the Phase 6 evidence gate passes. See
+[`docs/CUG_CONFIG_WIZARD.md`](docs/CUG_CONFIG_WIZARD.md) for the future GUI
+boundary.
+
 The Rust runtime exposes one versioned JSON configuration authority for CLI,
 headless automation and a future wizard or GUI. It is additive and does not
 enable restricted-domain operation by itself.

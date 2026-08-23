@@ -48,6 +48,7 @@ pub mod backends;
 pub mod cip_policy;
 pub mod concurrency;
 pub mod confidentiality;
+pub mod config_wizard;
 pub mod conformance;
 pub mod delegation;
 #[cfg(feature = "dispatch-admission-sqlite")]

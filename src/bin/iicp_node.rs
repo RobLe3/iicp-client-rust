@@ -24,7 +24,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process;
 use std::time::Duration;
 use subtle::ConstantTimeEq;
@@ -745,17 +745,206 @@ fn config_environment_overrides() -> Result<iicp_client::runtime_config::ConfigO
 fn run_config(args: &[String]) -> Result<i32, String> {
     let Some(action) = args.first().map(String::as_str) else {
         return Err(
-            "config requires schema, validate, effective, migrate-node or migrate-node-secrets"
+            "config requires schema, wizard, validate, effective, migrate-node or migrate-node-secrets"
                 .into(),
         );
     };
     match action {
         "schema" => run_config_schema(args),
+        "wizard" => run_config_wizard(args),
         "migrate-node" => run_config_migration(args),
         "migrate-node-secrets" => run_node_secret_migration(args),
         "validate" | "effective" => run_resolved_config_action(action, args),
         _ => Err(format!("unknown config action: {action}")),
     }
+}
+
+fn wizard_prompt(prompt: &str, fallback: &str) -> Result<String, String> {
+    let suffix = if fallback.is_empty() {
+        String::new()
+    } else {
+        format!(" [{fallback}]")
+    };
+    print!("{prompt}{suffix}: ");
+    io::stdout().flush().map_err(|error| error.to_string())?;
+    let mut value = String::new();
+    let read = io::stdin()
+        .read_line(&mut value)
+        .map_err(|error| error.to_string())?;
+    if read == 0 {
+        return Err("configuration wizard cancelled before writing configuration".into());
+    }
+    let value = value.trim();
+    Ok(if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    })
+}
+
+fn write_runtime_config_atomic(
+    path: &Path,
+    config: &iicp_client::runtime_config::RuntimeConfigV1,
+) -> Result<(), String> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|error| format!("create config directory: {error}"))?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let bytes = serde_json::to_vec_pretty(config).map_err(|error| error.to_string())?;
+    fs::write(&temporary, bytes).map_err(|error| format!("write staged config: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
+            .map_err(|error| format!("protect staged config: {error}"))?;
+    }
+    fs::rename(&temporary, path).map_err(|error| format!("commit config: {error}"))
+}
+
+#[derive(Default)]
+struct WizardCliOptions {
+    interactive: bool,
+    mode: Option<iicp_client::runtime_config::OperatingMode>,
+    directory_url: Option<String>,
+    directory_authority: Option<String>,
+    trust_domain_id: Option<String>,
+    trusted_domains: Vec<String>,
+    membership_env: Option<String>,
+    output: Option<PathBuf>,
+}
+
+fn parse_wizard_options(args: &[String]) -> Result<Option<WizardCliOptions>, String> {
+    let mut options = WizardCliOptions::default();
+    let mut i = 1;
+    while i < args.len() {
+        let value = |index: usize, option: &str| {
+            args.get(index)
+                .cloned()
+                .ok_or_else(|| format!("{option} requires a value"))
+        };
+        match args[i].as_str() {
+            "--interactive" => options.interactive = true,
+            "--mode" => {
+                i += 1;
+                options.mode = Some(parse_operating_mode(&value(i, "--mode")?)?);
+            }
+            "--directory-url" => {
+                i += 1;
+                options.directory_url = Some(value(i, "--directory-url")?);
+            }
+            "--directory-authority" => {
+                i += 1;
+                options.directory_authority = Some(value(i, "--directory-authority")?);
+            }
+            "--trust-domain" => {
+                i += 1;
+                options.trust_domain_id = Some(value(i, "--trust-domain")?);
+            }
+            "--trusted-domain" => {
+                i += 1;
+                options.trusted_domains.push(value(i, "--trusted-domain")?);
+            }
+            "--membership-env" => {
+                i += 1;
+                options.membership_env = Some(value(i, "--membership-env")?);
+            }
+            "--output" => {
+                i += 1;
+                options.output = Some(PathBuf::from(value(i, "--output")?));
+            }
+            "--help" | "-h" => {
+                println!(
+                    "usage: iicp-node config wizard --mode MODE [--interactive] [--directory-url URL] [--directory-authority ID] [--trust-domain ID] [--trusted-domain ID] [--membership-env NAME] [--output FILE]"
+                );
+                return Ok(None);
+            }
+            other => return Err(format!("unknown config wizard option: {other}")),
+        }
+        i += 1;
+    }
+    Ok(Some(options))
+}
+
+fn prompt_wizard_options(options: &mut WizardCliOptions) -> Result<(), String> {
+    use iicp_client::runtime_config::OperatingMode;
+
+    if options.interactive {
+        options.mode = Some(parse_operating_mode(&wizard_prompt(
+            "Operating mode (public, private, federated_private, local_only, custom)",
+            options
+                .mode
+                .map(iicp_client::config_wizard::mode_name)
+                .unwrap_or("public"),
+        )?)?);
+        if matches!(
+            options.mode,
+            Some(OperatingMode::Private | OperatingMode::FederatedPrivate)
+        ) {
+            options.directory_url = Some(wizard_prompt(
+                "Private directory URL",
+                options
+                    .directory_url
+                    .as_deref()
+                    .unwrap_or("https://directory.example/api"),
+            )?);
+            options.directory_authority = Some(wizard_prompt(
+                "Verified directory authority ID",
+                options.directory_authority.as_deref().unwrap_or(""),
+            )?);
+            options.trust_domain_id = Some(wizard_prompt(
+                "Trust-domain ID",
+                options.trust_domain_id.as_deref().unwrap_or(""),
+            )?);
+            options.membership_env = Some(wizard_prompt(
+                "Environment variable holding the membership credential (blank for external enrollment handoff)",
+                options.membership_env.as_deref().unwrap_or(""),
+            )?);
+        }
+        if options.mode == Some(OperatingMode::FederatedPrivate)
+            && options.trusted_domains.is_empty()
+        {
+            options
+                .trusted_domains
+                .push(wizard_prompt("Trusted peer domain", "")?);
+        }
+    }
+    Ok(())
+}
+
+fn run_config_wizard(args: &[String]) -> Result<i32, String> {
+    use iicp_client::config_wizard::WizardRequest;
+    use iicp_client::runtime_config::SecretRef;
+
+    let Some(mut options) = parse_wizard_options(args)? else {
+        return Ok(0);
+    };
+    prompt_wizard_options(&mut options)?;
+    let mode = options
+        .mode
+        .ok_or("non-interactive wizard requires --mode; use --interactive to be prompted")?;
+    let report = WizardRequest {
+        mode,
+        directory_url: options.directory_url,
+        directory_authority: options.directory_authority,
+        trust_domain_id: options.trust_domain_id,
+        trusted_domains: options.trusted_domains,
+        membership_credential: options
+            .membership_env
+            .filter(|value| !value.trim().is_empty())
+            .map(|name| SecretRef::Environment { name }),
+    }
+    .build();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+    );
+    if !report.valid {
+        return Ok(2);
+    }
+    if let Some(path) = options.output {
+        write_runtime_config_atomic(&path, &report.config)?;
+        eprintln!("WROTE: {}", path.display());
+    }
+    Ok(0)
 }
 
 fn run_resolved_config_action(action: &str, args: &[String]) -> Result<i32, String> {
