@@ -555,15 +555,32 @@ pub struct ProxyConfig {
     pub port: u16,
     pub directory_url: Option<String>,
     pub region: Option<String>,
+    /// Validated process-local boundary inherited by a co-hosted private node.
+    /// Standalone public proxies leave this unset.
+    pub restricted_directory: Option<crate::types::RestrictedDirectoryContext>,
+}
+
+fn client_config_for_proxy(cfg: &ProxyConfig) -> crate::types::ClientConfig {
+    let mut client_cfg = crate::types::ClientConfig::default();
+    if let Some(d) = &cfg.directory_url {
+        client_cfg.directory_url = d.clone();
+    }
+    client_cfg.region = cfg.region.clone();
+    client_cfg.restricted_directory = cfg.restricted_directory.clone();
+    if cfg.restricted_directory.is_some() {
+        client_cfg.profile_request = Some(crate::types::ProfileRequest {
+            profile_id: crate::restricted_directory::PROFILE_ID.into(),
+            profile_version: crate::restricted_directory::PROFILE_VERSION.into(),
+            profile_fixture_sha256: crate::restricted_directory::PROFILE_FIXTURE_SHA256.into(),
+            required: true,
+        });
+    }
+    client_cfg
 }
 
 /// CLI entry: build a real `IicpClient` gateway and serve (loopback by default).
 pub async fn run_proxy(cfg: ProxyConfig) -> std::io::Result<()> {
-    let mut client_cfg = crate::types::ClientConfig::default();
-    if let Some(d) = cfg.directory_url {
-        client_cfg.directory_url = d;
-    }
-    client_cfg.region = cfg.region;
+    let client_cfg = client_config_for_proxy(&cfg);
     let client = IicpClient::new(client_cfg).map_err(|e| std::io::Error::other(format!("{e}")))?;
     let backend: Backend = Arc::new(client);
     let app = proxy_router(backend);
@@ -576,6 +593,49 @@ pub async fn run_proxy(cfg: ProxyConfig) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_client_config_preserves_validated_restricted_context() {
+        let restricted = crate::types::RestrictedDirectoryContext {
+            domain_id: "example.internal".into(),
+            authority_id: "did:key:directory".into(),
+            subject_id: "did:key:node".into(),
+            subject_kind: "node".into(),
+            minimum_membership_generation: 7,
+            membership_credential: crate::runtime_config::SecretRef::File {
+                path: "/not/resolved/by-this-test".into(),
+            },
+        };
+        let config = client_config_for_proxy(&ProxyConfig {
+            host: "127.0.0.1".into(),
+            port: 9483,
+            directory_url: Some("https://directory.example".into()),
+            region: Some("eu".into()),
+            restricted_directory: Some(restricted),
+        });
+        let actual = config.restricted_directory.expect("restricted context");
+        assert_eq!(actual.domain_id, "example.internal");
+        assert_eq!(actual.authority_id, "did:key:directory");
+        assert_eq!(actual.minimum_membership_generation, 7);
+        let profile = config.profile_request.expect("canonical profile request");
+        assert_eq!(profile.profile_id, crate::restricted_directory::PROFILE_ID);
+        assert_eq!(
+            profile.profile_fixture_sha256,
+            crate::restricted_directory::PROFILE_FIXTURE_SHA256
+        );
+    }
+
+    #[test]
+    fn standalone_proxy_remains_unrestricted_by_default() {
+        let config = client_config_for_proxy(&ProxyConfig {
+            host: "127.0.0.1".into(),
+            port: 9483,
+            directory_url: None,
+            region: None,
+            restricted_directory: None,
+        });
+        assert!(config.restricted_directory.is_none());
+    }
 
     struct Mock {
         kind: String,

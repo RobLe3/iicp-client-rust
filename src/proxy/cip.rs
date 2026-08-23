@@ -483,6 +483,12 @@ mod tests {
                 membership_generation: 7,
                 membership_expires_at: u64::MAX,
             }),
+            Some(RestrictedEligibility {
+                domain_id: "domain-a".into(),
+                authority_id: "directory-b".into(),
+                membership_generation: 7,
+                membership_expires_at: u64::MAX,
+            }),
         ] {
             let mut candidate = worker("n1");
             candidate.restricted_eligibility = proof;

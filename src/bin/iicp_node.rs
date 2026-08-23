@@ -3459,6 +3459,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             } else {
                 Some(opts.region.clone())
             };
+            let restricted_directory = opts.restricted_directory_context.clone();
             println!("co-hosted proxy → http://127.0.0.1:{pport} (OpenAI/Ollama/Anthropic compat)");
             tokio::spawn(async move {
                 if let Err(e) = iicp_client::proxy::run_proxy(iicp_client::proxy::ProxyConfig {
@@ -3466,6 +3467,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                     port: pport,
                     directory_url: Some(dir),
                     region,
+                    restricted_directory,
                 })
                 .await
                 {
@@ -5339,6 +5341,7 @@ async fn run_proxy_cmd(args: &[String]) -> Result<(), String> {
         port,
         directory_url,
         region,
+        restricted_directory: None,
     })
     .await
     .map_err(|e| e.to_string())

@@ -9,6 +9,9 @@ use crate::errors::{IicpError, Result};
 use crate::types::{RestrictedDirectoryContext, RestrictedEligibility};
 
 pub const PROFILE_ID: &str = "urn:iicp:profile:restricted-trust-domain:v1";
+pub const PROFILE_VERSION: &str = "0.1.0-draft";
+pub const PROFILE_FIXTURE_SHA256: &str =
+    "0b23cc925dd3409d1c39d788e54281e60255b16dcd83fe5e4be84720ddd6039f";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
