@@ -35,6 +35,8 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.107] — 2026-08-23
+
 ### Fixed — CLI runtime self-description
 
 - `iicp-node query` now uses the default-auto runtime identity path for `llm:chat:v1` instead of bypassing it through raw task submission.
