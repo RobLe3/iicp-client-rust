@@ -35,6 +35,22 @@ in the main repo).
 
 ## [Unreleased]
 
+## [0.7.108] — 2026-08-23
+
+### Fixed — accurate direct IICP explanations
+
+- Guard direct `iicp-node query` explanation requests so an otherwise successful model response cannot redefine the IICP acronym or purpose.
+- Preserve normal provider output for unrelated prompts and use the bounded canonical explanation only when the returned answer is incompatible with IICP's published identity.
+
+### Added — private/local operator preparation
+
+- Add the canonical CUG configuration wizard and verified DNS-SD directory resolution while preserving explicit configuration precedence and treating discovery as distinct from trust.
+- Close local-directory discovery conformance gaps and preserve CUG scope through co-hosted CIP execution.
+
+### Security — deterministic unattended updates
+
+- Install the exact selected release with its published lockfile, retain bounded failed-candidate state, and never retry through unlocked dependency resolution.
+
 ## [0.7.107] — 2026-08-23
 
 ### Fixed — CLI runtime self-description
