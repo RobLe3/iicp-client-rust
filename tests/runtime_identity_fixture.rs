@@ -3,11 +3,25 @@ use iicp_client::runtime_identity::{
     RuntimeIdentityOptions, RUNTIME_IDENTITY_CHAT_INTENT, RUNTIME_IDENTITY_MARKER,
     RUNTIME_IDENTITY_MAX_BYTES,
 };
+
+#[test]
+fn direct_explainer_guard_rejects_conflicting_expansion() {
+    assert!(iicp_client::runtime_identity::is_direct_iicp_explainer(
+        "Explain IICP."
+    ));
+    assert!(!iicp_client::runtime_identity::is_direct_iicp_explainer(
+        "Compare two protocols"
+    ));
+    assert!(iicp_client::runtime_identity::valid_iicp_explanation("IICP is the Intent-based Inter-agent Communication Protocol, a provider-neutral control plane for discovery."));
+    assert!(!iicp_client::runtime_identity::valid_iicp_explanation(
+        "IICP means Industrial Internet of Things Computing."
+    ));
+}
 use iicp_client::ChatMessage;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-const FIXTURE_SHA256: &str = "a31064ca630ab5409fb2f57edd1ef29a5c79532b8960927f6a0d2b52d7d71c81";
+const FIXTURE_SHA256: &str = "3f6071dd39ca9c743ccd3c9c3da1582f1005c4c6daa210fbf62f5bae60d241ac";
 
 fn fixture() -> Value {
     serde_json::from_slice(include_bytes!(
