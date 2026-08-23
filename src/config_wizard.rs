@@ -135,6 +135,9 @@ fn reproduction_argv(config: &RuntimeConfigV1) -> Vec<String> {
             argv.extend(["--directory-url".into(), value.clone()]);
         }
     }
+    if config.directory.local_discovery_enabled {
+        argv.extend(["--local-directory-discovery".into(), "true".into()]);
+    }
     if let Some(value) = &config.directory.authority_id {
         argv.extend(["--directory-authority".into(), value.clone()]);
     }

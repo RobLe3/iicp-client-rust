@@ -13,9 +13,10 @@ use std::collections::BTreeMap;
 pub const RUNTIME_CONFIG_SCHEMA_VERSION: u32 = 1;
 pub const PUBLIC_DIRECTORY_URL: &str = "https://iicp.network/api";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OperatingMode {
+    #[default]
     Public,
     Private,
     FederatedPrivate,
@@ -40,6 +41,8 @@ pub struct DirectoryConfig {
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_id: Option<String>,
+    #[serde(default)]
+    pub local_discovery_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -172,6 +175,7 @@ pub struct ConfigOverrides {
     pub trust_domain_id: Option<String>,
     pub allow_public_fallback: Option<bool>,
     pub trusted_domains: Option<Vec<String>>,
+    pub local_directory_discovery: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,6 +209,7 @@ impl RuntimeConfigV1 {
                     Some(PUBLIC_DIRECTORY_URL.to_string())
                 },
                 authority_id: None,
+                local_discovery_enabled: false,
             },
             trust_domain_id: None,
             membership: MembershipConfig {
@@ -263,7 +268,8 @@ impl RuntimeConfigV1 {
         if matches!(
             self.directory.source,
             DirectorySource::Public | DirectorySource::Remote
-        ) && self.directory.url.as_deref().is_none_or(str::is_empty)
+        ) && !self.directory.local_discovery_enabled
+            && self.directory.url.as_deref().is_none_or(str::is_empty)
         {
             findings.push(ConfigFinding::new(
                 "directory_url_required",
@@ -275,6 +281,19 @@ impl RuntimeConfigV1 {
         self.validate_federation(&mut findings);
         self.validate_reserved_restricted_features(&mut findings);
         self.validate_local_only(&mut findings);
+        if self.directory.local_discovery_enabled
+            && self
+                .directory
+                .authority_id
+                .as_deref()
+                .is_none_or(str::is_empty)
+        {
+            findings.push(ConfigFinding::new(
+                "local_directory_trust_anchor_required",
+                "/directory/authority_id",
+                "local directory discovery requires an explicit trusted directory DID",
+            ));
+        }
         if self.cip.enabled && self.membership.required && !self.cip.require_same_trust_domain {
             findings.push(ConfigFinding::new(
                 "cip_trust_domain_required",
@@ -382,6 +401,13 @@ impl RuntimeConfigV1 {
                 "local-only mode cannot enable external control-plane, update or execution access",
             ));
         }
+        if self.mode == OperatingMode::LocalOnly && self.directory.local_discovery_enabled {
+            findings.push(ConfigFinding::new(
+                "local_only_multicast_forbidden",
+                "/directory/local_discovery_enabled",
+                "local-only mode cannot issue multicast directory discovery queries",
+            ));
+        }
     }
 
     fn has_restricted_membership_controls(&self) -> bool {
@@ -428,6 +454,9 @@ impl RuntimeConfigV1 {
         }
         if let Some(domains) = overlay.trusted_domains {
             self.federation.trusted_domains = domains;
+        }
+        if let Some(enabled) = overlay.local_directory_discovery {
+            self.directory.local_discovery_enabled = enabled;
         }
     }
 
@@ -535,6 +564,19 @@ mod tests {
         assert!(config.validate().is_empty());
         assert!(!config.network.allow_external_bootstrap);
         assert!(!config.network.allow_auto_update_network);
+    }
+
+    #[test]
+    fn private_local_discovery_accepts_no_locator_but_requires_pinned_authority() {
+        let mut config = valid_private();
+        config.directory.url = None;
+        config.directory.local_discovery_enabled = true;
+        assert!(config.validate().is_empty());
+        config.directory.authority_id = None;
+        assert!(config
+            .validate()
+            .iter()
+            .any(|finding| finding.code == "local_directory_trust_anchor_required"));
     }
 
     #[test]

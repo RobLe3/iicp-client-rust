@@ -27,6 +27,10 @@
             "null"
           ]
         },
+        "local_discovery_enabled": {
+          "default": false,
+          "type": "boolean"
+        },
         "source": {
           "$ref": "#/definitions/DirectorySource"
         },

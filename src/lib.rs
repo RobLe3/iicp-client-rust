@@ -58,6 +58,8 @@ pub mod idempotency;
 pub mod identity;
 pub mod instance_lock;
 pub mod jcs;
+#[cfg(feature = "local-discovery")]
+pub mod local_directory_discovery;
 pub mod mcp_negotiation;
 pub mod mcp_policy;
 pub mod native_call_identity;

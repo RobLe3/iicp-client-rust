@@ -31,7 +31,7 @@ path = "src/bin/iicp_node.rs"
 # nat + iicp-tcp on by default so `cargo install iicp-client` ships with UPnP support
 # AND the native IICP binary transport (#457: iicp-node serve advertises iicp-native on
 # the same port as HTTP). Library consumers can opt out with --no-default-features.
-default = ["nat", "iicp-tcp"]
+default = ["nat", "iicp-tcp", "local-discovery"]
 metrics = ["dep:prometheus"]
 # Native IICP binary transport (port 9484, spec/iicp-framing.md). Default-on (#457);
 # adds ciborium (~50KB). Pure-HTTP library consumers can drop it via --no-default-features.
@@ -55,6 +55,9 @@ systemd-notify = ["dep:sd-notify"]
 # Development/evidence-only deterministic health-state injection. Never part
 # of the default build and not wired to CLI, HTTP or environment input.
 runtime-health-fault-injection = []
+# Native RFC 6762/6763 directory candidate discovery. Runtime use remains
+# opt-in and is independently constrained by operating mode and trust policy.
+local-discovery = ["dep:mdns-sd"]
 
 [[example]]
 name = "systemd_watchdog_fixture"
@@ -102,6 +105,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.32", features = ["bundled"], optional = true }
 serde_jcs = "0.2.0"
 zeroize = "1"
+mdns-sd = { version = "0.21", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
