@@ -12,7 +12,7 @@
     "representative_operator_environment": false
   },
   "artifact": {
-    "sdk_version": "0.7.107",
+    "sdk_version": "0.7.108",
     "source_commit": null,
     "binary_sha256": null,
     "native_watchdog_enabled": true
