@@ -228,6 +228,10 @@ no-retention policy manifest is required.
 
 Provider nodes run an hourly official-registry check by default
 (`IICP_AUTO_UPDATE=1`, `IICP_AUTO_UPDATE_INTERVAL_S=3600`; minimum 300s).
+Failed candidates use persisted, bounded retry backoff (up to 24 hours) instead
+of being reinstalled every check. The non-sensitive retry status is stored under
+`$IICP_HOME/state/update-status.json`; `IICP_UPDATE_STATE_FILE` overrides that
+path for managed or test environments.
 When crates.io publishes a newer stable release, `serve` installs it with
 `cargo install iicp-client --version X.Y.Z --locked --force --registry crates-io --features nat,iicp-tcp` and re-execs the
 node so identity and cached node tokens are preserved.

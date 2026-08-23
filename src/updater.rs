@@ -10,24 +10,121 @@
 //! The loop is failure-isolated and opt-out via `IICP_AUTO_UPDATE=0`.
 
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
 };
 
 const DEFAULT_AUTO_UPDATE_INTERVAL_SECS: u64 = 3600;
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, serde::Serialize, serde::Deserialize)]
 struct UpdateStatus {
     latest_seen: Option<String>,
     last_checked_at: Option<String>,
     error_class: Option<String>,
+    last_attempted_version: Option<String>,
+    last_result: Option<String>,
+    consecutive_failures: u32,
+    next_retry_at: Option<String>,
 }
 
 static UPDATE_STATUS: OnceLock<Mutex<UpdateStatus>> = OnceLock::new();
 
 fn update_status() -> &'static Mutex<UpdateStatus> {
-    UPDATE_STATUS.get_or_init(|| Mutex::new(UpdateStatus::default()))
+    UPDATE_STATUS.get_or_init(|| Mutex::new(load_update_status()))
+}
+
+fn update_state_path() -> PathBuf {
+    env::var_os("IICP_UPDATE_STATE_FILE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            env::var_os("IICP_HOME")
+                .map(PathBuf::from)
+                .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".iicp")))
+                .unwrap_or_else(|| PathBuf::from(".iicp"))
+                .join("state/update-status.json")
+        })
+}
+
+fn load_status_from(path: &Path) -> UpdateStatus {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|value| serde_json::from_str(&value).ok())
+        .unwrap_or_default()
+}
+
+fn load_update_status() -> UpdateStatus {
+    load_status_from(&update_state_path())
+}
+
+fn persist_status_to(path: &Path, status: &UpdateStatus) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(
+        &temporary,
+        serde_json::to_vec(status).map_err(std::io::Error::other)?,
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::rename(temporary, path)
+}
+
+fn persist_update_status(status: &UpdateStatus) -> bool {
+    persist_status_to(&update_state_path(), status).is_ok()
+}
+
+fn retry_delay_secs(failures: u32, interval: u64) -> u64 {
+    interval
+        .saturating_mul(1_u64 << failures.saturating_sub(1).min(5))
+        .min(86_400)
+}
+
+pub fn candidate_retry_blocked(version: &str) -> bool {
+    let status = update_status().lock().expect("poisoned update status");
+    if status.last_attempted_version.as_deref() != Some(version)
+        || status.last_result.as_deref() != Some("failed")
+    {
+        return false;
+    }
+    status
+        .next_retry_at
+        .as_deref()
+        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .is_some_and(|retry| retry.with_timezone(&chrono::Utc) > chrono::Utc::now())
+}
+
+pub fn record_update_result(version: &str, success: bool, error_class: Option<String>) {
+    let mut status = update_status().lock().expect("poisoned update status");
+    let same_candidate = status.last_attempted_version.as_deref() == Some(version);
+    status.last_attempted_version = Some(version.to_string());
+    status.last_result = Some(if success { "success" } else { "failed" }.to_string());
+    status.error_class = error_class;
+    if success {
+        status.consecutive_failures = 0;
+        status.next_retry_at = None;
+    } else {
+        status.consecutive_failures = if same_candidate {
+            status.consecutive_failures.saturating_add(1)
+        } else {
+            1
+        };
+        status.next_retry_at = Some(
+            (chrono::Utc::now()
+                + chrono::Duration::seconds(retry_delay_secs(
+                    status.consecutive_failures,
+                    auto_update_interval_secs(),
+                ) as i64))
+            .to_rfc3339(),
+        );
+    }
+    if !persist_update_status(&status) {
+        status.error_class = Some("update_state_write_failed".into());
+    }
 }
 
 /// Parse a dotted version into a comparable vec; truncate at the first
@@ -258,6 +355,9 @@ pub fn record_update_check(latest: Option<String>, error_class: Option<String>) 
     status.latest_seen = latest;
     status.last_checked_at = Some(chrono::Utc::now().to_rfc3339());
     status.error_class = error_class;
+    if !persist_update_status(&status) {
+        status.error_class = Some("update_state_write_failed".into());
+    }
 }
 
 /// Optional heartbeat fields that let the directory see updater health.
@@ -272,6 +372,10 @@ pub fn auto_update_status_json() -> serde_json::Value {
         "sdk_latest_seen": status.latest_seen,
         "sdk_update_last_checked_at": status.last_checked_at,
         "sdk_update_error_class": status.error_class,
+        "sdk_update_last_attempted_version": status.last_attempted_version,
+        "sdk_update_last_result": status.last_result,
+        "sdk_update_consecutive_failures": status.consecutive_failures,
+        "sdk_update_next_retry_at": status.next_retry_at,
     })
 }
 
@@ -364,6 +468,9 @@ mod tests {
     #[test]
     fn auto_update_status_payload_defaults_hourly() {
         let _guard = env_lock().lock().unwrap();
+        let state =
+            std::env::temp_dir().join(format!("iicp-update-status-{}.json", std::process::id()));
+        std::env::set_var("IICP_UPDATE_STATE_FILE", &state);
         std::env::remove_var("IICP_AUTO_UPDATE");
         std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
         record_update_check(Some("0.7.69".into()), None);
@@ -373,6 +480,8 @@ mod tests {
         assert_eq!(payload["sdk_latest_seen"], "0.7.69");
         assert!(payload["sdk_update_last_checked_at"].is_string());
         assert!(payload["sdk_update_error_class"].is_null());
+        let _ = std::fs::remove_file(state);
+        std::env::remove_var("IICP_UPDATE_STATE_FILE");
     }
 
     #[test]
@@ -413,6 +522,27 @@ mod tests {
         );
         assert!(upgrade_command("0.7.108-rc.1", "nat").is_none());
         assert!(!args.iter().any(|arg| arg == "latest"));
+    }
+
+    #[test]
+    fn candidate_backoff_is_bounded_and_persisted_atomically() {
+        assert_eq!(retry_delay_secs(1, 3600), 3600);
+        assert_eq!(retry_delay_secs(2, 3600), 7200);
+        assert_eq!(retry_delay_secs(20, 3600), 86_400);
+        let path =
+            std::env::temp_dir().join(format!("iicp-update-persist-{}.json", std::process::id()));
+        let status = UpdateStatus {
+            last_attempted_version: Some("0.7.108".into()),
+            last_result: Some("failed".into()),
+            consecutive_failures: 2,
+            next_retry_at: Some("2026-08-24T00:00:00Z".into()),
+            ..UpdateStatus::default()
+        };
+        persist_status_to(&path, &status).unwrap();
+        let loaded = load_status_from(&path);
+        assert_eq!(loaded.last_attempted_version.as_deref(), Some("0.7.108"));
+        assert_eq!(loaded.consecutive_failures, 2);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

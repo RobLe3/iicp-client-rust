@@ -3374,6 +3374,34 @@ fn run_list(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+async fn apply_auto_update_candidate(candidate: String) {
+    if iicp_client::updater::candidate_retry_blocked(&candidate) {
+        eprintln!("[iicp-node] auto-update: candidate {candidate} is in bounded retry backoff");
+        return;
+    }
+    let features = iicp_client::updater::enabled_runtime_features();
+    let attempted = candidate.clone();
+    let ok = tokio::task::spawn_blocking(move || {
+        iicp_client::updater::perform_self_update(&candidate, &features)
+    })
+    .await
+    .unwrap_or(false);
+    if ok {
+        iicp_client::updater::record_update_result(&attempted, true, None);
+        eprintln!("[iicp-node] auto-update: upgraded; restarting to apply…");
+        let e = iicp_client::updater::reexec();
+        iicp_client::updater::record_update_result(&attempted, false, Some("reexec_failed".into()));
+        eprintln!("[iicp-node] auto-update: re-exec failed ({e}); staying up on the new binary at next manual restart");
+    } else {
+        iicp_client::updater::record_update_result(
+            &attempted,
+            false,
+            Some("cargo_install_failed".into()),
+        );
+        eprintln!("[iicp-node] auto-update: upgrade failed; will retry after bounded backoff");
+    }
+}
+
 async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // CIP toggle via env var — safe-off default; operators advertise as a
     // CIP worker by setting IICP_CIP_ALLOW_WORKER=true. Matches the same
@@ -4273,19 +4301,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                         latest.as_deref().unwrap_or("?")
                     );
                     let candidate = latest.expect("validated update candidate");
-                    let features = iicp_client::updater::enabled_runtime_features();
-                    let ok = tokio::task::spawn_blocking(move || {
-                        iicp_client::updater::perform_self_update(&candidate, &features)
-                    })
-                    .await
-                    .unwrap_or(false);
-                    if ok {
-                        eprintln!("[iicp-node] auto-update: upgraded; restarting to apply…");
-                        let e = iicp_client::updater::reexec();
-                        eprintln!("[iicp-node] auto-update: re-exec failed ({e}); staying up on the new binary at next manual restart");
-                    } else {
-                        eprintln!("[iicp-node] auto-update: upgrade failed; will retry next check");
-                    }
+                    apply_auto_update_candidate(candidate).await;
                 }
             }
         });
