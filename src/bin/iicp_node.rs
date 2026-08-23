@@ -1918,6 +1918,14 @@ async fn run_query(args: &[String]) -> Result<(), String> {
                 )
                 .unwrap_or_default()
             });
+        let content = if iicp_client::runtime_identity::is_direct_iicp_explainer(&prompt)
+            && !iicp_client::runtime_identity::valid_iicp_explanation(&content)
+        {
+            eprintln!("[iicp-node] provider explanation failed the canonical IICP fact check; using project fallback");
+            iicp_client::runtime_identity::CANONICAL_IICP_EXPLANATION.to_string()
+        } else {
+            content
+        };
         println!("{content}");
         if let Some(m) = &resp.metrics {
             if let Some(node_id) = &m.node_id {

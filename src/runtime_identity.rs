@@ -10,7 +10,28 @@ pub const RUNTIME_IDENTITY_MAX_BYTES: usize = 2048;
 const MAX_FACT_BYTES: usize = 160;
 const MAX_CAPABILITIES: usize = 32;
 
-const BASE_CAPSULE: &str = "This request reached you through IICP, the Intent-based Inter-agent Communication Protocol. IICP discovers eligible services and routes requests. You are the selected model or service, not IICP. When asked about this connection, use only supplied runtime facts; do not guess missing facts.";
+pub const CANONICAL_IICP_EXPLANATION: &str = "IICP is the Intent-based Inter-agent Communication Protocol: a provider-neutral control plane that discovers eligible intelligence services, evaluates them under explicit constraints, selects a provider, and leaves execution to a supported provider mechanism.";
+
+pub fn is_direct_iicp_explainer(prompt: &str) -> bool {
+    let normalized = prompt.trim().to_ascii_lowercase();
+    matches!(
+        normalized.trim_end_matches(['.', '?', '!']),
+        "what is iicp"
+            | "what does iicp stand for"
+            | "explain iicp"
+            | "describe iicp"
+            | "what is this"
+    )
+}
+
+pub fn valid_iicp_explanation(answer: &str) -> bool {
+    let lower = answer.to_ascii_lowercase();
+    lower.contains("intent-based inter-agent communication protocol")
+        && (lower.contains("control plane") || lower.contains("discover"))
+        && !lower.contains("industrial internet of things computing")
+}
+
+const BASE_CAPSULE: &str = "This request reached you through IICP, the Intent-based Inter-agent Communication Protocol. IICP is a provider-neutral control plane that turns a requested intent and constraints into discovery, eligibility evaluation and provider selection; execution then uses a supported provider mechanism. You are the selected model or service, not IICP. If asked what IICP is or stands for, use this definition. IICP does not mean Industrial Internet of Things Computing. Use only supplied runtime facts and do not guess missing facts.";
 const SELECTION_TEXT: [(&str, &str); 5] = [
     (
         "matched_intent_and_constraints",
