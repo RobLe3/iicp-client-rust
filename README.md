@@ -725,6 +725,25 @@ secret-reference boundary, refusal behavior and current limitations.
 Provider-specific read and mutation support is listed in
 [`docs/SECRET_REFERENCES.md`](docs/SECRET_REFERENCES.md).
 
+Native builds can opt in to verified local-directory candidate discovery. In a
+canonical configuration, set `directory.local_discovery_enabled` to `true`,
+keep `directory.url` null and pin `directory.authority_id` to the expected DID.
+The existing private-mode membership and trust-domain fields remain required.
+
+```bash
+iicp-node serve --config runtime-private.json
+```
+
+The resolver browses `_iicp-dir._tcp.local.` for at most one second, fetches no
+credentials with the descriptor, validates TLS, the signed descriptor, its DID
+document and the configured directory authority, then selects deterministically.
+The first implementation binds HTTPS to the locally observed addresses and
+accepts only an API endpoint on that same discovered origin; it does not follow
+redirects or use multicast discovery as trust.
+An explicit directory URL suppresses multicast. Private mode fails closed when
+no trusted candidate is available; local-only mode never performs the query.
+The feature is compiled into the standard CLI but remains disabled by default.
+
 The research client and runtime APIs support authenticated restricted-directory
 discovery, registration, bootstrap, dispatch-ticket and consumer-token
 operations. The shared context accepts only a typed `SecretRef`, requires the

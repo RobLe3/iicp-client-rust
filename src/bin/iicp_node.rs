@@ -250,6 +250,11 @@ struct ServeOpts {
     restricted_peer_bundle: Option<iicp_client::restricted_membership::RestrictedPeerBundle>,
     restricted_directory_context: Option<iicp_client::RestrictedDirectoryContext>,
     enable_mesh: bool,
+    operating_mode: iicp_client::runtime_config::OperatingMode,
+    local_directory_discovery: bool,
+    directory_explicit: bool,
+    directory_authority: Option<String>,
+    allow_public_fallback: bool,
 }
 
 fn resolve_receipt_profiles(values: &[String]) -> Result<Vec<String>, String> {
@@ -308,6 +313,7 @@ fn print_help() {
          \x20 --mode MODE                IICP_MODE — public | private | federated_private | local_only | custom\n\
          \x20 --trust-domain ID          IICP_TRUST_DOMAIN_ID — required by restricted modes\n\
          \x20 --directory-authority ID   IICP_DIRECTORY_AUTHORITY — required by restricted modes\n\
+         \x20 --local-directory-discovery BOOL  IICP_LOCAL_DIRECTORY_DISCOVERY — verified DNS-SD candidates (default false)\n\
          \x20 --region REGION            IICP_REGION (e.g. us-east; unknown if unset)\n\
          \x20 --intent URN               IICP_INTENT (default urn:iicp:intent:llm:chat:v1)\n\
          \x20 --max-concurrent N         IICP_MAX_CONCURRENT (default 4)\n\
@@ -739,6 +745,10 @@ fn config_environment_overrides() -> Result<iicp_client::runtime_config::ConfigO
                 .map(str::to_string)
                 .collect()
         }),
+        local_directory_discovery: env::var("IICP_LOCAL_DIRECTORY_DISCOVERY")
+            .ok()
+            .map(|value| parse_bool_config(&value, "IICP_LOCAL_DIRECTORY_DISCOVERY"))
+            .transpose()?,
     })
 }
 
@@ -2586,6 +2596,11 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         restricted_peer_bundle: None,
         restricted_directory_context: None,
         enable_mesh: false,
+        operating_mode: OperatingMode::Public,
+        local_directory_discovery: false,
+        directory_explicit: env::var("IICP_DIRECTORY_URL").is_ok(),
+        directory_authority: env::var("IICP_DIRECTORY_AUTHORITY").ok(),
+        allow_public_fallback: true,
     };
     let mut config_file = env::var("IICP_CONFIG_FILE").ok();
     let mut config_cli = ConfigOverrides::default();
@@ -2650,6 +2665,11 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                     "--directory-url" => {
                         opts.directory_url = v.clone();
                         config_cli.directory_url = Some(v);
+                        opts.directory_explicit = true;
+                    }
+                    "--local-directory-discovery" => {
+                        config_cli.local_directory_discovery =
+                            Some(parse_bool_config(&v, "--local-directory-discovery")?)
                     }
                     "--config" => config_file = Some(v),
                     "--mode" => {
@@ -2703,6 +2723,13 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
                 .and_then(|contents| RuntimeConfigV1::from_json(&contents))
         })
         .transpose()?;
+    if file_config
+        .as_ref()
+        .and_then(|config| config.directory.url.as_ref())
+        .is_some()
+    {
+        opts.directory_explicit = true;
+    }
     let config = RuntimeConfigV1::resolve(
         config_preset,
         file_config,
@@ -2717,6 +2744,10 @@ fn parse_args(args: &[String]) -> Result<ServeOpts, String> {
         ));
     }
     apply_restricted_peer_config(&config, &mut opts)?;
+    opts.operating_mode = config.mode;
+    opts.local_directory_discovery = config.directory.local_discovery_enabled;
+    opts.directory_authority = config.directory.authority_id.clone();
+    opts.allow_public_fallback = config.network.allow_public_fallback;
     if let Some(url) = config.directory.url {
         opts.directory_url = url;
     }
@@ -3620,6 +3651,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 saved_node_token =
                     resolve_identity_credential(&saved, "node_token", saved.node_token.as_deref())?;
                 apply_saved_node(&mut opts, &saved);
+                opts.directory_explicit = true;
             }
             None => {
                 return Err(format!(
@@ -3631,6 +3663,35 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
     if let Some(values) = &opts.receipt_profiles {
         opts.receipt_profiles = Some(resolve_receipt_profiles(values)?);
+    }
+
+    #[cfg(feature = "local-discovery")]
+    if opts.local_directory_discovery {
+        let resolution = iicp_client::local_directory_discovery::resolve(
+            iicp_client::local_directory_discovery::ResolveRequest {
+                enabled: true,
+                mode: opts.operating_mode,
+                explicit_directory: opts.directory_explicit.then(|| opts.directory_url.clone()),
+                trusted_directory_did: opts.directory_authority.clone(),
+                allow_public_fallback: opts.allow_public_fallback,
+                collection_window_ms:
+                    iicp_client::local_directory_discovery::DEFAULT_COLLECTION_WINDOW_MS,
+            },
+        )
+        .await
+        .map_err(|error| format!("local directory resolution failed: {error}"))?;
+        if let Some(resolution) = resolution {
+            if resolution.source == iicp_client::local_directory_discovery::ResolutionSource::Mdns {
+                eprintln!(
+                    "[iicp-node] selected verified local directory {} ({})",
+                    resolution.endpoint,
+                    resolution.directory_did.as_deref().unwrap_or("unknown DID")
+                );
+                opts.directory_url = resolution.endpoint;
+            }
+        } else if opts.operating_mode != iicp_client::runtime_config::OperatingMode::Public {
+            return Err("no trusted local directory candidate and fallback is forbidden".into());
+        }
     }
 
     let managed_operator = load_operator().ok().flatten();
