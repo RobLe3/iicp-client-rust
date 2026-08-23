@@ -273,6 +273,7 @@ impl RuntimeConfigV1 {
         }
         self.validate_restricted_mode(&mut findings);
         self.validate_federation(&mut findings);
+        self.validate_reserved_restricted_features(&mut findings);
         self.validate_local_only(&mut findings);
         if self.cip.enabled && self.membership.required && !self.cip.require_same_trust_domain {
             findings.push(ConfigFinding::new(
@@ -352,6 +353,23 @@ impl RuntimeConfigV1 {
                 "federation_mode_mismatch",
                 "/federation/enabled",
                 "federation requires federated-private mode",
+            ));
+        }
+    }
+
+    fn validate_reserved_restricted_features(&self, findings: &mut Vec<ConfigFinding>) {
+        if self.membership.revocation_source.is_some() {
+            findings.push(ConfigFinding::new(
+                "revocation_source_not_supported",
+                "/membership/revocation_source",
+                "authenticated revocation sources are reserved until their contract is implemented",
+            ));
+        }
+        if self.mode == OperatingMode::FederatedPrivate {
+            findings.push(ConfigFinding::new(
+                "federated_private_not_supported",
+                "/mode",
+                "federated-private operation remains unavailable until the Phase 6 evidence gate passes",
             ));
         }
     }
@@ -520,7 +538,7 @@ mod tests {
     }
 
     #[test]
-    fn federated_private_requires_explicit_peer_domain() {
+    fn federated_private_is_reserved_even_with_explicit_peer_domain() {
         let mut config = RuntimeConfigV1::preset(OperatingMode::FederatedPrivate);
         config.trust_domain_id = Some("a.example".into());
         config.directory.authority_id = Some("did:key:a".into());
@@ -529,6 +547,29 @@ mod tests {
             .iter()
             .any(|finding| finding.code == "trusted_federation_domain_required"));
         config.federation.trusted_domains.push("b.example".into());
+        assert_eq!(
+            config
+                .validate()
+                .iter()
+                .map(|finding| finding.code)
+                .collect::<Vec<_>>(),
+            ["federated_private_not_supported"]
+        );
+    }
+
+    #[test]
+    fn configured_revocation_source_fails_closed_until_supported() {
+        let mut config = valid_private();
+        config.membership.revocation_source = Some("https://directory.example/revocations".into());
+        assert_eq!(
+            config
+                .validate()
+                .iter()
+                .map(|finding| finding.code)
+                .collect::<Vec<_>>(),
+            ["revocation_source_not_supported"]
+        );
+        config.membership.revocation_source = None;
         assert!(config.validate().is_empty());
     }
 

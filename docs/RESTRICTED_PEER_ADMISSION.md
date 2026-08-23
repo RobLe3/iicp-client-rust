@@ -13,7 +13,7 @@ it must present its own valid assertion.
 
 ## Configuration boundary
 
-Private and federated-private configurations name a
+Private configurations name a
 `secret_refs.restricted_peer_bundle`. The reference must resolve through the
 shared secret-resolution boundary. Environment variables and owner-only files
 are supported on every applicable host. macOS Keychain and Linux Secret
@@ -57,6 +57,12 @@ must not claim automatic revocation propagation.
 ## Current limits
 
 - This is a Rust reference implementation, not yet a cross-SDK guarantee.
+- `membership.revocation_source` is reserved and rejected until an authenticated
+  revocation-source contract exists. Current peers remain valid only until their
+  signed assertion expires; directory eligibility decisions can reject revoked
+  members immediately for new protected operations.
+- `federated_private` configuration is rejected before network activity until
+  the separate Phase 6 cross-domain evidence gate passes.
 - Legacy node records remain readable, but the current migration projection
   only detects and omits plaintext material. Atomic transfer into a selected
   provider remains required before legacy migration is complete.
