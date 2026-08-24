@@ -1,8 +1,10 @@
 # Runtime-health Linux and ARM validation
 
-The opt-in systemd notifier must remain disabled by default until Linux and
-ARM evidence shows that meaningful stalls are detected without restarting a
-healthy node during dependency loss or legitimate load.
+The native systemd notifier is opt-in under the policy recorded in
+[`SYSTEMD_WATCHDOG_POLICY.md`](SYSTEMD_WATCHDOG_POLICY.md). Controlled Linux and
+ARM evidence shows the implementation can detect meaningful stalls without
+classifying ordinary dependency loss as runtime death. Representative operator
+evidence is still required before reconsidering default enablement.
 
 Run the content-free source-level lane on Linux with:
 
@@ -46,8 +48,8 @@ synchronous writes. This is scheduler and storage-pressure evidence for the
 health loop, not an inference-performance benchmark or a production watchdog
 timeout selection.
 
-Before issue #66 can close, a maintainer must additionally record on x86-64
-Linux and Raspberry Pi OS or Debian ARM64:
+Before default enablement can be reconsidered, a maintainer must additionally
+record on x86-64 Linux and Raspberry Pi OS or Debian ARM64:
 
 1. normal and worst-case progress cadence during startup, slow storage, CPU
    pressure, memory pressure, and long inference;
@@ -69,7 +71,9 @@ run and complete the copy with content-free outcomes and measured cadence. Run:
 python3 scripts/check_systemd_operator_validation.py <completed-record.json>
 ```
 
-The repository copy remains blank. A completed record recommends either
+The repository copy remains blank while no representative operator result is
+available. That absence is recorded honestly and the notifier remains opt-in.
+A future completed record recommends either
 `retain_opt_in` or `propose_default_enablement`; it does not itself authorize a
 default-policy change. A failed or unavailable representative run is valid
 evidence for retaining opt-in behavior.
