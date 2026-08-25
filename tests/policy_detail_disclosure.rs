@@ -5,35 +5,42 @@ use serde_json::Value;
 
 #[test]
 fn policy_detail_disclosure_fixture() {
-    let fixture: Value =
-        serde_json::from_str(include_str!("../parity/policy-detail-disclosure-v0.json")).unwrap();
-    assert_eq!(
-        fixture["allowed_detail_fields"],
-        serde_json::json!(ALLOWED_DETAIL_FIELDS)
-    );
-    for case in fixture["cases"].as_array().unwrap() {
-        let result = evaluate_policy_detail_disclosure(&case["context"]);
+    let fixtures: Vec<Value> = [
+        include_str!("../parity/policy-detail-disclosure-v0.json"),
+        include_str!("../parity/policy-detail-disclosure-authority-v0.json"),
+    ]
+    .into_iter()
+    .map(|raw| serde_json::from_str(raw).unwrap())
+    .collect();
+    for fixture in fixtures {
         assert_eq!(
-            result.status,
-            case["expected"]["status"].as_u64().unwrap() as u16,
-            "{}",
-            case["id"]
+            fixture["allowed_detail_fields"],
+            serde_json::json!(ALLOWED_DETAIL_FIELDS)
         );
-        assert_eq!(
-            result.reason,
-            case["expected"]["reason"].as_str().unwrap(),
-            "{}",
-            case["id"]
-        );
-        if result.status == 200 {
-            let encoded = serde_json::to_string(&result.body).unwrap();
-            for forbidden in [
-                "must-not-leak",
-                "private.example",
-                "backend_topology",
-                "natural_person_contact",
-            ] {
-                assert!(!encoded.contains(forbidden));
+        for case in fixture["cases"].as_array().unwrap() {
+            let result = evaluate_policy_detail_disclosure(&case["context"]);
+            assert_eq!(
+                result.status,
+                case["expected"]["status"].as_u64().unwrap() as u16,
+                "{}",
+                case["id"]
+            );
+            assert_eq!(
+                result.reason,
+                case["expected"]["reason"].as_str().unwrap(),
+                "{}",
+                case["id"]
+            );
+            if result.status == 200 {
+                let encoded = serde_json::to_string(&result.body).unwrap();
+                for forbidden in [
+                    "must-not-leak",
+                    "private.example",
+                    "backend_topology",
+                    "natural_person_contact",
+                ] {
+                    assert!(!encoded.contains(forbidden));
+                }
             }
         }
     }

@@ -101,18 +101,29 @@ pub fn verify_policy_detail_consumer_token(
     }
 }
 
-/// Apply the portable disclosure contract. `consumer_auth` must be produced by
-/// a cryptographic adapter; this helper intentionally does not parse raw tokens.
+/// Apply the portable disclosure contract. `consumer_auth` and
+/// `dispatch_ticket` must be produced by a cryptographic adapter; this helper
+/// intentionally does not parse raw tokens or tickets.
 pub fn evaluate_policy_detail_disclosure(context: &Value) -> PolicyDetailDisclosureDecision {
     let auth = context["consumer_auth"].as_str();
     if auth == Some("missing") {
         return decision(401, "consumer_auth_required");
     }
-    if !matches!(auth, Some("valid" | "expired")) {
+    if !matches!(auth, Some("valid" | "expired" | "revoked")) {
         return decision(401, "consumer_auth_invalid");
     }
     if auth == Some("expired") {
         return decision(401, "consumer_auth_expired");
+    }
+    if auth == Some("revoked") {
+        return decision(401, "consumer_auth_revoked");
+    }
+
+    match context["dispatch_ticket"].as_str() {
+        Some("expired") => return decision(401, "dispatch_ticket_expired"),
+        Some("revoked") => return decision(401, "dispatch_ticket_revoked"),
+        Some("valid") | None => {}
+        _ => return decision(401, "dispatch_ticket_invalid"),
     }
     if context["disclosure_allowed"].as_bool() != Some(true) {
         return decision(403, "disclosure_forbidden");
