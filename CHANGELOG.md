@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.109] — 2026-08-25
+
+### Added — shell completion
+
+- Add side-effect-free Bash, Zsh, Fish, and PowerShell completion generated from a static command catalog.
+
 ## [0.7.105] — 2026-08-15
 
 ### Changed — factual runtime self-description by default
