@@ -282,6 +282,7 @@ fn print_help() {
     print!(
         "usage: iicp-node <command> [options]\n\n\
          Commands:\n\
+         \x20 completion <shell>         Print a shell completion script\n\
          \x20 init                       Interactive wizard — set up operator + first node\n\
          \x20 list                       List node configs saved under ~/.iicp/nodes/\n\
          \x20 serve                      Register and serve a node\n\
@@ -6366,6 +6367,26 @@ async fn main() {
         process::exit(0);
     }
     let cmd = &args[1];
+    if cmd == "__complete" {
+        for value in iicp_client::cli_completion::candidates(&args[2..]) {
+            println!("{value}");
+        }
+        return;
+    }
+    if cmd == "completion" {
+        if args.len() != 3 {
+            eprintln!("usage: iicp-node completion <bash|zsh|fish|powershell>");
+            process::exit(2);
+        }
+        match iicp_client::cli_completion::script(&args[2]) {
+            Ok(value) => print!("{value}"),
+            Err(e) => {
+                eprintln!("ERROR: {e}");
+                process::exit(2);
+            }
+        }
+        return;
+    }
     if cmd == "init" {
         if let Err(e) = run_init(&args[2..]).await {
             eprintln!("ERROR: {e}");

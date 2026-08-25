@@ -1,0 +1,26 @@
+{
+  "schema": "iicp.cli-completion.v1",
+  "shells": ["bash", "zsh", "fish", "powershell"],
+  "aliases": {"pwsh": "powershell"},
+  "common_top_level": [
+    "completion", "credits", "doctor", "healthcheck", "help", "init", "list",
+    "mcp-gateway", "operator", "proxy", "query", "serve", "service", "update"
+  ],
+  "cases": [
+    {"tokens": [], "contains": ["completion", "init", "query", "serve"]},
+    {"tokens": ["op"], "contains": ["operator"]},
+    {"tokens": ["operator", ""], "contains": ["decrypt", "dsr", "encrypt", "key", "rename"]},
+    {"tokens": ["operator", "dsr", ""], "contains": ["anonymize", "export", "restrict"]},
+    {"tokens": ["service", ""], "contains": ["install", "restart", "status", "uninstall"]},
+    {"tokens": ["query", "--routing-profile", ""], "contains": ["eu-restricted", "sensitive", "standard", "strict-policy"]},
+    {"tokens": ["serve", "--backend-type", ""], "contains": ["anthropic", "llamacpp", "meshllm", "openai_compat", "vllm"]},
+    {"tokens": ["query", "--rou"], "contains": ["--routing-profile"]}
+  ],
+  "safety": {
+    "network_access": false,
+    "filesystem_mutation": false,
+    "shell_profile_mutation": false,
+    "operator_state_enumeration": false,
+    "secret_output": false
+  }
+}

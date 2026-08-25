@@ -132,3 +132,5 @@ pub use types::{
     RestrictedEligibility, RouteConstraints, RoutingPolicy, RoutingProfile, TaskAuth,
     TaskConstraints, TaskRequest, TaskResponse,
 };
+
+pub mod cli_completion;
