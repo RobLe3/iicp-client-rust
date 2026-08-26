@@ -24,7 +24,7 @@ jobs:
     environment: crates-io
     env:
       CARGO_INCREMENTAL: "0"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/iicp-client-rust-release
+      CARGO_TARGET_DIR: ${{ github.workspace }}/../.iicp-ci-target/rust-sdk-release
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

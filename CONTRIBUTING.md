@@ -38,6 +38,15 @@ run-owned target. Set `IICP_KEEP_FAILED_CARGO_TARGET=1` when a failed build tree
 is needed for diagnosis; ordinary interactive Cargo commands still use the
 repository `target/` directory.
 
+Before committing a GitHub Actions change, run:
+
+```bash
+./scripts/check_ci_workflows.sh
+```
+
+The check uses a pinned semantic workflow linter. A workflow that produces no
+jobs is a failure, not an empty green check set.
+
 The public [IICP repository map](https://github.com/RobLe3/IICP/blob/main/ecosystem/public-repositories.json)
 identifies normative and implementation ownership. A pull request does not
 authorize a package release. Maintainers publish immutable, versioned artifacts
