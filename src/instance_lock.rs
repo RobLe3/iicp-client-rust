@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 pub struct InstanceLock {
     path: PathBuf,
     owner_pid: u32,
+    owner_token: Option<String>,
 }
 
 impl InstanceLock {
@@ -29,27 +30,31 @@ impl InstanceLock {
 
         let path = dir.join(format!("{node_id}.pid"));
         let owner_pid = std::process::id();
+        let owner_token = process_token(owner_pid);
         if force {
-            remove_if_present(&path)
+            remove_lock_files(&path)
                 .map_err(|error| format!("cannot replace the existing node lock: {error}"))?;
         }
 
         for attempt in 0..2 {
-            match create_pidfile(&path, owner_pid) {
-                Ok(()) => return Ok(Self { path, owner_pid }),
+            match create_pidfile(&path, owner_pid, owner_token.as_deref()) {
+                Ok(()) => {
+                    return Ok(Self {
+                        path,
+                        owner_pid,
+                        owner_token,
+                    })
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     let existing = read_owner_pid(&path);
                     if force && attempt == 0 {
-                        remove_if_present(&path)
+                        remove_lock_files(&path)
                             .map_err(|error| format!("cannot replace raced node lock: {error}"))?;
                         continue;
                     }
-                    if existing == Some(owner_pid) {
-                        return Err(already_serving(node_id, existing));
-                    }
-                    match existing.map(pid_state) {
-                        Some(ProcessState::Absent) if attempt == 0 => {
-                            remove_if_present(&path).map_err(|error| {
+                    match existing.map(|pid| owner_state(&path, pid)) {
+                        Some(OwnerState::Stale) if attempt == 0 => {
+                            remove_lock_files(&path).map_err(|error| {
                                 format!("cannot remove stale node instance lock: {error}")
                             })?;
                         }
@@ -66,23 +71,65 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        if read_owner_pid(&self.path) == Some(self.owner_pid) {
-            let _ = fs::remove_file(&self.path);
+        if read_owner_pid(&self.path) == Some(self.owner_pid)
+            && read_owner_token(&self.path) == self.owner_token
+        {
+            let _ = remove_lock_files(&self.path);
         }
     }
 }
 
-fn create_pidfile(path: &Path, owner_pid: u32) -> io::Result<()> {
+fn create_pidfile(path: &Path, owner_pid: u32, owner_token: Option<&str>) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     if let Err(error) = write!(file, "{owner_pid}").and_then(|_| file.sync_all()) {
         let _ = fs::remove_file(path);
         return Err(error);
+    }
+    if let Some(token) = owner_token {
+        let metadata_path = metadata_path(path);
+        if let Err(error) = remove_if_present(&metadata_path) {
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
+        let mut metadata = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&metadata_path)
+        {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = fs::remove_file(path);
+                return Err(error);
+            }
+        };
+        if let Err(error) = write!(metadata, "{token}").and_then(|_| metadata.sync_all()) {
+            let _ = fs::remove_file(path);
+            let _ = fs::remove_file(metadata_path);
+            return Err(error);
+        }
     }
     Ok(())
 }
 
 fn read_owner_pid(path: &Path) -> Option<u32> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn metadata_path(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta", path.display()))
+}
+
+fn read_owner_token(path: &Path) -> Option<String> {
+    fs::read_to_string(metadata_path(path))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn remove_lock_files(path: &Path) -> io::Result<()> {
+    let pid_result = remove_if_present(path);
+    let metadata_result = remove_if_present(&metadata_path(path));
+    pid_result.and(metadata_result)
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {
@@ -109,6 +156,41 @@ enum ProcessState {
     Indeterminate,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+enum OwnerState {
+    Current,
+    Stale,
+    Indeterminate,
+}
+
+fn owner_state(path: &Path, pid: u32) -> OwnerState {
+    match pid_state(pid) {
+        ProcessState::Absent => OwnerState::Stale,
+        ProcessState::Indeterminate => OwnerState::Indeterminate,
+        ProcessState::Alive => match (read_owner_token(path), process_token(pid)) {
+            (Some(recorded), Some(current)) if recorded != current => OwnerState::Stale,
+            (Some(_), Some(_)) | (None, _) | (_, None) => OwnerState::Current,
+        },
+    }
+}
+
+/// Linux exposes a boot identity and a per-process start tick. Together they
+/// distinguish a restarted container's new PID 1 from the previous PID 1 while
+/// keeping the public lock file itself a cross-SDK-compatible decimal PID.
+#[cfg(target_os = "linux")]
+fn process_token(pid: u32) -> Option<String> {
+    let boot = fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_name = stat.rsplit_once(") ")?.1;
+    let start_ticks = after_name.split_whitespace().nth(19)?;
+    Some(format!("{}:{}", boot.trim(), start_ticks))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_token(_pid: u32) -> Option<String> {
+    None
+}
+
 #[cfg(unix)]
 fn pid_state(pid: u32) -> ProcessState {
     let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
@@ -129,6 +211,8 @@ fn pid_state(_pid: u32) -> ProcessState {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    use super::{metadata_path, process_token};
     use super::{pid_state, InstanceLock, ProcessState};
     use std::sync::{Arc, Barrier, Mutex, OnceLock};
 
@@ -177,6 +261,33 @@ mod tests {
             std::fs::create_dir_all(&run).unwrap();
             std::fs::write(run.join("stale.pid"), "2147483647").unwrap();
             assert!(InstanceLock::acquire("stale", false).is_ok());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn reused_live_pid_with_different_process_identity_is_recovered() {
+        with_tmp_home(|home| {
+            let run = home.join("run");
+            std::fs::create_dir_all(&run).unwrap();
+            let path = run.join("reused.pid");
+            std::fs::write(&path, std::process::id().to_string()).unwrap();
+            std::fs::write(metadata_path(&path), "different-boot:different-start").unwrap();
+            assert!(InstanceLock::acquire("reused", false).is_ok());
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pid_with_matching_process_identity_is_refused() {
+        with_tmp_home(|home| {
+            let run = home.join("run");
+            std::fs::create_dir_all(&run).unwrap();
+            let path = run.join("current.pid");
+            let pid = std::process::id();
+            std::fs::write(&path, pid.to_string()).unwrap();
+            std::fs::write(metadata_path(&path), process_token(pid).unwrap()).unwrap();
+            assert!(InstanceLock::acquire("current", false).is_err());
         });
     }
 
