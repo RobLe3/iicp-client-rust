@@ -3,6 +3,11 @@
 # Isolated, content-free systemd manager recovery evidence.
 set -euo pipefail
 
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${IICP_DISPOSABLE_CARGO_ACTIVE:-0}" != 1 ]]; then
+  exec "$ROOT/scripts/with_disposable_cargo_target.sh" --label systemd-watchdog -- "$0" "$@"
+fi
+
 if [[ "$(uname -s)" != "Linux" ]] || ! command -v systemd-run >/dev/null; then
   echo "ERROR: Linux with systemd-run is required" >&2
   exit 2
@@ -43,7 +48,7 @@ trap cleanup EXIT
 
 cargo build --locked --example systemd_watchdog_fixture \
   --features systemd-notify,runtime-health-fault-injection
-fixture="$(pwd)/target/debug/examples/systemd_watchdog_fixture"
+fixture="${CARGO_TARGET_DIR:?disposable target wrapper did not set CARGO_TARGET_DIR}/debug/examples/systemd_watchdog_fixture"
 
 common=(
   --property=Type=notify

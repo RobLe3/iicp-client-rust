@@ -32,6 +32,12 @@ cargo test --locked --all-targets --all-features
 cargo package --locked --allow-dirty
 ```
 
+Release, coverage and operator-evidence scripts use an isolated Cargo target
+with incremental compilation disabled. Successful runs remove only that
+run-owned target. Set `IICP_KEEP_FAILED_CARGO_TARGET=1` when a failed build tree
+is needed for diagnosis; ordinary interactive Cargo commands still use the
+repository `target/` directory.
+
 The public [IICP repository map](https://github.com/RobLe3/IICP/blob/main/ecosystem/public-repositories.json)
 identifies normative and implementation ownership. A pull request does not
 authorize a package release. Maintainers publish immutable, versioned artifacts

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import tomllib
 from datetime import UTC, datetime
@@ -45,6 +47,12 @@ def coverage_percent(path: Path) -> float:
 
 
 def main() -> int:
+    if os.environ.get("IICP_DISPOSABLE_CARGO_ACTIVE") != "1":
+        helper = Path(__file__).resolve().parent / "with_disposable_cargo_target.sh"
+        os.execv(
+            helper,
+            [str(helper), "--label", "rust-sdk-quality", "--", sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]],
+        )
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
