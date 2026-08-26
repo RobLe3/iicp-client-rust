@@ -614,11 +614,23 @@ fn runtime_health_path(node: &str) -> Result<PathBuf, String> {
             "healthcheck node name must contain only letters, digits, '.', '-' or '_'".into(),
         );
     }
-    Ok(home_dir()
+    let root = env::var_os("IICP_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".iicp"));
+    Ok(root.join("run").join(node).join("health-v1.json"))
+}
+
+fn legacy_runtime_health_path(node: &str) -> Result<Option<PathBuf>, String> {
+    if env::var_os("IICP_HOME").is_none_or(|value| value.is_empty()) {
+        return Ok(None);
+    }
+    let legacy = home_dir()
         .join(".iicp")
         .join("run")
         .join(node)
-        .join("health-v1.json"))
+        .join("health-v1.json");
+    Ok((legacy != runtime_health_path(node)?).then_some(legacy))
 }
 
 fn run_healthcheck(args: &[String]) -> Result<i32, String> {
@@ -645,14 +657,34 @@ fn run_healthcheck(args: &[String]) -> Result<i32, String> {
     if node.is_empty() {
         return Err("healthcheck requires --node NAME".into());
     }
-    let path = runtime_health_path(&node)?;
-    let raw = match fs::read(&path) {
+    let canonical_path = runtime_health_path(&node)?;
+    let mut path = canonical_path.clone();
+    let raw = match fs::read(&canonical_path) {
         Ok(raw) => raw,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("INDETERMINATE: no runtime-health snapshot for node {node}");
-            return Ok(2);
+            match legacy_runtime_health_path(&node)? {
+                Some(legacy) => match fs::read(&legacy) {
+                    Ok(raw) => {
+                        eprintln!(
+                            "NOTICE: using legacy runtime-health snapshot {}; restart the node to write under IICP_HOME",
+                            legacy.display()
+                        );
+                        path = legacy;
+                        raw
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        eprintln!("INDETERMINATE: no runtime-health snapshot for node {node}");
+                        return Ok(2);
+                    }
+                    Err(error) => return Err(format!("read {}: {error}", legacy.display())),
+                },
+                None => {
+                    eprintln!("INDETERMINATE: no runtime-health snapshot for node {node}");
+                    return Ok(2);
+                }
+            }
         }
-        Err(e) => return Err(format!("read {}: {e}", path.display())),
+        Err(e) => return Err(format!("read {}: {e}", canonical_path.display())),
     };
     let snapshot: iicp_client::runtime_health::HealthSnapshot = match serde_json::from_slice(&raw) {
         Ok(snapshot) => snapshot,
