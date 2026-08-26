@@ -15,6 +15,9 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/iicp-client-rust-quality
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4d407b29186a635f0cc27475ef0bc0ae605a8866 # 1.86.0
@@ -28,6 +31,8 @@ jobs:
         run: ./scripts/test_instance_lock_container.sh
       - name: Validate blank operator-evidence intake
         run: python3 scripts/check_systemd_operator_validation.py
+      - name: Validate disposable Cargo target lifecycle
+        run: python3 scripts/test_disposable_cargo_target.py
       - name: Validate isolated systemd watchdog recovery
         run: |
           sudo env "PATH=$PATH" \
