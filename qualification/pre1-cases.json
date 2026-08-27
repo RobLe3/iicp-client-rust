@@ -1,0 +1,195 @@
+{
+  "component": "client-rust",
+  "evidence_policy": "digest-only",
+  "network_policy": "isolated-fixtures-only",
+  "non_authorizing": true,
+  "scenario_commands": {
+    "ciphertext-tamper": [
+      "@cargo",
+      "test",
+      "--locked",
+      "confidentiality"
+    ],
+    "confidentiality-downgrade": [
+      "@cargo",
+      "test",
+      "--locked",
+      "confidentiality"
+    ],
+    "confidentiality-key-missing": [
+      "@cargo",
+      "test",
+      "--locked",
+      "confidentiality"
+    ],
+    "config-malformed": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "config_wizard_cli"
+    ],
+    "config-missing": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "config_wizard_cli"
+    ],
+    "config-permission-denied": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "runtime_identity_fixture"
+    ],
+    "credential-expired": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "dispatch_ticket_trust_runtime"
+    ],
+    "credential-missing": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "node_register_tests"
+    ],
+    "credential-replayed": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "dispatch_ticket_trust_store"
+    ],
+    "credential-rotated": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "dispatch_ticket_trust_store"
+    ],
+    "cross-flavor-equivalence": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "conformance_tests"
+    ],
+    "directory-unavailable": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "restricted_directory_client"
+    ],
+    "dns-failure": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "client_tests"
+    ],
+    "duplicate-registration": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "node_register_tests"
+    ],
+    "minimum-version": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "sdk_quality_contract"
+    ],
+    "offline-locked-install": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "sdk_quality_contract"
+    ],
+    "package-version-self-report": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "sdk_quality_contract"
+    ],
+    "partial-response": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "conformance_tests"
+    ],
+    "process-crash-restart": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "service_lifecycle_identity"
+    ],
+    "rate-limit": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "relay_http_poll_tests"
+    ],
+    "request-timeout": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "client_tests"
+    ],
+    "rollback-last-supported": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "sdk_quality_contract"
+    ],
+    "signature-mismatch": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "dispatch_ticket_trust_crypto"
+    ],
+    "stale-pid-or-lock": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "service_manager_cli"
+    ],
+    "tls-failure": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "client_tests"
+    ],
+    "unsupported-version": [
+      "@cargo",
+      "test",
+      "--locked",
+      "--test",
+      "sdk_quality_contract"
+    ]
+  },
+  "schema": "iicp.pre1-component-case-map.v1",
+  "support_command": [
+    "@cargo",
+    "test",
+    "--locked",
+    "--test",
+    "client_tests"
+  ]
+}
