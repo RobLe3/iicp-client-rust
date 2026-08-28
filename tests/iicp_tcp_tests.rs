@@ -17,7 +17,7 @@ use ciborium::value::Value as CborValue;
 use futures_util::StreamExt;
 use iicp_client::iicp_tcp::{
     decode_cbor, encode_frame, IicpTcpClient, IicpTcpClientError, IicpTcpServer, MsgType,
-    TcpStreamEvent, FRAME_HEADER_LEN, FRAMING_VERSION, IICP_MAGIC,
+    TcpStreamEvent, FRAME_HEADER_LEN, FRAMING_VERSION, IICP_MAGIC, MAX_FRAME_PAYLOAD,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -317,6 +317,86 @@ async fn test_bad_magic_closes_connection() {
 }
 
 #[tokio::test]
+async fn test_server_rejects_application_frame_before_init() {
+    let port = start_server().await;
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    sock.write_all(&encode_frame(MsgType::Ping as u8, &[], 0))
+        .await
+        .unwrap();
+    let mut byte = [0_u8; 1];
+    let read = timeout(TIMEOUT, sock.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0, "pre-handshake application frame must close");
+}
+
+#[tokio::test]
+async fn test_server_rejects_duplicate_init() {
+    let port = start_server().await;
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let init = encode_frame(
+        MsgType::Init as u8,
+        &cbor_encode(&CborValue::Map(vec![(
+            CborValue::Integer(1.into()),
+            CborValue::Integer((FRAMING_VERSION as i64).into()),
+        )])),
+        0,
+    );
+    sock.write_all(&init).await.unwrap();
+    read_frame(&mut sock).await.unwrap();
+    sock.write_all(&init).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let read = timeout(TIMEOUT, sock.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0, "duplicate INIT must close");
+}
+
+#[tokio::test]
+async fn test_server_rejects_init_with_unsupported_negotiated_version() {
+    let port = start_server().await;
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let init = encode_frame(
+        MsgType::Init as u8,
+        &cbor_encode(&CborValue::Map(vec![(
+            CborValue::Integer(1.into()),
+            CborValue::Integer(2.into()),
+        )])),
+        0,
+    );
+    sock.write_all(&init).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let read = timeout(TIMEOUT, sock.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0, "unsupported INIT version must close without ACK");
+}
+
+#[tokio::test]
+async fn test_server_rejects_oversized_length_before_body_read() {
+    let port = start_server().await;
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let mut header = [0_u8; FRAME_HEADER_LEN];
+    header[..4].copy_from_slice(IICP_MAGIC);
+    header[4] = FRAMING_VERSION;
+    header[5] = MsgType::Init as u8;
+    header[8..12].copy_from_slice(&((MAX_FRAME_PAYLOAD as u32) + 1).to_be_bytes());
+    sock.write_all(&header).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let read = timeout(TIMEOUT, sock.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        read, 0,
+        "oversized header must fail before waiting for body"
+    );
+}
+
+#[tokio::test]
 async fn test_payload_bearing_frame_does_not_close_session() {
     // iter-1410 regression guard: send INIT + PING back-to-back as a single TCP
     // write. Pre-fix the session loop closed after INIT because decode() raised
@@ -359,6 +439,59 @@ async fn test_client_handshake_populates_peer_node_id() {
     client.handshake().await.unwrap();
     assert_eq!(client.framing_version, Some(FRAMING_VERSION));
     assert_eq!(client.peer_node_id.as_deref(), Some("test-node-id"));
+}
+
+#[tokio::test]
+async fn test_client_requires_handshake_before_application_frames() {
+    let port = start_server().await;
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    let error = client.ping(None).await.expect_err("handshake required");
+    assert!(error.to_string().contains("handshake is not complete"));
+}
+
+#[tokio::test]
+async fn test_client_rejects_oversized_response_header_before_body_read() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_frame(&mut socket).await.unwrap();
+        let mut header = [0_u8; FRAME_HEADER_LEN];
+        header[..4].copy_from_slice(IICP_MAGIC);
+        header[4] = FRAMING_VERSION;
+        header[5] = MsgType::Ack as u8;
+        header[8..12].copy_from_slice(&((MAX_FRAME_PAYLOAD as u32) + 1).to_be_bytes());
+        socket.write_all(&header).await.unwrap();
+    });
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    let error = client.handshake().await.expect_err("oversized response");
+    assert!(error
+        .to_string()
+        .contains("response frame payload too large"));
+}
+
+#[tokio::test]
+async fn test_client_rejects_ack_with_wrong_negotiated_version() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_frame(&mut socket).await.unwrap();
+        let ack = encode_frame(
+            MsgType::Ack as u8,
+            &cbor_encode(&CborValue::Map(vec![(
+                CborValue::Integer(1.into()),
+                CborValue::Integer(2.into()),
+            )])),
+            0,
+        );
+        socket.write_all(&ack).await.unwrap();
+    });
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    let error = client.handshake().await.expect_err("version mismatch");
+    assert!(error
+        .to_string()
+        .contains("ACK negotiated unsupported framing version"));
 }
 
 #[tokio::test]

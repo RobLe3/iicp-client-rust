@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
-use iicp_client::iicp_tcp::{decode_frame, encode_frame, MsgType, FRAME_HEADER_LEN};
+use iicp_client::iicp_tcp::{
+    decode_frame, encode_frame, try_encode_frame, MsgType, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD,
+};
 use serde_json::Value;
 
 fn fixture() -> Value {
@@ -17,6 +19,10 @@ fn native_frame_decoder_matches_canonical_implementation_backed_vectors() {
     assert_eq!(
         fixture["frame"]["header_bytes"].as_u64(),
         Some(FRAME_HEADER_LEN as u64)
+    );
+    assert_eq!(
+        fixture["frame"]["max_payload_bytes"].as_u64(),
+        Some(MAX_FRAME_PAYLOAD as u64)
     );
 
     for scenario in fixture["scenarios"].as_array().expect("scenario array") {
@@ -57,11 +63,20 @@ fn native_frame_decoder_matches_canonical_implementation_backed_vectors() {
                 "invalid_magic" => "Invalid IICP magic",
                 "truncated_header" => "frame too short",
                 "truncated_payload" => "payload truncated",
+                "unsupported_version" => "Unsupported IICP framing version",
+                "payload_too_large" => "frame payload too large",
                 other => panic!("{name}: unsupported expected reason {other}"),
             };
             assert!(error.contains(expected_text), "{name}: {error}");
         }
     }
+}
+
+#[test]
+fn native_frame_encoder_rejects_payload_above_the_declared_limit() {
+    let payload = vec![0_u8; MAX_FRAME_PAYLOAD + 1];
+    let error = try_encode_frame(MsgType::Call as u8, &payload, 0).expect_err("oversized payload");
+    assert!(error.contains("frame payload too large"));
 }
 
 #[test]

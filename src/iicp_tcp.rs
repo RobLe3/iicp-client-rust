@@ -36,7 +36,9 @@ use crate::native_response_sequence::{
 pub const IICP_MAGIC: &[u8; 4] = b"IICP"; // 0x49 0x49 0x43 0x50
 pub const FRAMING_VERSION: u8 = 0x01;
 pub const FRAME_HEADER_LEN: usize = 12;
-const MAX_PAYLOAD: usize = 16 * 1024 * 1024;
+/// Maximum payload bytes in one native frame. The 12-byte header is not part
+/// of this limit; this matches the header's Length-field semantics.
+pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
 /// IICP message type codes (spec/iicp-framing.md §3, 0x01–0x0E).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,7 +90,14 @@ pub struct IicpFrame {
     pub payload: Vec<u8>,
 }
 
-pub fn encode_frame(msg_type: u8, payload: &[u8], flags: u8) -> Vec<u8> {
+/// Encode a frame, failing before the payload length can be truncated to u32.
+pub fn try_encode_frame(msg_type: u8, payload: &[u8], flags: u8) -> Result<Vec<u8>, String> {
+    if payload.len() > MAX_FRAME_PAYLOAD {
+        return Err(format!(
+            "IICP frame payload too large: {} > {MAX_FRAME_PAYLOAD}",
+            payload.len()
+        ));
+    }
     let mut out = Vec::with_capacity(FRAME_HEADER_LEN + payload.len());
     out.extend_from_slice(IICP_MAGIC);
     out.push(FRAMING_VERSION);
@@ -97,7 +106,22 @@ pub fn encode_frame(msg_type: u8, payload: &[u8], flags: u8) -> Vec<u8> {
     out.push(0); // reserved
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     out.extend_from_slice(payload);
-    out
+    Ok(out)
+}
+
+/// Compatibility encoder for callers that already hold a bounded payload.
+///
+/// # Panics
+///
+/// Panics if `payload` exceeds [`MAX_FRAME_PAYLOAD`]. Network-facing code uses
+/// [`try_encode_frame`] so untrusted application output becomes a bounded
+/// protocol error rather than a task panic.
+pub fn encode_frame(msg_type: u8, payload: &[u8], flags: u8) -> Vec<u8> {
+    try_encode_frame(msg_type, payload, flags).expect("native frame payload must be bounded")
+}
+
+fn invalid_frame(error: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error)
 }
 
 /// Decode one frame from `data`; return (frame, bytes_consumed).
@@ -112,10 +136,22 @@ pub fn decode_frame(data: &[u8]) -> Result<(IicpFrame, usize), String> {
         return Err(format!("Invalid IICP magic: {:?}", &data[0..4]));
     }
     let version = data[4];
+    if version != FRAMING_VERSION {
+        return Err(format!(
+            "Unsupported IICP framing version: {version}; expected {FRAMING_VERSION}"
+        ));
+    }
     let msg_type = data[5];
     let flags = data[6];
     let payload_len = u32::from_be_bytes(data[8..12].try_into().unwrap()) as usize;
-    let total = FRAME_HEADER_LEN + payload_len;
+    if payload_len > MAX_FRAME_PAYLOAD {
+        return Err(format!(
+            "IICP frame payload too large: {payload_len} > {MAX_FRAME_PAYLOAD}"
+        ));
+    }
+    let total = FRAME_HEADER_LEN
+        .checked_add(payload_len)
+        .ok_or_else(|| "IICP frame length overflow".to_string())?;
     if data.len() < total {
         return Err(format!(
             "IICP payload truncated: need {total}, have {}",
@@ -554,6 +590,7 @@ impl IicpTcpServer {
     /// (the HTTP control plane and native transport share one port via first-byte detection).
     pub async fn handle_connection(&self, mut socket: TcpStream) -> std::io::Result<()> {
         let mut buf: Vec<u8> = Vec::with_capacity(4096);
+        let mut initialized = false;
 
         // Stage 1 + magic byte validation. Read until we have the 12-byte header.
         // First check magic byte once we have at least 4 bytes.
@@ -598,7 +635,7 @@ impl IicpTcpServer {
                 return Ok(());
             }
             let payload_len = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
-            if payload_len + FRAME_HEADER_LEN > MAX_PAYLOAD {
+            if payload_len > MAX_FRAME_PAYLOAD {
                 warn!("IICP frame payload exceeds limit — closing");
                 return Ok(());
             }
@@ -620,7 +657,17 @@ impl IicpTcpServer {
             };
             buf.drain(..consumed);
 
+            if (!initialized && frame.msg_type != MsgType::Init as u8)
+                || (initialized && frame.msg_type == MsgType::Init as u8)
+            {
+                warn!("Invalid IICP handshake state — closing");
+                return Ok(());
+            }
+
             let keep_open = self.dispatch(frame, &mut socket).await?;
+            if !initialized {
+                initialized = true;
+            }
             if !keep_open {
                 return Ok(());
             }
@@ -629,7 +676,7 @@ impl IicpTcpServer {
 
     async fn dispatch(&self, frame: IicpFrame, socket: &mut TcpStream) -> std::io::Result<bool> {
         match MsgType::from_u8(frame.msg_type) {
-            Some(MsgType::Init) => self.on_init(socket).await,
+            Some(MsgType::Init) => self.on_init(&frame, socket).await,
             Some(MsgType::Ping) => self.on_ping(&frame, socket).await,
             Some(MsgType::Discover) => self.on_discover(&frame, socket).await,
             Some(MsgType::Call) => self.on_call(&frame, socket).await,
@@ -639,9 +686,23 @@ impl IicpTcpServer {
         }
     }
 
-    async fn on_init(&self, socket: &mut TcpStream) -> std::io::Result<bool> {
+    async fn on_init(&self, frame: &IicpFrame, socket: &mut TcpStream) -> std::io::Result<bool> {
+        let version =
+            decode_cbor(&frame.payload)
+                .ok()
+                .and_then(|body| match cbor_map_get(&body, 1) {
+                    Some(CborValue::Integer(value)) => {
+                        let value: i128 = (*value).into();
+                        u8::try_from(value).ok()
+                    }
+                    _ => None,
+                });
+        if version != Some(FRAMING_VERSION) {
+            warn!("INIT requested an unsupported framing version — closing");
+            return Ok(false);
+        }
         let ack = encode_ack(FRAMING_VERSION, self.node_id.as_deref());
-        let frame = encode_frame(MsgType::Ack as u8, &ack, 0);
+        let frame = try_encode_frame(MsgType::Ack as u8, &ack, 0).map_err(invalid_frame)?;
         socket.write_all(&frame).await?;
         Ok(true)
     }
@@ -656,7 +717,7 @@ impl IicpTcpServer {
             }
         }
         let pong = encode_pong(echo.as_deref());
-        let out = encode_frame(MsgType::Pong as u8, &pong, 0);
+        let out = try_encode_frame(MsgType::Pong as u8, &pong, 0).map_err(invalid_frame)?;
         socket.write_all(&out).await?;
         Ok(true)
     }
@@ -689,7 +750,7 @@ impl IicpTcpServer {
             };
 
         let resp = encode_discover_response(&session_id, &intent, &nodes);
-        let out = encode_frame(MsgType::Response as u8, &resp, 0);
+        let out = try_encode_frame(MsgType::Response as u8, &resp, 0).map_err(invalid_frame)?;
         socket.write_all(&out).await?;
         Ok(true)
     }
@@ -838,7 +899,7 @@ impl IicpTcpServer {
             error_code,
             error_message.as_deref(),
         );
-        let out = encode_frame(MsgType::Response as u8, &resp, 0);
+        let out = try_encode_frame(MsgType::Response as u8, &resp, 0).map_err(invalid_frame)?;
         socket.write_all(&out).await?;
         Ok(true)
     }
@@ -881,9 +942,9 @@ impl IicpTcpServer {
                 event: None,
             };
             let payload = encode_lifecycle_response(session_id, call_id, task_id, sequence, &event);
-            socket
-                .write_all(&encode_frame(MsgType::Response as u8, &payload, 0))
-                .await?;
+            let frame =
+                try_encode_frame(MsgType::Response as u8, &payload, 0).map_err(invalid_frame)?;
+            socket.write_all(&frame).await?;
             return Ok(true);
         }
         let _gate_lease = ConcurrencyGateLease(gate);
@@ -915,9 +976,9 @@ impl IicpTcpServer {
                 },
             };
             let payload = encode_lifecycle_response(session_id, call_id, task_id, sequence, &event);
-            socket
-                .write_all(&encode_frame(MsgType::Response as u8, &payload, 0))
-                .await?;
+            let frame =
+                try_encode_frame(MsgType::Response as u8, &payload, 0).map_err(invalid_frame)?;
+            socket.write_all(&frame).await?;
             sequence += 1;
             terminal_sent = event.status != "partial";
             if terminal_sent {
@@ -934,9 +995,9 @@ impl IicpTcpServer {
                 event: None,
             };
             let payload = encode_lifecycle_response(session_id, call_id, task_id, sequence, &event);
-            socket
-                .write_all(&encode_frame(MsgType::Response as u8, &payload, 0))
-                .await?;
+            let frame =
+                try_encode_frame(MsgType::Response as u8, &payload, 0).map_err(invalid_frame)?;
+            socket.write_all(&frame).await?;
         }
         Ok(true)
     }
@@ -1016,6 +1077,20 @@ pub struct IicpTcpClient {
 }
 
 impl IicpTcpClient {
+    fn frame(msg_type: MsgType, payload: &[u8], flags: u8) -> Result<Vec<u8>, IicpTcpClientError> {
+        try_encode_frame(msg_type as u8, payload, flags).map_err(IicpTcpClientError::Protocol)
+    }
+
+    fn require_handshake(&self) -> Result<(), IicpTcpClientError> {
+        if self.framing_version == Some(FRAMING_VERSION) {
+            Ok(())
+        } else {
+            Err(IicpTcpClientError::Protocol(
+                "native session handshake is not complete".into(),
+            ))
+        }
+    }
+
     /// Connect to host:port. Default 10s timeout for connect + each subsequent RPC.
     pub async fn connect(host: &str, port: u16) -> Result<Self, IicpTcpClientError> {
         Self::connect_with_timeout(host, port, std::time::Duration::from_secs(10)).await
@@ -1046,7 +1121,7 @@ impl IicpTcpClient {
             CborValue::Integer(1.into()),
             CborValue::Integer((FRAMING_VERSION as i64).into()),
         )]));
-        let frame = encode_frame(MsgType::Init as u8, &init_payload, 0);
+        let frame = Self::frame(MsgType::Init, &init_payload, 0)?;
         self.write_all(&frame).await?;
         let (mt, payload) = self.read_frame().await?;
         if mt != MsgType::Ack as u8 {
@@ -1054,14 +1129,22 @@ impl IicpTcpClient {
                 "expected ACK (0x02), got 0x{mt:02x}"
             )));
         }
-        if let Ok(body) = decode_cbor(&payload) {
-            if let Some(CborValue::Integer(i)) = cbor_map_get(&body, 1) {
-                let n: i128 = (*i).into();
-                self.framing_version = Some(n as u8);
+        let body = decode_cbor(&payload).map_err(IicpTcpClientError::Protocol)?;
+        let negotiated = match cbor_map_get(&body, 1) {
+            Some(CborValue::Integer(value)) => {
+                let value: i128 = (*value).into();
+                u8::try_from(value).ok()
             }
-            if let Some(v) = cbor_map_get(&body, 2) {
-                self.peer_node_id = cbor_to_str(v);
-            }
+            _ => None,
+        };
+        if negotiated != Some(FRAMING_VERSION) {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "ACK negotiated unsupported framing version {negotiated:?}"
+            )));
+        }
+        self.framing_version = negotiated;
+        if let Some(v) = cbor_map_get(&body, 2) {
+            self.peer_node_id = cbor_to_str(v);
         }
         Ok(())
     }
@@ -1071,6 +1154,7 @@ impl IicpTcpClient {
         &mut self,
         echo: Option<&[u8]>,
     ) -> Result<Option<Vec<u8>>, IicpTcpClientError> {
+        self.require_handshake()?;
         let body = if let Some(b) = echo {
             CborValue::Map(vec![(
                 CborValue::Integer(1.into()),
@@ -1079,7 +1163,7 @@ impl IicpTcpClient {
         } else {
             CborValue::Map(vec![])
         };
-        let frame = encode_frame(MsgType::Ping as u8, &encode_cbor(&body), 0);
+        let frame = Self::frame(MsgType::Ping, &encode_cbor(&body), 0)?;
         self.write_all(&frame).await?;
         let (mt, payload) = self.read_frame().await?;
         if mt != MsgType::Pong as u8 {
@@ -1108,6 +1192,7 @@ impl IicpTcpClient {
         intent: &str,
         session_id: &str,
     ) -> Result<Vec<CborValue>, IicpTcpClientError> {
+        self.require_handshake()?;
         let payload = encode_cbor(&CborValue::Map(vec![
             (
                 CborValue::Integer(2.into()),
@@ -1115,7 +1200,7 @@ impl IicpTcpClient {
             ),
             (CborValue::Integer(3.into()), CborValue::Text(intent.into())),
         ]));
-        let frame = encode_frame(MsgType::Discover as u8, &payload, 0);
+        let frame = Self::frame(MsgType::Discover, &payload, 0)?;
         self.write_all(&frame).await?;
         let (mt, body_bytes) = self.read_frame().await?;
         if mt != MsgType::Response as u8 {
@@ -1138,6 +1223,7 @@ impl IicpTcpClient {
         payload: serde_json::Value,
         call_id: Option<&str>,
     ) -> Result<serde_json::Value, IicpTcpClientError> {
+        self.require_handshake()?;
         self.call_with_session(intent, payload, call_id, "call-1")
             .await
     }
@@ -1149,6 +1235,7 @@ impl IicpTcpClient {
         call_id: Option<&str>,
         session_id: &str,
     ) -> Result<serde_json::Value, IicpTcpClientError> {
+        self.require_handshake()?;
         let payload_bytes = serde_json::to_vec(&payload)
             .map_err(|e| IicpTcpClientError::Protocol(format!("JSON encode: {e}")))?;
         let mut entries: Vec<(CborValue, CborValue)> = vec![
@@ -1165,11 +1252,7 @@ impl IicpTcpClient {
         if let Some(cid) = call_id {
             entries.push((CborValue::Integer(15.into()), CborValue::Text(cid.into())));
         }
-        let frame = encode_frame(
-            MsgType::Call as u8,
-            &encode_cbor(&CborValue::Map(entries)),
-            0,
-        );
+        let frame = Self::frame(MsgType::Call, &encode_cbor(&CborValue::Map(entries)), 0)?;
         self.write_all(&frame).await?;
         let (mt, body_bytes) = self.read_frame().await?;
         if mt != MsgType::Response as u8 {
@@ -1217,7 +1300,7 @@ impl IicpTcpClient {
     ) -> impl Stream<Item = Result<NativeResponseFrame, IicpTcpClientError>> {
         struct State {
             client: IicpTcpClient,
-            request: Vec<u8>,
+            request: Option<Result<Vec<u8>, IicpTcpClientError>>,
             sequence: NativeResponseSequence,
             started: bool,
             finished: bool,
@@ -1250,14 +1333,12 @@ impl IicpTcpClient {
         if let Some(key) = idempotency_key {
             entries.push((CborValue::Integer(16.into()), CborValue::Text(key)));
         }
-        let request = encode_frame(
-            MsgType::Call as u8,
-            &encode_cbor(&CborValue::Map(entries)),
-            0,
-        );
+        let request = self
+            .require_handshake()
+            .and_then(|()| Self::frame(MsgType::Call, &encode_cbor(&CborValue::Map(entries)), 0));
         let state = State {
             client: self,
-            request,
+            request: Some(request),
             sequence: NativeResponseSequence::new(session_id, call_id, task_id),
             started: false,
             finished: false,
@@ -1268,7 +1349,14 @@ impl IicpTcpClient {
                 return None;
             }
             if !state.started {
-                if let Err(error) = state.client.write_all(&state.request.clone()).await {
+                let request = match state.request.take().expect("request consumed once") {
+                    Ok(request) => request,
+                    Err(error) => {
+                        state.finished = true;
+                        return Some((Err(error), state));
+                    }
+                };
+                if let Err(error) = state.client.write_all(&request).await {
                     state.finished = true;
                     return Some((Err(error), state));
                 }
@@ -1320,7 +1408,8 @@ impl IicpTcpClient {
 
     /// Send CLOSE — server hangs up cleanly. Subsequent RPCs on this client will fail.
     pub async fn close(&mut self) -> Result<(), IicpTcpClientError> {
-        let frame = encode_frame(MsgType::Close as u8, &[], 0);
+        self.require_handshake()?;
+        let frame = Self::frame(MsgType::Close, &[], 0)?;
         self.write_all(&frame).await?;
         Ok(())
     }
@@ -1349,8 +1438,19 @@ impl IicpTcpClient {
                 &head[0..4]
             )));
         }
+        if head[4] != FRAMING_VERSION {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "unsupported framing version {} in response",
+                head[4]
+            )));
+        }
         let mt = head[5];
         let payload_len = u32::from_be_bytes(head[8..12].try_into().unwrap()) as usize;
+        if payload_len > MAX_FRAME_PAYLOAD {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "response frame payload too large: {payload_len} > {MAX_FRAME_PAYLOAD}"
+            )));
+        }
         let mut payload = vec![0u8; payload_len];
         if payload_len > 0 {
             tokio::time::timeout(self.timeout, self.sock.read_exact(&mut payload))
