@@ -377,7 +377,11 @@ def expected_runtime_version(runtime: str, manifest: dict) -> str:
         if runtime != f"rust-{expected}":
             raise ValueError("qualification stable Rust runtime differs from the candidate")
         return expected
-    field = {"client-rust": "rust_client_msrv", "client-rust": "rust_directory_msrv", "management": "management_msrv"}[COMPONENT]
+    field = {
+        "client-rust": "rust_client_msrv",
+        "directory-rust": "rust_directory_msrv",
+        "management": "management_msrv",
+    }[COMPONENT]
     return str(manifest["toolchains"][field])
 
 
