@@ -37,7 +37,7 @@ iicp-client = "0.7.110"
 Install the CLI and ask the mesh:
 
 ```bash
-cargo install iicp-client --version 0.7.109 --locked
+cargo install iicp-client --version 0.7.110 --locked
 iicp-node query "Hello, mesh."
 ```
 
@@ -210,7 +210,7 @@ let reply = client.chat(
 Existing OpenAI-compatible tools:
 
 ```bash
-cargo install iicp-client --version 0.7.109 --locked --features proxy
+cargo install iicp-client --version 0.7.110 --locked --features proxy
 iicp-node proxy
 export OPENAI_BASE_URL=http://127.0.0.1:9483/v1
 ```
@@ -304,7 +304,7 @@ Run a local gateway that speaks the OpenAI, Ollama, and Anthropic HTTP APIs and 
 every request across the IICP mesh — point any tool you already use at it, no code changes.
 
 ```bash
-cargo install iicp-client --version 0.7.109 --locked --features proxy
+cargo install iicp-client --version 0.7.110 --locked --features proxy
 iicp-node proxy                       # → http://127.0.0.1:9483
 
 export OPENAI_BASE_URL=http://127.0.0.1:9483/v1   # OpenAI SDK / LangChain / Cursor / liteLLM
