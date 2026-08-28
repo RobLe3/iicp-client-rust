@@ -232,9 +232,10 @@ Failed candidates use persisted, bounded retry backoff (up to 24 hours) instead
 of being reinstalled every check. The non-sensitive retry status is stored under
 `$IICP_HOME/state/update-status.json`; `IICP_UPDATE_STATE_FILE` overrides that
 path for managed or test environments.
-When crates.io publishes a newer stable release, `serve` installs it with
-`cargo install iicp-client --version X.Y.Z --locked --force --registry crates-io --features nat,iicp-tcp` and re-execs the
-node so identity and cached node tokens are preserved.
+When crates.io publishes a newer stable release, `serve` preserves the running
+binary's compiled feature set during its exact, locked reinstall and then
+re-execs the node so identity and cached node tokens are preserved. Compiling
+`iicp-tcp` does not enable the experimental native listener.
 
 If an older supervised node does not update itself, perform one manual upgrade
 and restart through its normal supervisor. For Docker, use a restart policy
@@ -470,12 +471,32 @@ capabilities. Image and audio are passed through OpenAI-style content parts
 
 ### Listen port — default 9484, auto-increment (v0.7.5+)
 
-The official IICP port **9484** is the default listen port (`IICP_PORT`, `--port`).
+The unassigned project-default port **9484** is the default listen port
+(`IICP_PORT`, `--port`); it is not an IANA-assigned IICP service port.
 The `iicp-node` binary auto-increments to the next free port when 9484 is already
 in use, so several nodes on one host don't need hand-picked ports — first binds
 9484, second 9485, third 9486, etc. Each node gets its own port (hence its own NAT
 pinhole); multiple models on one node share that single port. Auto-increment is
 skipped when you pass an explicit `--public-endpoint`.
+
+---
+
+### Experimental native TCP boundary
+
+Provider nodes serve the supported HTTP task path by default. The native TCP
+draft is not part of the coordinated stable or production support baseline.
+Even when the `iicp-tcp` feature is compiled, the listener is mounted and its
+`transport_endpoint` is registered only after this explicit development opt-in:
+
+```bash
+IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1 iicp-node serve --node my-node
+```
+
+Automatic derivation is limited to direct `http://` endpoints and produces a
+plaintext `iicp://` endpoint. An `https://` endpoint is never rewritten to
+`iicpsec://`: an HTTPS reverse proxy or Quick Tunnel does not prove a native
+TLS route. Generated launchd and systemd units omit the setting by default and
+preserve it only when the operator supplied a valid explicit value.
 
 ---
 
@@ -487,7 +508,7 @@ needed. Requires the `nat` feature (UPnP detection):
 ```toml
 [dependencies]
 iicp-client = { version = "0.7", features = ["nat"] }
-# For relay substrate (CGNAT fallback): add "iicp-tcp"
+# For the experimental relay substrate (CGNAT fallback): add "iicp-tcp"
 iicp-client = { version = "0.7", features = ["nat", "iicp-tcp"] }
 ```
 

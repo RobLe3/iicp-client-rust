@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-//! Native IICP binary transport (port 9484) — server + framing + cbor payloads.
+//! Experimental native IICP binary transport — server + framing + CBOR payloads.
 //!
 //! Rust port of iicp-client-python iicp_tcp.py (iter-1414) and
 //! iicp-client-typescript iicp_tcp.ts (iter-1415). Wire-compatible with
 //! adapter nodes and REACH FRAME-PING-01 / FRAME-INIT-01 conformance probes.
 //!
-//! Enabled via the `iicp-tcp` feature flag — ciborium is added as an opt-in
-//! dependency because HTTP-only nodes don't need it.
+//! Compiled via the `iicp-tcp` feature flag. `iicp-node` still requires the
+//! separate `IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1` runtime opt-in before it
+//! mounts or advertises this plaintext development binding. It is excluded
+//! from stable and production support claims.
 //!
 //! Implements the iter-1410 framing fixes from the start:
 //! - Session loop reads the announced payload BEFORE decoding (pre-fix the
@@ -40,11 +42,11 @@ pub const FRAME_HEADER_LEN: usize = 12;
 /// of this limit; this matches the header's Length-field semantics.
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
-/// Fail-closed type-byte disposition for the stable native task profile.
+/// Fail-closed type-byte disposition for the bounded experimental task profile.
 ///
 /// The experimental relay keeps 0x0b/0x0c on its dedicated transport. Those
 /// bytes conflict with the inherited CONTROL/ADVERTISE registry and are never
-/// accepted by a stable task session.
+/// accepted by the bounded task profile.
 pub fn stable_task_message_type_error(msg_type: u8) -> Option<&'static str> {
     match msg_type {
         0x01..=0x0a | 0x0d | 0x0e => None,
