@@ -55,6 +55,66 @@ fn decision(vector: &Value, keys: &BTreeMap<&str, &Value>, signature_valid: bool
     "accept_anchored"
 }
 
+fn assert_fixture_decision(vector_id: &str, expected: &str) {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../parity/dispatch-ticket-trust-v2-crypto.json"
+    ))
+    .unwrap();
+    let vector = fixture["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|value| value["id"] == vector_id)
+        .unwrap();
+    let keys = fixture["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| (key["key_id"].as_str().unwrap(), key))
+        .collect::<BTreeMap<_, _>>();
+    let domain = URL_SAFE_NO_PAD
+        .decode(fixture["domain_separator_b64url"].as_str().unwrap())
+        .unwrap();
+    let key = keys[vector["claims"]["key_id"].as_str().unwrap()];
+    let public_bytes: [u8; 32] = URL_SAFE_NO_PAD
+        .decode(key["public_key_b64url"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let signature_bytes: [u8; 64] = URL_SAFE_NO_PAD
+        .decode(vector["signature_b64url"].as_str().unwrap())
+        .unwrap()
+        .try_into()
+        .unwrap();
+    let mut message = domain;
+    message.extend_from_slice(canonical(&vector["claims"]).as_bytes());
+    let signature_valid = VerifyingKey::from_bytes(&public_bytes)
+        .unwrap()
+        .verify(&message, &Signature::from_bytes(&signature_bytes))
+        .is_ok();
+    assert_eq!(decision(vector, &keys, signature_valid), expected);
+}
+
+#[test]
+fn expired_dispatch_ticket_key_fails_closed() {
+    assert_fixture_decision("expired_key_refused", "reject_key_expired");
+}
+
+#[test]
+fn replayed_dispatch_ticket_fails_closed() {
+    assert_fixture_decision("local_replay_refused", "reject_local_replay");
+}
+
+#[test]
+fn revoked_dispatch_ticket_key_fails_closed_after_rotation() {
+    assert_fixture_decision("revoked_key_refused", "reject_key_revoked");
+}
+
+#[test]
+fn tampered_dispatch_ticket_signature_fails_closed() {
+    assert_fixture_decision("tampered_claim_refused", "reject_signature");
+}
+
 #[test]
 fn dispatch_ticket_v2_signed_vectors_are_portable() {
     let fixture: Value = serde_json::from_str(include_str!(

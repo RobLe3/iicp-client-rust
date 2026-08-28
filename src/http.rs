@@ -273,6 +273,29 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn tls_handshake_failure_is_transient_and_bounded() {
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+        });
+        let client = HttpClient::new(2_000, None).unwrap();
+        let error = client
+            .get_json::<Value>(&format!("https://{address}/"), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, IicpError::Http(_)));
+        assert!(error.is_transient());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn private_provider_requires_opt_in_and_uses_pinned_transport() {
         let app = Router::new()
             .route("/redirect", post(|| async { Redirect::temporary("/task") }))
