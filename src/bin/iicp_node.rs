@@ -1330,6 +1330,43 @@ fn detect_service_platform(requested: &str) -> Result<&'static str, String> {
     }
 }
 
+fn supervisor_tunnel_environment() -> Result<Vec<(&'static str, String)>, String> {
+    let configured_path = env::var_os("IICP_CLOUDFLARED_PATH");
+    let cloudflared = iicp_client::tunnel::cloudflared_path();
+    if configured_path.is_some() && cloudflared.is_none() {
+        return Err(
+            "IICP_CLOUDFLARED_PATH must be an absolute path to an executable file".to_string(),
+        );
+    }
+
+    let explicit_tunnel = match env::var("IICP_TUNNEL") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Some("1"),
+            "0" | "false" | "no" => Some("0"),
+            _ => return Err("IICP_TUNNEL must be one of 1/true/yes or 0/false/no".to_string()),
+        },
+        Err(env::VarError::NotPresent) => None,
+        Err(env::VarError::NotUnicode(_)) => {
+            return Err("IICP_TUNNEL must contain valid UTF-8".to_string())
+        }
+    };
+    if explicit_tunnel == Some("1") && cloudflared.is_none() {
+        return Err(
+            "IICP_TUNNEL=1 requires cloudflared; set IICP_CLOUDFLARED_PATH to its absolute executable path"
+                .to_string(),
+        );
+    }
+
+    let mut envs = Vec::new();
+    if let Some(path) = cloudflared {
+        envs.push(("IICP_CLOUDFLARED_PATH", path.to_string_lossy().to_string()));
+    }
+    if let Some(value) = explicit_tunnel {
+        envs.push(("IICP_TUNNEL", value.to_string()));
+    }
+    Ok(envs)
+}
+
 fn render_launchd_service(
     node: &str,
     name: Option<&str>,
@@ -1348,7 +1385,7 @@ fn render_launchd_service(
         .join("Library")
         .join("LaunchAgents")
         .join(format!("{label}.plist"));
-    let envs = [
+    let mut envs = vec![
         ("IICP_NODE_NAME", node.to_string()),
         (
             "IICP_AUTO_UPDATE",
@@ -1368,6 +1405,7 @@ fn render_launchd_service(
         ),
         ("IICP_LOG_DIR", log_dir.to_string_lossy().to_string()),
     ];
+    envs.extend(supervisor_tunnel_environment()?);
     let env_xml = envs
         .iter()
         .map(|(k, v)| {
@@ -1473,6 +1511,7 @@ fn render_systemd_service(
         ),
         ("IICP_LOG_DIR", log_dir.to_string_lossy().to_string()),
     ];
+    envs.extend(supervisor_tunnel_environment()?);
     if notify_requested {
         envs.push(("IICP_SYSTEMD_NOTIFY", "1".to_string()));
     }
@@ -1605,6 +1644,14 @@ fn run_service(args: &[String]) -> Result<(), String> {
     let managed_binary = supervised_executable_path();
     let executable = managed_binary.to_string_lossy().to_string();
     let unit = render_service_unit(&node, name.as_deref(), &platform, &executable)?;
+    if subcmd == "install"
+        && env::var_os("IICP_CLOUDFLARED_PATH").is_none()
+        && iicp_client::tunnel::cloudflared_path().is_none()
+    {
+        eprintln!(
+            "WARNING: Quick Tunnel fallback is unavailable under the supervisor because cloudflared could not be resolved. Direct reachability remains supported."
+        );
+    }
     let execute =
         |program: &str, command_args: &[&str], tolerate_failure: bool| -> Result<(), String> {
             println!("manager:  {} {}", program, command_args.join(" "));
@@ -3663,6 +3710,76 @@ async fn apply_auto_update_candidate(candidate: String) {
     }
 }
 
+async fn register_before_serving(
+    node: &IicpNode,
+    opts: &ServeOpts,
+    node_log: Option<&iicp_client::node_log::NodeLog>,
+    dynamic_public_route: bool,
+) -> Result<String, String> {
+    // A dynamic public route is not eligible until the directory can dial the
+    // already-listening node. Do one pre-listener attempt only; on its expected
+    // IICP-E036 rejection, serve() binds and the empty-token heartbeat
+    // immediately re-registers through the verified route.
+    let attempt_limit = if dynamic_public_route { 1 } else { 3 };
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match node.register().await {
+            Ok(token) => {
+                eprintln!("[iicp-node] registered as {}", opts.node_id);
+                if let Some(log) = node_log {
+                    log.write(
+                        "register_ok",
+                        &opts.node_id,
+                        &format!("endpoint={}", opts.public_endpoint),
+                    );
+                }
+                // #456 / TC-9c — cache token + HMAC key in the saved config so
+                // credits and CIP worker receipts work immediately on restart.
+                if !opts.node.is_empty() {
+                    if let Ok(Some(mut identity)) = load_node(&opts.node) {
+                        let hmac_key = node.node_hmac_key();
+                        persist_registered_identity_credentials(
+                            &mut identity,
+                            &token,
+                            Some(hmac_key.as_str()).filter(|value| !value.is_empty()),
+                        )?;
+                        if let Err(error) = save_node(&identity) {
+                            return Err(format!(
+                                "could not commit protected saved credentials: {error}"
+                            ));
+                        }
+                    }
+                    complete_handoff_for_node(&opts.node);
+                }
+                return Ok(token);
+            }
+            Err(error) if attempt >= attempt_limit => {
+                eprintln!(
+                    "[iicp-node] registration failed after {attempt} attempts: {error} — \
+                     starting heartbeat loop anyway; it will re-register on the first 401"
+                );
+                if let Some(log) = node_log {
+                    log.write(
+                        "register_fail",
+                        &opts.node_id,
+                        &format!("error={error} attempts={attempt}"),
+                    );
+                }
+                return Ok(String::new());
+            }
+            Err(error) => {
+                let backoff = Duration::from_secs(2u64.pow(attempt));
+                eprintln!(
+                    "[iicp-node] registration attempt {attempt} failed: {error} — retrying in {}s",
+                    backoff.as_secs()
+                );
+                tokio::time::sleep(backoff).await;
+            }
+        }
+    }
+}
+
 async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // CIP toggle via env var — safe-off default; operators advertise as a
     // CIP worker by setting IICP_CIP_ALLOW_WORKER=true. Matches the same
@@ -4490,66 +4607,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     let token = if opts.skip_registration {
         None
     } else {
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            match node.register().await {
-                Ok(t) => {
-                    eprintln!("[iicp-node] registered as {}", opts.node_id);
-                    if let Some(ref log) = node_log {
-                        log.write(
-                            "register_ok",
-                            &opts.node_id,
-                            &format!("endpoint={}", opts.public_endpoint),
-                        );
-                    }
-                    // #456 / TC-9c — cache token + HMAC key in the saved config so
-                    // `iicp-node credits` can authenticate and CIPWorkerReceipts work
-                    // immediately on restart (best-effort).
-                    if !opts.node.is_empty() {
-                        if let Ok(Some(mut ni)) = load_node(&opts.node) {
-                            let hmac_key = node.node_hmac_key();
-                            persist_registered_identity_credentials(
-                                &mut ni,
-                                &t,
-                                Some(hmac_key.as_str()).filter(|value| !value.is_empty()),
-                            )?;
-                            if let Err(error) = save_node(&ni) {
-                                return Err(format!(
-                                    "could not commit protected saved credentials: {error}"
-                                ));
-                            }
-                        }
-                    }
-                    if !opts.node.is_empty() {
-                        complete_handoff_for_node(&opts.node);
-                    }
-                    break Some(t);
-                }
-                Err(e) if attempt >= 3 => {
-                    eprintln!(
-                        "[iicp-node] registration failed after {attempt} attempts: {e} — \
-                         starting heartbeat loop anyway; it will re-register on the first 401"
-                    );
-                    if let Some(ref log) = node_log {
-                        log.write(
-                            "register_fail",
-                            &opts.node_id,
-                            &format!("error={e} attempts={attempt}"),
-                        );
-                    }
-                    break Some(String::new()); // empty token → #399 re-register self-heals
-                }
-                Err(e) => {
-                    let backoff = std::time::Duration::from_secs(2u64.pow(attempt));
-                    eprintln!(
-                        "[iicp-node] registration attempt {attempt} failed: {e} — retrying in {}s",
-                        backoff.as_secs()
-                    );
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        }
+        Some(register_before_serving(&node, &opts, node_log.as_deref(), tunnel.is_some()).await?)
     };
 
     eprintln!(
@@ -6630,7 +6688,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    fn systemd_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    fn service_env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
         LOCK.get_or_init(|| std::sync::Mutex::new(()))
             .lock()
@@ -6974,8 +7032,11 @@ mod tests {
 
     #[test]
     fn launchd_service_runs_foreground_serve_with_hourly_auto_update() {
+        let _guard = service_env_lock();
         env::remove_var("IICP_AUTO_UPDATE");
         env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
+        env::remove_var("IICP_CLOUDFLARED_PATH");
+        env::remove_var("IICP_TUNNEL");
         let unit = render_launchd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert_eq!(unit.platform, "launchd");
         assert!(unit
@@ -7009,10 +7070,12 @@ mod tests {
 
     #[test]
     fn systemd_service_runs_foreground_serve_with_hourly_auto_update() {
-        let _guard = systemd_env_lock();
+        let _guard = service_env_lock();
         env::remove_var("IICP_AUTO_UPDATE");
         env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
         env::remove_var("IICP_SYSTEMD_NOTIFY");
+        env::remove_var("IICP_CLOUDFLARED_PATH");
+        env::remove_var("IICP_TUNNEL");
         let unit = render_systemd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert_eq!(unit.platform, "systemd");
         assert!(unit
@@ -7037,13 +7100,73 @@ mod tests {
     #[cfg(all(target_os = "linux", feature = "systemd-notify"))]
     #[test]
     fn systemd_notify_is_explicit_and_does_not_guess_a_watchdog_timeout() {
-        let _guard = systemd_env_lock();
+        let _guard = service_env_lock();
         env::set_var("IICP_SYSTEMD_NOTIFY", "1");
         let unit = render_systemd_service("notify-node", None, "/tmp/iicp-node").unwrap();
         env::remove_var("IICP_SYSTEMD_NOTIFY");
         assert!(unit.content.contains("Type=notify\nNotifyAccess=main"));
         assert!(unit.content.contains("Environment=IICP_SYSTEMD_NOTIFY=1"));
         assert!(!unit.content.contains("WatchdogSec="));
+    }
+
+    #[test]
+    fn supervisor_service_preserves_only_explicit_tunnel_policy_and_resolved_binary() {
+        let _guard = service_env_lock();
+        let root = env::temp_dir().join(format!("iicp-cloudflared-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join("cloudflared");
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&binary).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&binary, permissions).unwrap();
+        }
+        env::set_var("IICP_CLOUDFLARED_PATH", &binary);
+        env::set_var("IICP_TUNNEL", "yes");
+
+        let launchd = render_launchd_service("mynode", None, "/tmp/iicp-node").unwrap();
+        let systemd = render_systemd_service("mynode", None, "/tmp/iicp-node").unwrap();
+        let resolved = binary.canonicalize().unwrap().to_string_lossy().to_string();
+        assert!(launchd.content.contains(&format!(
+            "<key>IICP_CLOUDFLARED_PATH</key><string>{resolved}</string>"
+        )));
+        assert!(launchd
+            .content
+            .contains("<key>IICP_TUNNEL</key><string>1</string>"));
+        assert!(systemd
+            .content
+            .contains(&format!("Environment=IICP_CLOUDFLARED_PATH={resolved}")));
+        assert!(systemd.content.contains("Environment=IICP_TUNNEL=1"));
+
+        env::remove_var("IICP_TUNNEL");
+        let automatic = render_launchd_service("mynode", None, "/tmp/iicp-node").unwrap();
+        assert!(!automatic.content.contains("<key>IICP_TUNNEL</key>"));
+        env::remove_var("IICP_CLOUDFLARED_PATH");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supervisor_service_refuses_invalid_or_unavailable_forced_tunnel() {
+        let _guard = service_env_lock();
+        env::set_var("IICP_CLOUDFLARED_PATH", "relative/cloudflared");
+        env::remove_var("IICP_TUNNEL");
+        assert!(render_launchd_service("mynode", None, "/tmp/iicp-node")
+            .unwrap_err()
+            .contains("absolute path"));
+
+        env::remove_var("IICP_CLOUDFLARED_PATH");
+        let old_path = env::var_os("PATH");
+        env::set_var("PATH", "");
+        env::set_var("IICP_TUNNEL", "1");
+        assert!(render_systemd_service("mynode", None, "/tmp/iicp-node")
+            .unwrap_err()
+            .contains("requires cloudflared"));
+        env::remove_var("IICP_TUNNEL");
+        match old_path {
+            Some(value) => env::set_var("PATH", value),
+            None => env::remove_var("PATH"),
+        }
     }
 
     #[test]

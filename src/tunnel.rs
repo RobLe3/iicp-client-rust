@@ -625,8 +625,36 @@ pub const INSTALL_HINT: &str = "cloudflared not found — install it to become r
 without router changes (zero-account Quick Tunnel): macOS `brew install cloudflared` · \
 Linux: https://pkg.cloudflare.com · Windows `winget install Cloudflare.cloudflared`";
 
-/// Locate the cloudflared binary on PATH, or None (we never auto-install it).
-pub fn cloudflared_path() -> Option<std::path::PathBuf> {
+fn executable_path(candidate: &Path) -> Option<PathBuf> {
+    let resolved = candidate.canonicalize().ok()?;
+    let metadata = resolved.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+    }
+    Some(resolved)
+}
+
+/// Locate the cloudflared binary without depending on an interactive shell.
+///
+/// `IICP_CLOUDFLARED_PATH` is authoritative when present. It must name an
+/// absolute executable; an invalid explicit value fails closed rather than
+/// falling through to a different binary on `PATH`. Without an override, the
+/// ordinary `PATH` lookup remains available for interactive use.
+pub fn cloudflared_path() -> Option<PathBuf> {
+    if let Some(configured) = std::env::var_os("IICP_CLOUDFLARED_PATH") {
+        let configured = PathBuf::from(configured);
+        if !configured.is_absolute() {
+            return None;
+        }
+        return executable_path(&configured);
+    }
     let exts: &[&str] = if cfg!(windows) {
         &[".exe", ".cmd", ""]
     } else {
@@ -636,8 +664,8 @@ pub fn cloudflared_path() -> Option<std::path::PathBuf> {
     for dir in std::env::split_paths(&path_var) {
         for ext in exts {
             let candidate = dir.join(format!("cloudflared{ext}"));
-            if candidate.is_file() {
-                return Some(candidate);
+            if let Some(resolved) = executable_path(&candidate) {
+                return Some(resolved);
             }
         }
     }
@@ -1204,6 +1232,50 @@ mod tests {
     use super::*;
 
     static RATE_LIMIT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    fn cloudflared_override_is_absolute_executable_and_authoritative() {
+        let _guard = RATE_LIMIT_TEST_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap();
+        let old_override = std::env::var_os("IICP_CLOUDFLARED_PATH");
+        let old_path = std::env::var_os("PATH");
+        let root =
+            std::env::temp_dir().join(format!("iicp-cloudflared-path-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let binary = root.join(if cfg!(windows) {
+            "cloudflared.exe"
+        } else {
+            "cloudflared"
+        });
+        fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&binary).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&binary, permissions).unwrap();
+        }
+
+        std::env::set_var("IICP_CLOUDFLARED_PATH", &binary);
+        assert_eq!(cloudflared_path(), Some(binary.canonicalize().unwrap()));
+        std::env::set_var("IICP_CLOUDFLARED_PATH", "relative/cloudflared");
+        std::env::set_var("PATH", &root);
+        assert_eq!(cloudflared_path(), None);
+        std::env::remove_var("IICP_CLOUDFLARED_PATH");
+        assert_eq!(cloudflared_path(), Some(binary.canonicalize().unwrap()));
+
+        match old_override {
+            Some(value) => std::env::set_var("IICP_CLOUDFLARED_PATH", value),
+            None => std::env::remove_var("IICP_CLOUDFLARED_PATH"),
+        }
+        match old_path {
+            Some(value) => std::env::set_var("PATH", value),
+            None => std::env::remove_var("PATH"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     fn with_temp_rate_limit_state<T>(f: impl FnOnce() -> T) -> T {
         let _guard = RATE_LIMIT_TEST_LOCK

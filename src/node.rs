@@ -141,6 +141,10 @@ struct RegistrationCredentials {
     node_hmac_key: Option<String>,
 }
 
+fn heartbeat_waits_before_first_tick(node_token: &str) -> bool {
+    !node_token.is_empty()
+}
+
 /// #404 — re-register: POST the register payload and return fresh credentials.
 /// Extracted from the heartbeat loop's re-register arm so the self-heal behaviour
 /// is unit-testable (the 30s interval loop itself is not).
@@ -2776,8 +2780,15 @@ impl IicpNode {
                 let mut seq: u64 = 0;
                 let mut recovery_failures: u32 = 0;
                 let mut pending_metrics: Option<PendingMetricBatch> = None;
+                // An empty token means startup registration was intentionally
+                // deferred until the listener existed. Recover immediately;
+                // ordinary registered nodes retain the normal heartbeat cadence.
+                let mut wait_before_tick = heartbeat_waits_before_first_tick(&token);
                 loop {
-                    tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+                    if wait_before_tick {
+                        tokio::time::sleep(Duration::from_secs(HEARTBEAT_INTERVAL_SECS)).await;
+                    }
+                    wait_before_tick = true;
                     hb_runtime_health.advance_supervisor();
                     seq += 1;
                     // Drain incremental task counters so the directory receives
@@ -3882,10 +3893,16 @@ mod capability_tests {
 #[cfg(test)]
 mod reregister_tests {
     use super::{
-        attach_current_node_token, probe_health_models_bg, reregister,
-        update_saved_identity_credentials,
+        attach_current_node_token, heartbeat_waits_before_first_tick, probe_health_models_bg,
+        reregister, update_saved_identity_credentials,
     };
     use serde_json::json;
+
+    #[test]
+    fn empty_startup_token_recovery_has_no_initial_delay() {
+        assert!(!heartbeat_waits_before_first_tick(""));
+        assert!(heartbeat_waits_before_first_tick("registered-token"));
+    }
 
     // #404 — the re-register seam used by the self-healing heartbeat loop:
     // POST the register payload, return the fresh node_token.
