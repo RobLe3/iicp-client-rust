@@ -479,6 +479,27 @@ mod tests {
     }
 
     #[test]
+    fn tampered_ciphertext_is_rejected() {
+        let (cx_key, private_key) = generate_test_keypair();
+        let mut envelope = encrypt_payload(
+            &serde_json::json!({"private": "payload"}),
+            &cx_key,
+            "tamper-task",
+            "urn:iicp:intent:llm:chat:v1",
+        )
+        .unwrap();
+        let mut ciphertext = b64url_decode(envelope["encrypted_body"].as_str().unwrap()).unwrap();
+        ciphertext[0] ^= 0x01;
+        envelope.insert(
+            "encrypted_body".into(),
+            Value::String(b64url_encode(&ciphertext)),
+        );
+
+        let error = decrypt_payload(&envelope, &private_key).unwrap_err();
+        assert!(error.to_string().contains("wrong key or tampered"));
+    }
+
+    #[test]
     fn test_unsupported_algorithm_fails() {
         let bad_key = CxPublicKey {
             algorithm: "RSA".to_string(),

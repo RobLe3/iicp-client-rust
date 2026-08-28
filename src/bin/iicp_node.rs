@@ -6637,6 +6637,38 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn configuration_permission_denial_does_not_commit_destination() {
+        let root =
+            std::env::temp_dir().join(format!("iicp-config-permission-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&root).unwrap();
+        let destination = root.join("runtime.json");
+        let temporary = destination.with_extension(format!("tmp-{}", std::process::id()));
+        fs::write(&temporary, b"preserved").unwrap();
+        let mut permissions = fs::metadata(&temporary).unwrap().permissions();
+        #[cfg(unix)]
+        permissions.set_mode(0o400);
+        #[cfg(windows)]
+        permissions.set_readonly(true);
+        fs::set_permissions(&temporary, permissions).unwrap();
+
+        let config = iicp_client::runtime_config::RuntimeConfigV1::preset(
+            iicp_client::runtime_config::OperatingMode::Public,
+        );
+        let error = write_runtime_config_atomic(&destination, &config).unwrap_err();
+        assert!(error.contains("write staged config"));
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&temporary).unwrap(), b"preserved");
+
+        let mut permissions = fs::metadata(&temporary).unwrap().permissions();
+        #[cfg(unix)]
+        permissions.set_mode(0o600);
+        #[cfg(windows)]
+        permissions.set_readonly(false);
+        fs::set_permissions(&temporary, permissions).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[cfg(unix)]
     fn secret_migration_fixture() -> (
         std::path::PathBuf,
