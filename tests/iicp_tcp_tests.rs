@@ -397,6 +397,35 @@ async fn test_server_rejects_oversized_length_before_body_read() {
 }
 
 #[tokio::test]
+async fn test_server_rejects_conflicted_type_before_body_read() {
+    let port = start_server().await;
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let init = encode_frame(
+        MsgType::Init as u8,
+        &cbor_encode(&CborValue::Map(vec![(
+            CborValue::Integer(1.into()),
+            CborValue::Integer((FRAMING_VERSION as i64).into()),
+        )])),
+        0,
+    );
+    sock.write_all(&init).await.unwrap();
+    read_frame(&mut sock).await.unwrap();
+
+    let mut header = [0_u8; FRAME_HEADER_LEN];
+    header[..4].copy_from_slice(IICP_MAGIC);
+    header[4] = FRAMING_VERSION;
+    header[5] = 0x0b;
+    header[8..12].copy_from_slice(&(MAX_FRAME_PAYLOAD as u32).to_be_bytes());
+    sock.write_all(&header).await.unwrap();
+    let mut byte = [0_u8; 1];
+    let read = timeout(TIMEOUT, sock.read(&mut byte))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(read, 0, "conflicted type must fail before waiting for body");
+}
+
+#[tokio::test]
 async fn test_payload_bearing_frame_does_not_close_session() {
     // iter-1410 regression guard: send INIT + PING back-to-back as a single TCP
     // write. Pre-fix the session loop closed after INIT because decode() raised
@@ -468,6 +497,28 @@ async fn test_client_rejects_oversized_response_header_before_body_read() {
     assert!(error
         .to_string()
         .contains("response frame payload too large"));
+}
+
+#[tokio::test]
+async fn test_client_rejects_conflicted_response_type_before_body_read() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        read_frame(&mut socket).await.unwrap();
+        let mut header = [0_u8; FRAME_HEADER_LEN];
+        header[..4].copy_from_slice(IICP_MAGIC);
+        header[4] = FRAMING_VERSION;
+        header[5] = 0x0b;
+        header[8..12].copy_from_slice(&(MAX_FRAME_PAYLOAD as u32).to_be_bytes());
+        socket.write_all(&header).await.unwrap();
+    });
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    let error = client
+        .handshake()
+        .await
+        .expect_err("conflicted response type");
+    assert!(error.to_string().contains("conflicted_type"));
 }
 
 #[tokio::test]

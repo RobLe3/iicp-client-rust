@@ -2,7 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 
 use iicp_client::iicp_tcp::{
-    decode_frame, encode_frame, try_encode_frame, MsgType, FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD,
+    decode_frame, encode_frame, stable_task_message_type_error, try_encode_frame, MsgType,
+    FRAME_HEADER_LEN, MAX_FRAME_PAYLOAD,
 };
 use serde_json::Value;
 
@@ -92,4 +93,22 @@ fn native_frame_encoder_emits_the_canonical_empty_ping_vector() {
         encode_frame(MsgType::Ping as u8, &[], 0),
         hex::decode(scenario["wire_hex"].as_str().unwrap()).unwrap()
     );
+}
+
+#[test]
+fn stable_task_type_boundary_matches_canonical_vectors() {
+    let fixture = fixture();
+    for scenario in fixture["stable_task_type_scenarios"]
+        .as_array()
+        .expect("stable task type scenario array")
+    {
+        let name = scenario["name"].as_str().expect("scenario name");
+        let message_type = scenario["message_type"].as_u64().expect("message type") as u8;
+        let expected = scenario["expected"]["reason"].as_str();
+        assert_eq!(
+            stable_task_message_type_error(message_type),
+            expected,
+            "{name}"
+        );
+    }
 }

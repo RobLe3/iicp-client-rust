@@ -40,6 +40,21 @@ pub const FRAME_HEADER_LEN: usize = 12;
 /// of this limit; this matches the header's Length-field semantics.
 pub const MAX_FRAME_PAYLOAD: usize = 16 * 1024 * 1024;
 
+/// Fail-closed type-byte disposition for the stable native task profile.
+///
+/// The experimental relay keeps 0x0b/0x0c on its dedicated transport. Those
+/// bytes conflict with the inherited CONTROL/ADVERTISE registry and are never
+/// accepted by a stable task session.
+pub fn stable_task_message_type_error(msg_type: u8) -> Option<&'static str> {
+    match msg_type {
+        0x01..=0x0a | 0x0d | 0x0e => None,
+        0x00 | 0xff => Some("invalid_type"),
+        0x0b | 0x0c => Some("conflicted_type"),
+        0xf0..=0xfe => Some("unsupported_extension"),
+        _ => Some("unknown_type"),
+    }
+}
+
 /// IICP message type codes (spec/iicp-framing.md §3, 0x01–0x0E).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -632,6 +647,10 @@ impl IicpTcpServer {
             }
             if &buf[0..4] != IICP_MAGIC {
                 warn!("Mid-stream magic drift — closing");
+                return Ok(());
+            }
+            if let Some(reason) = stable_task_message_type_error(buf[5]) {
+                warn!("Rejected native task frame type 0x{:02x}: {reason}", buf[5]);
                 return Ok(());
             }
             let payload_len = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
@@ -1445,6 +1464,11 @@ impl IicpTcpClient {
             )));
         }
         let mt = head[5];
+        if let Some(reason) = stable_task_message_type_error(mt) {
+            return Err(IicpTcpClientError::Protocol(format!(
+                "rejected native task frame type 0x{mt:02x}: {reason}"
+            )));
+        }
         let payload_len = u32::from_be_bytes(head[8..12].try_into().unwrap()) as usize;
         if payload_len > MAX_FRAME_PAYLOAD {
             return Err(IicpTcpClientError::Protocol(format!(
