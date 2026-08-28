@@ -96,7 +96,7 @@ pub struct DetectNatOptions {
     pub upnp_lease_seconds: u32,
     pub timeout: Duration,
     pub external_ip_probe_url: Option<String>,
-    /// spec/iicp-dir.md v0.7.0 — native IICP TCP port (default 9484).
+    /// Optional experimental native IICP TCP port. `None` is the stable default.
     pub transport_port: Option<u16>,
     /// ADR-043 §4 — run detect_ipv6() in parallel to the v4 path. Default true.
     pub detect_v6: bool,
@@ -111,7 +111,7 @@ impl Default for DetectNatOptions {
             upnp_lease_seconds: 3600,
             timeout: Duration::from_secs(10),
             external_ip_probe_url: None,
-            transport_port: Some(9484),
+            transport_port: None,
             detect_v6: true,
         }
     }

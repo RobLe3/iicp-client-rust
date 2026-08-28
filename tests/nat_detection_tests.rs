@@ -14,6 +14,11 @@ use std::time::Duration;
 
 use iicp_client::nat_detection::{detect_nat, looks_routable, DetectNatOptions, TransportMethod};
 
+#[test]
+fn default_detection_does_not_request_an_experimental_native_mapping() {
+    assert_eq!(DetectNatOptions::default().transport_port, None);
+}
+
 // ── looks_routable ──────────────────────────────────────────────────────────
 
 #[test]

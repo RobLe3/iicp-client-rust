@@ -479,10 +479,10 @@ pub struct NodeConfig {
     pub tokens_per_min: u32,
     /// Per-request token cap declared on the capability object (`capabilities[].max_tokens`).
     pub max_tokens: u32,
-    /// Optional native IICP binary endpoint (spec/iicp-dir.md v0.7.0).
-    /// Scheme MUST be `iicp://` (plaintext) or `iicpsec://` (TLS).
-    /// Default IICP port is 9484 (ADR-040). When set, the directory persists it
-    /// and clients SHOULD prefer it over `endpoint` for task CALLs.
+    /// Experimental native IICP endpoint (ADR-040), disabled by default.
+    /// `iicp://` is plaintext development use; `iicpsec://` requires a real
+    /// native TLS terminator. Port 9484 is an unassigned project convention.
+    /// When set, the directory persists it for explicitly enabled peers.
     pub transport_endpoint: Option<String>,
     /// #331 Phase A.1 / ADR-041 — NAT-traversal observability fields surfaced
     /// to the directory in the register payload. Populated by
@@ -649,23 +649,19 @@ pub struct TaskRequest {
     pub _trace: Option<Value>,
 }
 
-/// #457 / ADR-040 — derive the native binary `transport_endpoint` from the HTTP `endpoint`.
-/// They share one host:port (serve() multiplexes both planes on one socket via first-byte
-/// detection), so the native URI is the same authority with the `iicp` scheme (`iicpsec`
-/// for TLS). Authority only — any path on the HTTP endpoint is dropped. Returns None if the
-/// endpoint is not http(s).
+/// Derive the experimental plaintext native `transport_endpoint` from a direct HTTP endpoint.
+///
+/// The maintained server has no native TLS terminator. An HTTPS URL may name an
+/// HTTP reverse proxy or tunnel that cannot forward the binary protocol, so it
+/// must never be rewritten to `iicpsec://` automatically. Authority only — any
+/// path on the HTTP endpoint is dropped.
 pub fn derive_native_endpoint(endpoint: &str) -> Option<String> {
-    let (scheme, rest) = if let Some(r) = endpoint.strip_prefix("http://") {
-        ("iicp", r)
-    } else {
-        let r = endpoint.strip_prefix("https://")?;
-        ("iicpsec", r)
-    };
+    let rest = endpoint.strip_prefix("http://")?;
     let authority = rest.split('/').next().unwrap_or(rest);
     if authority.is_empty() {
         return None;
     }
-    Some(format!("{scheme}://{authority}"))
+    Some(format!("iicp://{authority}"))
 }
 
 #[derive(Debug, Serialize)]
@@ -2042,8 +2038,9 @@ impl IicpNode {
         self.cfg.relay_worker_endpoint = Some(endpoint);
     }
 
-    /// #457 / ADR-040 — set the native binary `transport_endpoint` advertised at register
-    /// (the single-port multiplexer serves it on the same socket as the HTTP endpoint).
+    /// Explicitly enable the experimental native binary listener and advertise
+    /// its endpoint at registration. Plaintext `iicp://` is development-only
+    /// and excluded from the coordinated stable support baseline.
     pub fn set_transport_endpoint(&mut self, endpoint: String) {
         self.cfg.transport_endpoint = Some(endpoint);
     }
@@ -2530,6 +2527,11 @@ impl IicpNode {
         Fut: std::future::Future<Output = Result<Value>> + Send + 'static,
     {
         let handler: TaskHandlerFn = Arc::new(move |req| Box::pin(handler(req)));
+        // Merely compiling the experimental transport must not mount it on a
+        // public listener. A configured transport_endpoint is the explicit
+        // opt-in and is also the only state registration can advertise.
+        #[cfg(feature = "iicp-tcp")]
+        let experimental_native_enabled = self.cfg.transport_endpoint.is_some();
         // Clone before handler is potentially moved into the relay worker closure (iicp-tcp only).
         #[cfg(feature = "iicp-tcp")]
         let handler_for_relay = Arc::clone(&handler);
@@ -3522,92 +3524,91 @@ impl IicpNode {
             });
         }
 
-        // #457 / ADR-040 — single-port multiplexer: the HTTP control plane and the native
-        // IICP binary transport share ONE socket. The public listener peeks the first 4
-        // bytes of each connection — the IICP frame magic "IICP" routes to the native
-        // handler (the SAME backend task handler as HTTP), anything else is spliced to the
-        // real axum server on an internal loopback listener. One socket ⇒ one pinhole ⇒
-        // native is reachable exactly when HTTP is (advertise-when-reachable); a CGNAT node
-        // needs no second hole. (axum 0.7 serve() takes a concrete TcpListener, so the HTTP
-        // side runs unmodified behind a loopback splice — no client-IP use in handlers.)
+        // Experimental single-port multiplexer. It is mounted only when the
+        // operator explicitly configured transport_endpoint; ordinary and
+        // stable-candidate nodes remain HTTP-only even when the feature was
+        // compiled for compatibility or relay experiments.
         #[cfg(feature = "iicp-tcp")]
         {
-            let native = crate::iicp_tcp::IicpTcpServer::new(&bind_host, addr.port())
-                .with_node_id(self.cfg.node_id.clone())
-                .with_handler(Arc::new(move |t: crate::iicp_tcp::TcpTask| {
-                    let h = Arc::clone(&handler_for_native);
-                    Box::pin(async move {
-                        let req = TaskRequest {
-                            task_id: t.task_id,
-                            intent: t.intent,
-                            payload: t.payload,
-                            iicp_conf: None,
-                            cx_response_encryption: None,
-                            constraints: None,
-                            auth: None,
-                            nonce: None,
-                            source_node_id: None,
-                            _trace: None,
-                        };
-                        h(req)
-                            .await
-                            .unwrap_or_else(|e| json!({"error": e.to_string()}))
-                    })
-                        as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
-                }));
+            if experimental_native_enabled {
+                tracing::warn!(
+                    "experimental plaintext native TCP enabled; excluded from stable and production claims"
+                );
+                let native = crate::iicp_tcp::IicpTcpServer::new(&bind_host, addr.port())
+                    .with_node_id(self.cfg.node_id.clone())
+                    .with_handler(Arc::new(move |t: crate::iicp_tcp::TcpTask| {
+                        let h = Arc::clone(&handler_for_native);
+                        Box::pin(async move {
+                            let req = TaskRequest {
+                                task_id: t.task_id,
+                                intent: t.intent,
+                                payload: t.payload,
+                                iicp_conf: None,
+                                cx_response_encryption: None,
+                                constraints: None,
+                                auth: None,
+                                nonce: None,
+                                source_node_id: None,
+                                _trace: None,
+                            };
+                            h(req)
+                                .await
+                                .unwrap_or_else(|e| json!({"error": e.to_string()}))
+                        })
+                            as std::pin::Pin<Box<dyn std::future::Future<Output = Value> + Send>>
+                    }));
 
-            let internal = TcpListener::bind("127.0.0.1:0")
-                .await
-                .map_err(|e| IicpError::Node(e.to_string()))?;
-            let internal_addr = internal
-                .local_addr()
-                .map_err(|e| IicpError::Node(e.to_string()))?;
-            tokio::spawn(async move {
-                let _ = axum::serve(internal, app).await;
-            });
-
-            loop {
-                let (stream, _peer) = match listener.accept().await {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let native = native.clone();
+                let internal = TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .map_err(|e| IicpError::Node(e.to_string()))?;
+                let internal_addr = internal
+                    .local_addr()
+                    .map_err(|e| IicpError::Node(e.to_string()))?;
+                let http_app = app.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 4];
-                    let mut got = 0usize;
-                    // Peek (non-consuming) until the 4-byte prefix arrives; the chosen
-                    // consumer then parses from the start. Bounded so a stalled client
-                    // can't pin the task.
-                    for _ in 0..20 {
-                        match stream.peek(&mut buf).await {
-                            Ok(n) => {
-                                got = n;
-                                if n >= 4 {
-                                    break;
-                                }
-                            }
-                            Err(_) => return,
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                    }
-                    if got >= 4 && &buf == crate::iicp_tcp::IICP_MAGIC {
-                        let _ = native.handle_connection(stream).await;
-                    } else if let Ok(mut inner) =
-                        tokio::net::TcpStream::connect(internal_addr).await
-                    {
-                        let mut stream = stream;
-                        let _ = tokio::io::copy_bidirectional(&mut stream, &mut inner).await;
-                    }
+                    let _ = axum::serve(internal, http_app).await;
                 });
+
+                loop {
+                    let (stream, _peer) = match listener.accept().await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let native = native.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4];
+                        let mut got = 0usize;
+                        // Peek (non-consuming) until the 4-byte prefix arrives; the chosen
+                        // consumer then parses from the start. Bounded so a stalled client
+                        // can't pin the task.
+                        for _ in 0..20 {
+                            match stream.peek(&mut buf).await {
+                                Ok(n) => {
+                                    got = n;
+                                    if n >= 4 {
+                                        break;
+                                    }
+                                }
+                                Err(_) => return,
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        if got >= 4 && &buf == crate::iicp_tcp::IICP_MAGIC {
+                            let _ = native.handle_connection(stream).await;
+                        } else if let Ok(mut inner) =
+                            tokio::net::TcpStream::connect(internal_addr).await
+                        {
+                            let mut stream = stream;
+                            let _ = tokio::io::copy_bidirectional(&mut stream, &mut inner).await;
+                        }
+                    });
+                }
             }
         }
 
-        #[cfg(not(feature = "iicp-tcp"))]
-        {
-            axum::serve(listener, app)
-                .await
-                .map_err(|e| IicpError::Node(e.to_string()))
-        }
+        axum::serve(listener, app)
+            .await
+            .map_err(|e| IicpError::Node(e.to_string()))
     }
 }
 

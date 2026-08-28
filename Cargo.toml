@@ -28,13 +28,15 @@ name = "iicp-node"
 path = "src/bin/iicp_node.rs"
 
 [features]
-# nat + iicp-tcp on by default so `cargo install iicp-client` ships with UPnP support
-# AND the native IICP binary transport (#457: iicp-node serve advertises iicp-native on
-# the same port as HTTP). Library consumers can opt out with --no-default-features.
+# Keep the native draft compiled for relay and compatibility experiments, but
+# iicp-node neither mounts nor advertises it without the separate explicit
+# IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1 runtime opt-in. It is outside the stable
+# and production support baseline. Library consumers can omit it with
+# --no-default-features.
 default = ["nat", "iicp-tcp", "local-discovery"]
 metrics = ["dep:prometheus"]
-# Native IICP binary transport (port 9484, spec/iicp-framing.md). Default-on (#457);
-# adds ciborium (~50KB). Pure-HTTP library consumers can drop it via --no-default-features.
+# Experimental plaintext native IICP binary transport (provisional port 9484,
+# spec/iicp-framing.md). Compilation alone never enables the node listener.
 iicp-tcp = ["dep:ciborium", "dep:futures-util", "dep:async-stream"]
 # ADR-041 UPnP NAT detection — auto-discover the public endpoint on operator
 # networks behind a UPnP-capable router.

@@ -60,6 +60,23 @@ fn env_bool(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn experimental_native_tcp_from_env() -> Result<Option<bool>, String> {
+    match env::var("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP") {
+        Ok(raw) => match raw.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" => Ok(Some(true)),
+            "0" | "false" | "no" => Ok(Some(false)),
+            _ => Err(
+                "IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP must be one of 1/true/yes or 0/false/no"
+                    .to_string(),
+            ),
+        },
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => {
+            Err("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP must contain valid UTF-8".to_string())
+        }
+    }
+}
+
 const TUNNEL_DEAD_EXIT_CODE: i32 = 75;
 const OPERATOR_HANDOFF_EXIT_CODE: i32 = 75;
 const TUNNEL_DEAD_RETRY_INITIAL: Duration = Duration::from_secs(30);
@@ -332,6 +349,7 @@ fn print_help() {
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
          \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
          \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: use a tunnel when direct IPv4/IPv6/pinhole reachability is unavailable or unverified, then relay; --no-tunnel disables tunnel fallback. Dead policy: IICP_TUNNEL_DEAD_POLICY=auto|retry|exit|log-only; generated services set IICP_SUPERVISED=1\n\
+         \x20 IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1 mounts and advertises the plaintext native TCP draft for direct development endpoints only. It is disabled by default and excluded from stable and production claims.\n\
          \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485).\n\
          \x20                            Public relays should set IICP_RELAY_REQUIRE_BIND_TICKET=1 and\n\
          \x20                            IICP_RELAY_BIND_TICKET_PUBLIC_KEY for directory-signed one-use binds.\n\
@@ -1363,6 +1381,18 @@ fn supervisor_tunnel_environment() -> Result<Vec<(&'static str, String)>, String
     }
     if let Some(value) = explicit_tunnel {
         envs.push(("IICP_TUNNEL", value.to_string()));
+    }
+    if let Some(enabled) = experimental_native_tcp_from_env()? {
+        if enabled && !cfg!(feature = "iicp-tcp") {
+            return Err(
+                "IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1 requires a build with --features iicp-tcp"
+                    .to_string(),
+            );
+        }
+        envs.push((
+            "IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP",
+            if enabled { "1" } else { "0" }.to_string(),
+        ));
     }
     Ok(envs)
 }
@@ -3456,7 +3486,7 @@ async fn check_dependencies(backend_url: &str) -> Vec<DepIssue> {
     out.push(DepIssue {
         name: "iicp-tcp".into(),
         severity: "ok",
-        message: "feature iicp-tcp compiled in (native TCP transport)".into(),
+        message: "feature compiled; native TCP remains disabled unless explicitly enabled for development and is excluded from stable/production claims".into(),
     });
     #[cfg(not(feature = "iicp-tcp"))]
     out.push(DepIssue {
@@ -4007,7 +4037,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         };
 
     // Resolve the actual listen port before NAT detection: start at the
-    // requested port (default 9484, the official IICP port) and auto-increment
+    // requested port (default 9484, the unassigned project convention) and auto-increment
     // to the next free port. Keeps one port per node (multiple models share it)
     // while N nodes on one host each get a distinct port → distinct pinhole.
     // Skipped when the operator supplies an explicit --public-endpoint.
@@ -4586,16 +4616,28 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         // probe listener dropped here; port is immediately available for serve()
     }
 
-    // #457 / ADR-040 — advertise the native IICP binary transport. serve() multiplexes it
-    // onto the SAME socket as HTTP (first-byte detection), so transport_endpoint shares the
-    // endpoint's host:port with the iicp:// scheme. Derived from the FINAL endpoint (after NAT
-    // detection); only sent when registering (skip_registration gates the non-routable case)
-    // → advertise-when-reachable. Opt out with IICP_DISABLE_NATIVE_TRANSPORT=1.
-    if !opts.skip_registration
-        && std::env::var("IICP_DISABLE_NATIVE_TRANSPORT").as_deref() != Ok("1")
-    {
+    // Native TCP is a development-only draft and is outside the coordinated
+    // stable support baseline. Compile-time availability is insufficient:
+    // the operator must opt in explicitly, and HTTPS must never be rewritten
+    // to iicpsec because this server has no native TLS terminator.
+    let experimental_native_requested = experimental_native_tcp_from_env()?.unwrap_or(false);
+    #[cfg(not(feature = "iicp-tcp"))]
+    if experimental_native_requested {
+        return Err(
+            "IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1 requires --features iicp-tcp".to_string(),
+        );
+    }
+    #[cfg(feature = "iicp-tcp")]
+    if experimental_native_requested {
         if let Some(tep) = iicp_client::node::derive_native_endpoint(&opts.public_endpoint) {
             node.set_transport_endpoint(tep);
+            eprintln!(
+                "[iicp-node] WARNING: experimental plaintext native TCP enabled; it is excluded from stable and production claims."
+            );
+        } else {
+            eprintln!(
+                "[iicp-node] experimental native TCP was requested but no direct HTTP endpoint can be derived; HTTPS/tunnel endpoints are not native TLS routes, so the native listener remains disabled."
+            );
         }
     }
 
@@ -4629,7 +4671,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // node reaches the first release carrying this updater, every future release
     // self-propagates (exact locked Cargo install + re-exec). Loop-safe + failure-isolated.
     // The Rust upgrade recompiles, so it can take a few minutes; the node keeps serving
-    // until the re-exec. Features default to the recommended `nat,iicp-tcp`.
+    // until the re-exec. Compiled features are preserved, but native TCP still
+    // requires the separate explicit development-only runtime opt-in.
     if iicp_client::updater::auto_update_enabled() {
         let current = env!("CARGO_PKG_VERSION").to_string();
         tokio::spawn(async move {
@@ -7037,6 +7080,7 @@ mod tests {
         env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
         env::remove_var("IICP_CLOUDFLARED_PATH");
         env::remove_var("IICP_TUNNEL");
+        env::remove_var("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP");
         let unit = render_launchd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert_eq!(unit.platform, "launchd");
         assert!(unit
@@ -7060,6 +7104,9 @@ mod tests {
             .content
             .contains("<key>IICP_TUNNEL_DEAD_POLICY</key><string>auto</string>"));
         assert!(unit.content.contains("<key>KeepAlive</key><true/>"));
+        assert!(!unit
+            .content
+            .contains("<key>IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP</key>"));
         assert!(!unit.content.contains("--daemon"));
     }
 
@@ -7076,6 +7123,7 @@ mod tests {
         env::remove_var("IICP_SYSTEMD_NOTIFY");
         env::remove_var("IICP_CLOUDFLARED_PATH");
         env::remove_var("IICP_TUNNEL");
+        env::remove_var("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP");
         let unit = render_systemd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert_eq!(unit.platform, "systemd");
         assert!(unit
@@ -7094,6 +7142,9 @@ mod tests {
             .content
             .contains("Environment=IICP_TUNNEL_DEAD_POLICY=auto"));
         assert!(unit.content.contains("Restart=on-failure"));
+        assert!(!unit
+            .content
+            .contains("Environment=IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP="));
         assert!(!unit.content.contains("--daemon"));
     }
 
@@ -7124,6 +7175,7 @@ mod tests {
         }
         env::set_var("IICP_CLOUDFLARED_PATH", &binary);
         env::set_var("IICP_TUNNEL", "yes");
+        env::set_var("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP", "yes");
 
         let launchd = render_launchd_service("mynode", None, "/tmp/iicp-node").unwrap();
         let systemd = render_systemd_service("mynode", None, "/tmp/iicp-node").unwrap();
@@ -7138,12 +7190,31 @@ mod tests {
             .content
             .contains(&format!("Environment=IICP_CLOUDFLARED_PATH={resolved}")));
         assert!(systemd.content.contains("Environment=IICP_TUNNEL=1"));
+        assert!(launchd
+            .content
+            .contains("<key>IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP</key><string>1</string>"));
+        assert!(systemd
+            .content
+            .contains("Environment=IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1"));
 
         env::remove_var("IICP_TUNNEL");
         let automatic = render_launchd_service("mynode", None, "/tmp/iicp-node").unwrap();
         assert!(!automatic.content.contains("<key>IICP_TUNNEL</key>"));
         env::remove_var("IICP_CLOUDFLARED_PATH");
+        env::remove_var("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn supervisor_service_refuses_invalid_experimental_native_setting() {
+        let _guard = service_env_lock();
+        env::remove_var("IICP_CLOUDFLARED_PATH");
+        env::remove_var("IICP_TUNNEL");
+        env::set_var("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP", "sometimes");
+        assert!(render_launchd_service("mynode", None, "/tmp/iicp-node")
+            .unwrap_err()
+            .contains("must be one of"));
+        env::remove_var("IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP");
     }
 
     #[test]

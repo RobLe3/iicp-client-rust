@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-//! #457 / ADR-040 — `iicp-node serve` multiplexes the HTTP control plane and the native
-//! IICP binary transport on ONE port (first-byte detection). Proves BOTH planes answer on
-//! the same socket, and that transport_endpoint derives from the HTTP endpoint.
-//!
-//! Fails without the fix: pre-#457 serve() bound only the axum HTTP server on the port, so
-//! a native IICP CALL would hit the HTTP parser and never get a RESPONSE.
+//! The native TCP draft is mounted only after an explicit transport endpoint
+//! opt-in. Ordinary nodes remain HTTP-only even when the feature is compiled.
 
 use std::net::TcpListener as StdListener;
 
@@ -27,7 +23,8 @@ async fn test_derive_native_endpoint() {
     );
     assert_eq!(
         derive_native_endpoint("https://node.example:9484").as_deref(),
-        Some("iicpsec://node.example:9484")
+        None,
+        "HTTPS does not prove that a native TLS route exists"
     );
     // Authority only — any path is dropped.
     assert_eq!(
@@ -50,6 +47,7 @@ async fn test_http_and_native_call_share_one_port() {
     );
     cfg.region = Some("test-region".into());
     cfg.model = Some("test-model".into());
+    cfg.transport_endpoint = Some(format!("iicp://127.0.0.1:{port}"));
     let node = IicpNode::new(cfg);
     let addr = format!("127.0.0.1:{port}");
     tokio::spawn(async move {
@@ -93,4 +91,47 @@ async fn test_http_and_native_call_share_one_port() {
         .await
         .expect("native CALL returned a RESPONSE over the multiplexed port");
     assert!(result.is_object(), "native CALL result is a JSON object");
+}
+
+#[cfg(feature = "iicp-tcp")]
+#[tokio::test]
+async fn test_native_call_is_not_mounted_without_explicit_endpoint() {
+    use iicp_client::iicp_tcp::IicpTcpClient;
+
+    let port = free_port();
+    let mut cfg = NodeConfig::new(
+        "http-only-node",
+        "http://test.local",
+        "urn:iicp:intent:llm:chat:v1",
+    );
+    cfg.region = Some("test-region".into());
+    cfg.model = Some("test-model".into());
+    assert!(cfg.transport_endpoint.is_none());
+    let node = IicpNode::new(cfg);
+    let addr = format!("127.0.0.1:{port}");
+    tokio::spawn(async move {
+        let _ = node
+            .serve(
+                |task| Box::pin(async move { Ok(json!({ "echo": task.payload })) }),
+                &addr,
+                None,
+            )
+            .await;
+    });
+
+    for _ in 0..40 {
+        if reqwest::get(format!("http://127.0.0.1:{port}/iicp/health"))
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let mut client = IicpTcpClient::connect("127.0.0.1", port).await.unwrap();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(2), client.handshake()).await;
+    assert!(
+        !matches!(result, Ok(Ok(()))),
+        "native handshake must not succeed without explicit transport_endpoint"
+    );
 }
