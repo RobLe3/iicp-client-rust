@@ -29,7 +29,7 @@ Or add to `Cargo.toml` directly:
 
 ```toml
 [dependencies]
-iicp-client = "0.7.109"
+iicp-client = "0.7.110"
 ```
 
 ## One-line test
@@ -37,7 +37,7 @@ iicp-client = "0.7.109"
 Install the CLI and ask the mesh:
 
 ```bash
-cargo install iicp-client --version 0.7.109 --locked
+cargo install iicp-client --version 0.7.110 --locked
 iicp-node query "Hello, mesh."
 ```
 
@@ -46,7 +46,7 @@ What good looks like:
 ```bash
 iicp-node --help       # shows query, serve, proxy, mcp-gateway, credits, ...
 which iicp-node        # points to your Cargo bin directory
-iicp-node --version    # prints iicp-node 0.7.109 or newer
+iicp-node --version    # prints iicp-node 0.7.110 or newer
 ```
 
 The query command contacts the public directory, discovers a matching live node,
@@ -210,7 +210,7 @@ let reply = client.chat(
 Existing OpenAI-compatible tools:
 
 ```bash
-cargo install iicp-client --version 0.7.109 --locked --features proxy
+cargo install iicp-client --version 0.7.110 --locked --features proxy
 iicp-node proxy
 export OPENAI_BASE_URL=http://127.0.0.1:9483/v1
 ```
@@ -220,7 +220,7 @@ base URL. Full guide: <https://iicp.network/docs/proxy>
 
 ## Keep provider nodes current
 
-The current public release line is **0.7.109**. Upgrade through your package
+The current public release line is **0.7.110**. Upgrade through your package
 manager before troubleshooting an older installation. Routing profiles can
 refuse remote dispatch before a prompt leaves the client; use `sensitive` for
 local-only work, `eu-restricted` for EU/EEA routing, or `strict-policy` when a
@@ -304,7 +304,7 @@ Run a local gateway that speaks the OpenAI, Ollama, and Anthropic HTTP APIs and 
 every request across the IICP mesh — point any tool you already use at it, no code changes.
 
 ```bash
-cargo install iicp-client --version 0.7.109 --locked --features proxy
+cargo install iicp-client --version 0.7.110 --locked --features proxy
 iicp-node proxy                       # → http://127.0.0.1:9483
 
 export OPENAI_BASE_URL=http://127.0.0.1:9483/v1   # OpenAI SDK / LangChain / Cursor / liteLLM

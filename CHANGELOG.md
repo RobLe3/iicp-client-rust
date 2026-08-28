@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.110] — 2026-08-28
+
+### Release coordination
+
+- Prepare the Rust SDK alongside the Python and TypeScript 0.7.110
+  qualification sources. No Rust runtime, package, or wire behavior changed.
+- Add a component-owned crate and vendored-offline candidate builder that keeps
+  disposable Cargo output outside the ordinary developer target directory.
+
 ## [0.7.109] — 2026-08-25
 
 ### Added — shell completion
