@@ -180,6 +180,17 @@
         "--exact"
       ]
     },
+    "dynamic-public-route-readiness": {
+      "assertion": "node::reregister_tests::empty_startup_token_recovery_has_no_initial_delay",
+      "command": [
+        "@cargo",
+        "test",
+        "--locked",
+        "node::reregister_tests::empty_startup_token_recovery_has_no_initial_delay",
+        "--",
+        "--exact"
+      ]
+    },
     "minimum-version": {
       "assertion": "minimum_rust_version_is_declared_and_candidate_remains_pre1",
       "command": [
