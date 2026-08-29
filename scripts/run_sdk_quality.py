@@ -63,6 +63,10 @@ def main() -> int:
     version = tomllib.loads(Path("Cargo.toml").read_text(encoding="utf-8"))["package"]["version"]
     try:
         require(run(["cargo", "fmt", "--all", "--", "--check"]), "format")
+        require(
+            toolchain("stable", "check", "--locked", "--no-default-features", "--lib"),
+            "transport-independent library",
+        )
         require(toolchain("stable", "clippy", "--locked", "--all-targets", "--all-features", "--", "-D", "warnings"), "Clippy")
         require(toolchain("1.86.0", "test", "--locked", "--all-features"), "Rust 1.86")
         require(toolchain("stable", "test", "--locked", "--all-features"), "stable Rust")
@@ -116,6 +120,7 @@ def main() -> int:
         "runtimes": [{"name": "1.86", "status": "pass"}, {"name": "stable", "status": "pass"}],
         "gates": {
             "static_analysis": {"status": "pass"},
+            "transport_independent_library": {"status": "pass"},
             "coverage": {"status": "pass", "percent": round(measured, 3), "minimum_percent": COVERAGE_MINIMUM},
             "dependency_audit": {"status": "pass"},
             "locked_build": {"status": "pass"},
