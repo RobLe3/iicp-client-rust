@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::{
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -33,6 +34,7 @@ use crate::effective_capability::{
     EffectiveCapability, EffectiveCapabilityAdvertisement, EFFECTIVE_CAPABILITY_SCHEMA_VERSION,
 };
 use crate::errors::{IicpError, Result};
+use crate::http_resource::{read_request_body, HttpResourceError, MAX_HTTP_TASK_BODY_BYTES};
 
 const DEFAULT_DIRECTORY: &str = "https://iicp.network/api";
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
@@ -1420,11 +1422,95 @@ async fn admit(state: &AppState, qos: &str) -> bool {
     false
 }
 
+fn task_resource_error_response(error: HttpResourceError) -> Response {
+    let body = json!({"error": {"code": error.code, "message": error.message}});
+    task_json_response(
+        StatusCode::from_u16(error.status).unwrap_or(StatusCode::BAD_REQUEST),
+        &body,
+    )
+}
+
+fn task_json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
+    let mut status = status;
+    let mut body = serde_json::to_vec(value).unwrap_or_else(|_| {
+        br#"{"error":{"code":"backend_error","message":"task response serialization failed"}}"#
+            .to_vec()
+    });
+    if body.len() > MAX_HTTP_TASK_BODY_BYTES {
+        status = StatusCode::INTERNAL_SERVER_ERROR;
+        body = format!(
+            "{{\"error\":{{\"code\":\"response_too_large\",\"message\":\"encoded task response exceeds {} bytes\"}}}}",
+            MAX_HTTP_TASK_BODY_BYTES
+        )
+        .into_bytes();
+    }
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header("Content-Length", body.len().to_string())
+        .body(Body::from(body))
+        .expect("valid task response")
+}
+
+#[cfg(test)]
+mod task_http_resource_tests {
+    use axum::body::to_bytes;
+
+    use super::*;
+
+    fn json_value_with_size(size: usize) -> Value {
+        let overhead = serde_json::to_vec(&json!({"padding": ""})).unwrap().len();
+        let value = json!({"padding": "x".repeat(size - overhead)});
+        assert_eq!(serde_json::to_vec(&value).unwrap().len(), size);
+        value
+    }
+
+    #[tokio::test]
+    async fn generated_task_response_is_bounded() {
+        let exact = task_json_response(
+            StatusCode::OK,
+            &json_value_with_size(MAX_HTTP_TASK_BODY_BYTES),
+        );
+        assert_eq!(exact.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(exact.into_body(), MAX_HTTP_TASK_BODY_BYTES)
+                .await
+                .unwrap()
+                .len(),
+            MAX_HTTP_TASK_BODY_BYTES
+        );
+
+        let oversize = task_json_response(
+            StatusCode::OK,
+            &json_value_with_size(MAX_HTTP_TASK_BODY_BYTES + 1),
+        );
+        assert_eq!(oversize.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = to_bytes(oversize.into_body(), MAX_HTTP_TASK_BODY_BYTES)
+            .await
+            .unwrap();
+        let decoded: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(decoded["error"]["code"], "response_too_large");
+    }
+}
+
 async fn task_endpoint(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Json(mut req): Json<TaskRequest>,
+    body: Body,
 ) -> Response {
+    let encoded = match read_request_body(&headers, body).await {
+        Ok(value) => value,
+        Err(error) => return task_resource_error_response(error),
+    };
+    let mut req: TaskRequest = match serde_json::from_slice(&encoded) {
+        Ok(value) => value,
+        Err(_) => {
+            return task_json_response(
+                StatusCode::BAD_REQUEST,
+                &json!({"error": {"code": "invalid_http_body", "message": "invalid JSON body"}}),
+            )
+        }
+    };
     // F4 (#524) — rate-limit browser-origin task dispatch (CORS confused-deputy
     // vector) only; non-browser callers send no Origin and are not throttled.
     if state.task_rate_limit > 0 {
@@ -1608,42 +1694,10 @@ async fn task_endpoint(
     match result {
         Ok(value) => {
             let latency_ms = started.elapsed().as_millis().min(usize::MAX as u128) as usize;
-            state.tasks_success.fetch_add(1, Ordering::Relaxed);
-            if latency_ms > 0 {
-                state
-                    .tasks_latency_total_ms
-                    .fetch_add(latency_ms, Ordering::Relaxed);
-            }
-            // TC-9c: background credit award — extract token count, snapshot credentials,
-            // and spawn a best-effort receipt POST so the task response is never delayed.
-            let hmac_key = state.node_hmac_key.read().expect("poisoned").clone();
-            if !hmac_key.is_empty() {
-                let token = state.node_token.read().expect("poisoned").clone();
-                // `value` is the handler's return value — the handler in iicp_node.rs already
-                // unwraps the backend's {"result": ...} envelope, so `value` IS the OpenAI
-                // completion response and usage lives at value["usage"], not value["result"]["usage"].
-                let tokens_used: u64 = value
-                    .get("usage")
-                    .and_then(|u| u.get("total_tokens"))
-                    .and_then(|t| t.as_u64())
-                    .unwrap_or(0);
-                tokio::spawn(post_cip_receipt(
-                    state.http.clone(),
-                    state.directory_url.clone(),
-                    token,
-                    hmac_key,
-                    state.node_id.clone(),
-                    task_id.clone(),
-                    tokens_used,
-                    value.clone(),
-                    // #488: pass requester identity so directory can detect self-query loops.
-                    querying_node_id,
-                ));
-            }
             let plain_response = json!({
                 "task_id": task_id,
                 "status": "success",
-                "result": value,
+                "result": value.clone(),
                 "generated_by_ai": true
             });
             let encrypted_response = if cx_response_encryption_required {
@@ -1658,43 +1712,92 @@ async fn task_endpoint(
             };
             let encrypted_response = match encrypted_response {
                 Ok(value) => value,
-                Err(err) => {
-                    return (
+                Err(_err) => {
+                    state.tasks_failed.fetch_add(1, Ordering::Relaxed);
+                    if latency_ms > 0 {
+                        state
+                            .tasks_latency_total_ms
+                            .fetch_add(latency_ms, Ordering::Relaxed);
+                    }
+                    return task_json_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(TaskResponse {
+                        &TaskResponse {
                             task_id,
                             status: "error".into(),
                             result: None,
                             iicp_conf_resp: None,
-                            error: Some(json!({"message": err.to_string()})),
+                            error: Some(
+                                json!({"code": "backend_error", "message": "task response encryption failed"}),
+                            ),
                             generated_by_ai: false,
-                        }),
-                    )
-                        .into_response();
+                        },
+                    );
                 }
             };
-            Json(TaskResponse {
-                task_id,
-                // Spec iicp-dir.md §task response: status ∈ {success, failure, timeout};
-                // matches the Python adapter ("success"). Was "completed" — a cross-flavour
-                // drift (spec-violating) surfaced by the first real client-inference test.
-                status: if encrypted_response.is_some() {
-                    "encrypted".into()
-                } else {
-                    "success".into()
+            let response = task_json_response(
+                StatusCode::OK,
+                &TaskResponse {
+                    task_id: task_id.clone(),
+                    // Spec iicp-dir.md §task response: status ∈ {success, failure, timeout};
+                    // matches the Python adapter ("success"). Was "completed" — a cross-flavour
+                    // drift (spec-violating) surfaced by the first real client-inference test.
+                    status: if encrypted_response.is_some() {
+                        "encrypted".into()
+                    } else {
+                        "success".into()
+                    },
+                    result: if encrypted_response.is_some() {
+                        None
+                    } else {
+                        Some(value.clone())
+                    },
+                    iicp_conf_resp: encrypted_response,
+                    error: None,
+                    generated_by_ai: true,
                 },
-                result: if encrypted_response.is_some() {
-                    None
-                } else {
-                    Some(value)
-                },
-                iicp_conf_resp: encrypted_response,
-                error: None,
-                generated_by_ai: true,
-            })
-            .into_response()
+            );
+            if response.status() != StatusCode::OK {
+                state.tasks_failed.fetch_add(1, Ordering::Relaxed);
+                if latency_ms > 0 {
+                    state
+                        .tasks_latency_total_ms
+                        .fetch_add(latency_ms, Ordering::Relaxed);
+                }
+                return response;
+            }
+
+            state.tasks_success.fetch_add(1, Ordering::Relaxed);
+            if latency_ms > 0 {
+                state
+                    .tasks_latency_total_ms
+                    .fetch_add(latency_ms, Ordering::Relaxed);
+            }
+            // TC-9c: award only a response that was encoded inside the supported
+            // boundary. A completed handler whose response cannot be delivered is
+            // a failed task, not billable completion evidence.
+            let hmac_key = state.node_hmac_key.read().expect("poisoned").clone();
+            if !hmac_key.is_empty() {
+                let token = state.node_token.read().expect("poisoned").clone();
+                let tokens_used = value
+                    .get("usage")
+                    .and_then(|usage| usage.get("total_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                tokio::spawn(post_cip_receipt(
+                    state.http.clone(),
+                    state.directory_url.clone(),
+                    token,
+                    hmac_key,
+                    state.node_id.clone(),
+                    task_id,
+                    tokens_used,
+                    value,
+                    querying_node_id,
+                ));
+            }
+            response
         }
-        Err(e) => {
+        Err(_e) => {
             let latency_ms = started.elapsed().as_millis().min(usize::MAX as u128) as usize;
             state.tasks_failed.fetch_add(1, Ordering::Relaxed);
             if latency_ms > 0 {
@@ -1702,18 +1805,19 @@ async fn task_endpoint(
                     .tasks_latency_total_ms
                     .fetch_add(latency_ms, Ordering::Relaxed);
             }
-            (
+            task_json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(TaskResponse {
+                &TaskResponse {
                     task_id,
                     status: "error".into(),
                     result: None,
                     iicp_conf_resp: None,
-                    error: Some(json!({ "message": e.to_string() })),
+                    error: Some(
+                        json!({ "code": "backend_error", "message": "task execution failed" }),
+                    ),
                     generated_by_ai: false,
-                }),
+                },
             )
-                .into_response()
         }
     }
 }

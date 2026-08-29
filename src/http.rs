@@ -7,6 +7,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::errors::{IicpError, Result};
+use crate::http_resource::{encode_request, validate_response_headers, MAX_HTTP_TASK_BODY_BYTES};
 
 /// Generate a W3C traceparent header value (SDK-06).
 /// Format: `00-<32hex>-<16hex>-01`
@@ -14,6 +15,42 @@ pub fn make_traceparent() -> String {
     let trace_id = Uuid::new_v4().simple().to_string(); // 32 hex chars
     let parent_id = &Uuid::new_v4().simple().to_string()[..16]; // 16 hex chars
     format!("00-{trace_id}-{parent_id}-01")
+}
+
+async fn decode_task_response(mut response: reqwest::Response) -> Result<Value> {
+    let status = response.status().as_u16();
+    validate_response_headers(response.headers()).map_err(|error| IicpError::Protocol {
+        code: error.code.into(),
+        message: error.message,
+        status: error.status,
+    })?;
+    let mut encoded = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if encoded.len() + chunk.len() > MAX_HTTP_TASK_BODY_BYTES {
+            return Err(IicpError::Protocol {
+                code: "response_too_large".into(),
+                message: format!(
+                    "encoded task response exceeds {} bytes",
+                    MAX_HTTP_TASK_BODY_BYTES
+                ),
+                status: 500,
+            });
+        }
+        encoded.extend_from_slice(&chunk);
+    }
+    let body: Value = serde_json::from_slice(&encoded).map_err(|_| IicpError::Protocol {
+        code: "invalid_http_body".into(),
+        message: "provider returned invalid JSON".into(),
+        status: if status >= 400 { status } else { 500 },
+    })?;
+    if status >= 400 {
+        return Err(IicpError::Protocol {
+            code: body["error"]["code"].as_str().unwrap_or("unknown").into(),
+            message: body["error"]["message"].as_str().unwrap_or("").into(),
+            status,
+        });
+    }
+    Ok(body)
 }
 
 pub(crate) struct HttpClient {
@@ -180,6 +217,11 @@ impl HttpClient {
         let tp = traceparent
             .map(|s| s.to_owned())
             .unwrap_or_else(make_traceparent);
+        let encoded_request = encode_request(body).map_err(|error| IicpError::Protocol {
+            code: error.code.into(),
+            message: error.message,
+            status: error.status,
+        })?;
         let mut current = url.to_string();
         let mut redirects = 0usize;
         let resp = loop {
@@ -200,7 +242,9 @@ impl HttpClient {
                 .build()?;
             let mut rb = pinned
                 .post(resolved.url)
-                .json(body)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::ACCEPT, "application/json")
+                .body(encoded_request.clone())
                 .header("traceparent", &tp);
             rb = match auth_override {
                 Some(t) => rb.bearer_auth(t),
@@ -245,18 +289,7 @@ impl HttpClient {
             }
             break candidate;
         };
-        let status = resp.status().as_u16();
-        let resp_body: Value = resp.json().await?;
-        if status >= 400 {
-            return Err(IicpError::Protocol {
-                code: resp_body["error"]["code"]
-                    .as_str()
-                    .unwrap_or("unknown")
-                    .into(),
-                message: resp_body["error"]["message"].as_str().unwrap_or("").into(),
-                status,
-            });
-        }
+        let resp_body = decode_task_response(resp).await?;
         Ok(serde_json::from_value(resp_body)?)
     }
 }
@@ -318,6 +351,70 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response, json!({"ok": true}));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn oversize_request_is_rejected_before_endpoint_resolution() {
+        let client = HttpClient::new(2_000, None).unwrap();
+        let overhead = serde_json::to_vec(&json!({"padding": ""})).unwrap().len();
+        let body = json!({"padding": "x".repeat(MAX_HTTP_TASK_BODY_BYTES + 1 - overhead)});
+        let error = client
+            .post_json_ct_with_policy::<_, Value>(
+                "not-a-provider-url",
+                &body,
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IicpError::Protocol { ref code, status: 413, .. } if code == "request_too_large"
+        ));
+        assert!(!error.is_transient());
+    }
+
+    #[tokio::test]
+    async fn declared_oversize_response_is_aborted_and_non_transient() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        MAX_HTTP_TASK_BODY_BYTES + 1
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        });
+        let client = HttpClient::new(2_000, None).unwrap();
+        let error = client
+            .post_json_ct_with_policy::<_, Value>(
+                &format!("http://{address}/task"),
+                &json!({}),
+                None,
+                None,
+                None,
+                Some(true),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            IicpError::Protocol { ref code, status: 500, .. } if code == "response_too_large"
+        ));
+        assert!(!error.is_transient());
         server.abort();
     }
 }

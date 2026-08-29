@@ -25,6 +25,7 @@ pub mod dispatch_ticket_trust;
 mod endpoint_security;
 mod errors;
 mod http;
+mod http_resource;
 pub mod node;
 pub mod node_log;
 mod types;
