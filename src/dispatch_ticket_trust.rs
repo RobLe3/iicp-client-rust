@@ -175,9 +175,42 @@ fn owner_only(path: &Path) -> Result<(), TrustBundleStoreError> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn owner_only(path: &Path) -> Result<(), TrustBundleStoreError> {
+    let operation = if path.is_dir() {
+        "directory-check"
+    } else {
+        "file-check"
+    };
+    crate::windows_private_path::verify(path, operation)
+        .map_err(|_| TrustBundleStoreError::Permissions)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn owner_only(_path: &Path) -> Result<(), TrustBundleStoreError> {
-    Ok(())
+    Err(TrustBundleStoreError::Permissions)
+}
+
+fn create_private_file(path: &Path) -> Result<File, TrustBundleStoreError> {
+    #[cfg(windows)]
+    {
+        // CreateNew and an explicit owner/DACL happen together. The Windows
+        // token's default file owner may otherwise be Administrators, not the
+        // current identity, even inside a correctly protected directory.
+        crate::windows_private_path::verify(path, "file-create")?;
+        Ok(OpenOptions::new().write(true).open(path)?)
+    }
+    #[cfg(not(windows))]
+    {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        Ok(options.open(path)?)
+    }
 }
 
 impl FileDispatchTrustBundleStore {
@@ -214,6 +247,10 @@ impl FileDispatchTrustBundleStore {
             .parent()
             .ok_or_else(|| TrustBundleStoreError::Corrupt("missing parent directory".into()))?;
         if !parent.exists() {
+            #[cfg(windows)]
+            crate::windows_private_path::verify(parent, "directory-create")
+                .map_err(|_| TrustBundleStoreError::Permissions)?;
+            #[cfg(not(windows))]
             fs::create_dir_all(parent)?;
             #[cfg(unix)]
             {
@@ -228,14 +265,7 @@ impl FileDispatchTrustBundleStore {
         self.prepare_directory()?;
         let deadline = Instant::now() + self.lock_timeout;
         loop {
-            let mut options = OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                options.mode(0o600);
-            }
-            match options.open(&self.lock_path) {
+            match create_private_file(&self.lock_path) {
                 Ok(mut file) => {
                     writeln!(file, "{}", std::process::id())?;
                     file.sync_all()?;
@@ -244,13 +274,15 @@ impl FileDispatchTrustBundleStore {
                         file: Some(file),
                     });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                Err(TrustBundleStoreError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
                     if Instant::now() >= deadline {
                         return Err(TrustBundleStoreError::Locked);
                     }
                     thread::sleep(Duration::from_millis(10));
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => return Err(error),
             }
         }
     }
@@ -278,14 +310,7 @@ impl FileDispatchTrustBundleStore {
             std::process::id(),
             uuid::Uuid::new_v4()
         ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&temporary)?;
+        let mut file = create_private_file(&temporary)?;
         file.write_all(&payload)?;
         file.sync_all()?;
         drop(file);
@@ -299,6 +324,11 @@ impl FileDispatchTrustBundleStore {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
         }
+        // File data is flushed before replacement on every platform. Directory
+        // handles support this additional durability barrier on Unix only,
+        // matching the identity writer's platform boundary. Windows File::open
+        // on a directory returns AccessDenied after the state already committed.
+        #[cfg(unix)]
         if let Some(parent) = self.path.parent() {
             File::open(parent)?.sync_all()?;
         }
@@ -321,6 +351,12 @@ impl TrustBundleStore for FileDispatchTrustBundleStore {
                 "trust store must be a regular file".into(),
             ));
         }
+        #[cfg(windows)]
+        owner_only(
+            self.path
+                .parent()
+                .ok_or(TrustBundleStoreError::Permissions)?,
+        )?;
         owner_only(&self.path)
             .map_err(|error| TrustBundleStoreError::Corrupt(error.to_string()))?;
         let mut raw = Vec::new();

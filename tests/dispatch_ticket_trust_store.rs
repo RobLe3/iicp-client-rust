@@ -132,7 +132,17 @@ fn corruption_orphan_temp_permissions_and_lock_fail_closed() {
 #[test]
 fn concurrent_writers_finish_at_highest_version() {
     let (root, path) = temporary_store("concurrent");
-    let store = Arc::new(FileDispatchTrustBundleStore::new(&path));
+    // This case tests serialization, not the default contention budget. Windows
+    // ACL subprocess checks exceeded two seconds in the measured LocalSystem
+    // lane; the separate zero-timeout test still verifies bounded refusal.
+    let timeout = if cfg!(windows) {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(2)
+    };
+    let store = Arc::new(FileDispatchTrustBundleStore::with_lock_timeout(
+        &path, timeout,
+    ));
     store.install(&bundle("v1"), None).unwrap();
     let barrier = Arc::new(Barrier::new(3));
     let mut handles = Vec::new();
@@ -178,5 +188,83 @@ fn symbolic_link_store_fails_closed() {
         FileDispatchTrustBundleStore::new(&path).load(),
         Err(TrustBundleStoreError::Corrupt(_))
     ));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_broadened_acl_and_junction_parent_fail_closed() {
+    use std::process::Command;
+    let (root, path) = temporary_store("acl");
+    let store = FileDispatchTrustBundleStore::new(&path);
+    store.install(&bundle("v1"), None).unwrap();
+    let original = fs::read(&path).unwrap();
+    let tool = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32/icacls.exe");
+    assert!(Command::new(&tool)
+        .arg(&path)
+        .args(["/grant", "*S-1-1-0:R"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(store.load().is_err());
+    assert!(store.install(&bundle("v2"), None).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert!(Command::new(&tool)
+        .arg(&path)
+        .args(["/remove:g", "*S-1-1-0"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(store.load().unwrap().is_some());
+    let parent = path.parent().unwrap();
+    assert!(Command::new(&tool)
+        .arg(parent)
+        .args(["/grant", "*S-1-1-0:(OI)(CI)R"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(store.load().is_err());
+    assert!(store.install(&bundle("v2"), None).is_err());
+    assert!(Command::new(&tool)
+        .arg(parent)
+        .args(["/remove:g", "*S-1-1-0"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    // A junction is available without Developer Mode or symlink privilege.
+    let alias = root.join("alias");
+    use base64::Engine as _;
+    let encode = |path: &std::path::Path| {
+        base64::engine::general_purpose::STANDARD.encode(path.to_str().unwrap())
+    };
+    let script = format!(
+        "$ErrorActionPreference='Stop'; $a=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')); $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{}')); New-Item -ItemType Junction -Path $a -Target $p | Out-Null",
+        encode(&alias), encode(parent));
+    let encoded: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let tool = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+        .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+    let junction = Command::new(tool)
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-EncodedCommand",
+            &base64::engine::general_purpose::STANDARD.encode(encoded),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        junction.status.success(),
+        "junction fixture failed: {}",
+        String::from_utf8_lossy(&junction.stderr)
+    );
+    let aliased = FileDispatchTrustBundleStore::new(alias.join("bundle.state"));
+    assert!(aliased.load().is_err());
+    assert!(aliased.install(&bundle("v2"), None).is_err());
+    fs::remove_dir(&alias).unwrap();
     fs::remove_dir_all(root).unwrap();
 }

@@ -2,7 +2,8 @@ use std::process::Command;
 
 #[test]
 fn blank_systemd_operator_record_is_valid_but_not_evidence() {
-    let output = Command::new("python3")
+    let interpreter = if cfg!(windows) { "python" } else { "python3" };
+    let output = Command::new(interpreter)
         .args(["scripts/check_systemd_operator_validation.py"])
         .output()
         .expect("validator should execute");

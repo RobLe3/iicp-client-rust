@@ -15,6 +15,15 @@
 - Make the service-generation regression fixture expect quoted Windows executable
   paths, matching the existing renderer without changing generated service behavior.
 
+### Fixed — Windows dispatch trust-store operations
+
+- Keep file-data flushing before replacement while limiting Unix directory-handle
+  flushing to Unix. The Windows durability boundary is documented explicitly.
+- Replace non-Unix permission-check success with Windows DACL verification;
+  unsupported platforms refuse unverifiable stores. Windows private directories
+  are restricted at creation and existing broad ACLs or reparse paths are refused.
+  The bounded PowerShell adapter follows the TypeScript store's ACL rules.
+
 ### Security — bounded stable HTTP task path
 
 - Enforce the protocol's 1 MiB encoded request and response boundary for
