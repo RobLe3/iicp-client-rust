@@ -10,6 +10,7 @@ import tarfile
 from pathlib import Path, PurePosixPath
 
 import pre1_artifact_common as common
+import pre1_cargo_diagnostics as diagnostics
 
 
 def cargo_environment(run_root: Path, label: str) -> dict[str, str]:
@@ -74,7 +75,7 @@ def package_and_vendor(
     root: Path, run_root: Path, package_name: str, version: str
 ) -> tuple[Path, Path, Path, str]:
     package_env = cargo_environment(run_root, "package")
-    common.run(["cargo", "package", "--locked"], root, package_env)
+    diagnostics.run(["cargo", "package", "--locked"], root, package_env)
     crate = (
         Path(package_env["CARGO_TARGET_DIR"])
         / "package"
@@ -89,7 +90,7 @@ def package_and_vendor(
     source = bundle / "source"
     shutil.copytree(extracted, source)
     vendor = bundle / "vendor"
-    common.run(
+    diagnostics.run(
         [
             "cargo",
             "vendor",
@@ -135,7 +136,7 @@ def install_and_report(
     ]
     if offline:
         argv.append("--offline")
-    common.run(argv, source if offline else root, environment)
+    diagnostics.run(argv, source if offline else root, environment)
     executable = install_root / "bin" / (binary + (".exe" if os.name == "nt" else ""))
     reported = common.output([str(executable), "--version"], source if offline else root)
     if version not in reported:
