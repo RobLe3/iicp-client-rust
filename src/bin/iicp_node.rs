@@ -7186,9 +7186,10 @@ mod tests {
         assert!(launchd
             .content
             .contains("<key>IICP_TUNNEL</key><string>1</string>"));
-        assert!(systemd
-            .content
-            .contains(&format!("Environment=IICP_CLOUDFLARED_PATH={resolved}")));
+        assert!(systemd.content.contains(&format!(
+            "Environment=IICP_CLOUDFLARED_PATH={}",
+            shell_quote(&resolved)
+        )));
         assert!(systemd.content.contains("Environment=IICP_TUNNEL=1"));
         assert!(launchd
             .content

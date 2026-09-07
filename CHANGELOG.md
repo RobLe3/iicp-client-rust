@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+### Fixed — Windows updater build boundary
+
+- Compile the node on non-Unix targets without referencing a missing re-exec
+  implementation. Automatic self-update is disabled there and its status reports
+  that boundary; explicit version checks remain available. Unsupported re-exec
+  returns an error without starting another provider process. Unix behavior is
+  unchanged.
+- Check Windows instance-lock owners using a non-inheritable process synchronization
+  handle and a zero-time wait. Confirmed absent processes permit stale-lock recovery;
+  access denial and unknown results still refuse takeover. PID file semantics are unchanged.
+- Make the service-generation regression fixture expect quoted Windows executable
+  paths, matching the existing renderer without changing generated service behavior.
+
+### Fixed — Windows dispatch trust-store operations
+
+- Keep file-data flushing before replacement while limiting Unix directory-handle
+  flushing to Unix. The Windows durability boundary is documented explicitly.
+- Replace non-Unix permission-check success with Windows DACL verification;
+  unsupported platforms refuse unverifiable stores. Windows private directories
+  are restricted at creation and existing broad ACLs or reparse paths are refused.
+  The bounded PowerShell adapter follows the TypeScript store's ACL rules.
+
 ### Security — bounded stable HTTP task path
 
 - Enforce the protocol's 1 MiB encoded request and response boundary for

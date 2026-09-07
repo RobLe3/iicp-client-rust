@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Behavior tests for #520 Quick-Tunnel escalation (rung 5) — Rust parity
 //! with iicp-client-python tests/test_tunnel.py / -typescript tunnel.test.ts.
-//! A fake `cloudflared` script stands in — no network, no Cloudflare.
+//! A tiny native fake `cloudflared` stands in — no network, no Cloudflare.
 
-use std::io::Write;
 use std::time::Duration;
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -14,24 +13,45 @@ use iicp_client::tunnel::{
 };
 
 fn fake_bin(name: &str, lifetime_secs: f64, silent: bool) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("iicp-tunnel-{}", uuid::Uuid::new_v4()));
+    // Keep the native fixture inside the existing per-test cleanup root.
+    let state =
+        std::path::PathBuf::from(std::env::var_os("IICP_TUNNEL_CREATE_STATE_FILE").unwrap());
+    let dir = state
+        .parent()
+        .unwrap()
+        .join(format!("fake-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("cloudflared");
-    let body = if silent {
-        "#!/bin/sh\nsleep 60\n".to_string()
+    let file = dir.join(if cfg!(windows) {
+        "cloudflared.exe"
+    } else {
+        "cloudflared"
+    });
+    let source = dir.join("fake.rs");
+    let output = if silent {
+        String::new()
     } else {
         format!(
-            "#!/bin/sh\necho \"INF | starting tunnel\" >&2\necho \"INF | https://{name}.trycloudflare.com\" >&2\nsleep {lifetime_secs}\n"
+            "eprintln!(\"INF | starting tunnel\"); eprintln!({:?});",
+            format!("INF | https://{name}.trycloudflare.com")
         )
     };
-    let mut f = std::fs::File::create(&file).unwrap();
-    f.write_all(body.as_bytes()).unwrap();
-    drop(f);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    std::fs::write(&source, format!(
+        "fn main() {{ {output} std::thread::sleep(std::time::Duration::from_secs_f64({lifetime_secs:?})); }}"
+    )).unwrap();
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let build = std::process::Command::new(rustc)
+        .args(["--edition=2021", "--crate-name", "iicp_fake_cloudflared"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&file)
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "native tunnel fixture must compile: {}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+
     file
 }
 

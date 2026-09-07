@@ -310,16 +310,18 @@ pub fn auto_update_decision(current: &str, latest: Option<&str>, enabled: bool) 
     }
 }
 
-/// Default-on; IICP_AUTO_UPDATE=0/false/no/off opts out.
+/// Default-on on Unix; IICP_AUTO_UPDATE=0/false/no/off opts out.
+/// Other platforms have no supported in-place re-exec and remain manual-only.
 pub fn auto_update_enabled() -> bool {
-    !matches!(
-        std::env::var("IICP_AUTO_UPDATE")
-            .unwrap_or_else(|_| "1".into())
-            .trim()
-            .to_lowercase()
-            .as_str(),
-        "0" | "false" | "no" | "off"
-    )
+    cfg!(unix)
+        && !matches!(
+            std::env::var("IICP_AUTO_UPDATE")
+                .unwrap_or_else(|_| "1".into())
+                .trim()
+                .to_lowercase()
+                .as_str(),
+            "0" | "false" | "no" | "off"
+        )
 }
 
 /// Check cadence in seconds (default 1h), floored at 5 min.
@@ -390,6 +392,16 @@ pub fn reexec() -> std::io::Error {
     std::process::Command::new(exe).args(rest).exec()
 }
 
+/// Re-exec is unavailable outside Unix. Do not spawn an overlapping provider
+/// process or pretend that an installed binary is already running.
+#[cfg(not(unix))]
+pub fn reexec() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "automatic restart is unsupported on this platform",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,6 +411,12 @@ mod tests {
 
     fn env_lock() -> &'static Mutex<()> {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn unsupported_reexec_returns_without_starting_a_process() {
+        assert_eq!(reexec().kind(), std::io::ErrorKind::Unsupported);
     }
 
     #[test]
@@ -441,13 +459,13 @@ mod tests {
     fn auto_update_enabled_env_opt_out() {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var("IICP_AUTO_UPDATE");
-        assert!(auto_update_enabled());
+        assert_eq!(auto_update_enabled(), cfg!(unix));
         for value in ["0", "false", "no", "off"] {
             std::env::set_var("IICP_AUTO_UPDATE", value);
             assert!(!auto_update_enabled());
         }
         std::env::set_var("IICP_AUTO_UPDATE", "1");
-        assert!(auto_update_enabled());
+        assert_eq!(auto_update_enabled(), cfg!(unix));
         std::env::remove_var("IICP_AUTO_UPDATE");
     }
 
@@ -475,7 +493,7 @@ mod tests {
         std::env::remove_var("IICP_AUTO_UPDATE_INTERVAL_S");
         record_update_check(Some("0.7.69".into()), None);
         let payload = auto_update_status_json();
-        assert_eq!(payload["auto_update_enabled"], true);
+        assert_eq!(payload["auto_update_enabled"], cfg!(unix));
         assert_eq!(payload["auto_update_interval_s"], 3600);
         assert_eq!(payload["sdk_latest_seen"], "0.7.69");
         assert!(payload["sdk_update_last_checked_at"].is_string());

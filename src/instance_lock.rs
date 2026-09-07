@@ -204,7 +204,41 @@ fn pid_state(pid: u32) -> ProcessState {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn windows_open_failure(pid: u32, error: u32) -> ProcessState {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    if pid != 0 && error == ERROR_INVALID_PARAMETER {
+        ProcessState::Absent
+    } else {
+        // Access denial and unknown failures must never allow lock takeover.
+        ProcessState::Indeterminate
+    }
+}
+
+#[cfg(windows)]
+fn pid_state(pid: u32) -> ProcessState {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE,
+    };
+    // SAFETY: only a non-inheritable synchronization handle is requested.
+    // A zero-time wait does not mutate the process; every valid handle is closed.
+    unsafe {
+        let handle = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if handle == 0 {
+            return windows_open_failure(pid, GetLastError());
+        }
+        let state = WaitForSingleObject(handle, 0);
+        CloseHandle(handle);
+        match state {
+            WAIT_TIMEOUT => ProcessState::Alive,
+            WAIT_OBJECT_0 => ProcessState::Absent,
+            _ => ProcessState::Indeterminate,
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn pid_state(_pid: u32) -> ProcessState {
     ProcessState::Indeterminate
 }
@@ -343,10 +377,32 @@ mod tests {
         });
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_unknown_or_protected_owners_are_not_stale() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+        assert_eq!(
+            super::windows_open_failure(42, ERROR_ACCESS_DENIED),
+            ProcessState::Indeterminate
+        );
+        assert_eq!(
+            super::windows_open_failure(42, 9999),
+            ProcessState::Indeterminate
+        );
+        assert_eq!(
+            super::windows_open_failure(0, ERROR_INVALID_PARAMETER),
+            ProcessState::Indeterminate
+        );
+        assert_eq!(
+            super::windows_open_failure(2_147_483_647, ERROR_INVALID_PARAMETER),
+            ProcessState::Absent
+        );
+    }
+
     #[test]
     fn current_pid_is_alive_and_impossible_pid_is_absent() {
         assert_eq!(pid_state(std::process::id()), ProcessState::Alive);
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert_eq!(pid_state(2_147_483_647), ProcessState::Absent);
     }
 }

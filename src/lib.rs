@@ -135,3 +135,6 @@ pub use types::{
 };
 
 pub mod cli_completion;
+
+#[cfg(windows)]
+mod windows_private_path;
