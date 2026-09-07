@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import uuid
 import hashlib
 import json
 import os
@@ -117,12 +119,60 @@ def safe_output(path: Path) -> None:
         cursor = cursor.parent
 
 
+def command_operation(argv: list[str], env: dict[str, str] | None) -> str:
+    groups = [(('--version',), 'version'), (('pytest', 'test'), 'test'),
+              (('install',), 'install'), (('vendor',), 'vendor'),
+              (('package', 'pack'), 'package'), (('build',), 'build')]
+    operation = next((label for tokens, label in groups if any(token in argv for token in tokens)), 'prepare')
+    if operation == 'install':
+        offline = '--offline' in argv or '--no-index' in argv or (env or {}).get('npm_config_offline') == 'true'
+        return 'install-offline' if offline else 'install-online'
+    return operation
+
+
+def command_step(argv: list[str], env: dict[str, str] | None = None) -> list[str]:
+    """Classify known builder argv without putting paths or values in events."""
+    name = Path(argv[0]).stem if argv else ''
+    tools = {'cargo': 'cargo', 'npm': 'npm', 'node': 'npm',
+             'python': 'python', 'python3': 'python', 'uv': 'python'}
+    return [tools.get(name, 'other'), command_operation(argv, env)]
+
+
+def emit_command_step(identity: str, command: list[str], state: str, code=None) -> None:
+    from datetime import datetime, UTC
+    import sys
+    value = {"schema": "iicp.pre1-build-step-event.v1", "step_id": identity,
+             "command": command, "state": state, "exit_code": code,
+             "observed_at": datetime.now(UTC).isoformat()}
+    try:
+        print("IICP_BUILD_STEP_EVENT " + json.dumps(value), file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass  # Optional observation cannot change native command semantics.
+
+
+@contextlib.contextmanager
+def command_observation(argv: list[str], env: dict[str, str] | None):
+    identity = uuid.uuid4().hex
+    command = command_step(argv, env)
+    emit_command_step(identity, command, "started")
+    try:
+        yield
+    except BaseException as error:
+        code = error.returncode if isinstance(error, subprocess.CalledProcessError) else None
+        emit_command_step(identity, command, "failed", code)
+        raise
+    else:
+        emit_command_step(identity, command, "success", 0)
+
+
 def run(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
-    subprocess.run(argv, cwd=cwd, env=env, check=True)
+    with command_observation(argv, env):
+        subprocess.run(argv, cwd=cwd, env=env, check=True)
 
 
 def output(argv: list[str], cwd: Path, env: dict[str, str] | None = None) -> str:
-    return subprocess.check_output(argv, cwd=cwd, env=env, text=True, stderr=subprocess.STDOUT).strip()
+    with command_observation(argv, env):
+        return subprocess.check_output(argv, cwd=cwd, env=env, text=True, stderr=subprocess.STDOUT).strip()
 
 
 def artifact(kind: str, target: str, path: Path) -> dict:
@@ -188,3 +238,66 @@ def publish_staging(staging: Path, destination: Path) -> None:
 
 def clean_failed_staging(staging: Path) -> None:
     shutil.rmtree(staging, ignore_errors=True)
+
+
+class RequiredSteps:
+    """Bounded required evidence, separate from optional command telemetry."""
+
+    def __init__(self, path, component, source_commit, target, expected):
+        import time
+        self.clock = time.monotonic
+        self.path = Path(path)
+        safe_output(self.path)
+        if not expected or len(expected) > 32 or len(set(expected)) != len(expected):
+            raise ValueError("invalid required step declaration")
+        if any(re.fullmatch(r"[a-z][a-z0-9-]{0,63}", step) is None for step in expected):
+            raise ValueError("unsafe required step identity")
+        self.value = {"schema": "iicp.pre1-required-steps.v1", "component": component,
+                      "source_commit": source_commit, "target": target,
+                      "expected": list(expected), "non_authorizing": True,
+                      "qualification_credit": 0, "steps": [
+                          {"id": step, "status": "NOT_RUN", "exit_code": None,
+                           "duration_ms": 0} for step in expected]}
+        self.persist()
+
+    def persist(self):
+        import tempfile
+        payload = (json.dumps(self.value, sort_keys=True) + "\n").encode()
+        if len(payload) > 32768:
+            raise ValueError("required step inventory exceeds bound")
+        if any(p.is_symlink() or (hasattr(p, "is_junction") and p.is_junction())
+               for p in (self.path, *self.path.parents)):
+            raise ValueError("unsafe required step path")
+        fd, name = tempfile.mkstemp(prefix=".steps-", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(name, self.path)
+        finally:
+            Path(name).unlink(missing_ok=True)
+
+    @contextlib.contextmanager
+    def step(self, identity):
+        row = next((row for row in self.value["steps"] if row["id"] == identity), None)
+        pending = next((row for row in self.value["steps"] if row["status"] != "PASS"), None)
+        if row is None or row is not pending or row["status"] != "NOT_RUN":
+            raise ValueError("unexpected, duplicate or out-of-order required step")
+        row["status"] = "INCOMPLETE"
+        self.persist()  # No work starts without its required start record.
+        started = self.clock()
+        try:
+            yield
+        except BaseException as error:
+            row.update(status="FAIL", exit_code=getattr(error, "returncode", None),
+                       duration_ms=max(0, int((self.clock() - started) * 1000)))
+            try:
+                self.persist()
+            except (OSError, ValueError):
+                pass  # Preserve original failure; durable start remains INCOMPLETE.
+            raise
+        else:
+            row.update(status="PASS", exit_code=0,
+                       duration_ms=max(0, int((self.clock() - started) * 1000)))
+            self.persist()  # Required evidence failure cannot become success.

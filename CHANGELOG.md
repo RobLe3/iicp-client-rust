@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Changed — Artifact-builder failure diagnostics
+
+- Capture bounded sanitized Cargo command and build-script failure context before
+  disposable cleanup. Preserve native failures and package identities; add a real
+  failing-build fixture and large-output regression. This improves diagnosis,
+  not the unresolved Windows custom-build result tracked in #172.
+
 ### Fixed — Windows updater build boundary
 
 - Compile the node on non-Unix targets without referencing a missing re-exec

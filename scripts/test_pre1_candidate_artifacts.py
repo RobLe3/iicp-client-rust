@@ -22,5 +22,8 @@ class Pre1CandidateArtifactBuilderTest(unittest.TestCase):
         self.assertTrue(value["non_authorizing"])
 
 
+from test_pre1_command_observation import CommandObservationTests
+
+
 if __name__ == "__main__":
     unittest.main()
