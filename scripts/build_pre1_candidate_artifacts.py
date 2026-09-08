@@ -46,6 +46,11 @@ def describe() -> dict:
     }
 
 
+def run_directory_prefix() -> str:
+    # Disposable native build paths need headroom for MSVC relative includes.
+    return "rc-" if os.name == "nt" else "iicp-pre1-rust-client-"
+
+
 def build(destination: Path, requested_target: str | None) -> dict:
     common.safe_output(destination)
     target = common.require_target(requested_target, TARGETS)
@@ -54,7 +59,7 @@ def build(destination: Path, requested_target: str | None) -> dict:
     version = package["version"]
     if package.get("rust-version") != "1.86":
         raise ValueError("Rust client MSRV differs from the qualification policy")
-    run_root = Path(tempfile.mkdtemp(prefix="iicp-pre1-rust-client-", dir=destination.parent))
+    run_root = Path(tempfile.mkdtemp(prefix=run_directory_prefix(), dir=destination.parent))
     staging = run_root / "fragment"
     staging.mkdir()
     try:

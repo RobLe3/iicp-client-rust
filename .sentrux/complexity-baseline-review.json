@@ -1,0 +1,472 @@
+{
+  "schema": "iicp.sentrux-complexity-baseline-review.v1",
+  "reviewed_at": "2026-09-08",
+  "analyzer": {
+    "name": "sentrux",
+    "version": "0.5.7"
+  },
+  "previous_baseline": {
+    "source_commit": "08a67fad7cbf36d557c0c09e79a56d596f866393",
+    "complex_function_count": 58
+  },
+  "reviewed_source_commit": "b052408c83e39597690251144076f600a6baf8a6",
+  "reviewed_complex_function_count": 64,
+  "review_rule": "Git-aware comparison of the baseline and current source found six additional classifications and one rename. Preserve max_cc=158 and all other baseline metrics. This accepts the enumerated structural inventory, not new qualification credit or a blanket baseline reset. Later increases must fail the gate.",
+  "removed_since_previous_baseline": [
+    {
+      "file": "src/client.rs",
+      "function": "submit",
+      "disposition": "Renamed to submit_internal; counted once."
+    }
+  ],
+  "current_functions": [
+    {
+      "file": "examples/systemd_watchdog_fixture.rs",
+      "function": "main",
+      "cc": 17,
+      "provenance": "4e51816af0bd7adf600990339596ee22165fe487",
+      "disposition": "Previously classified function (previous cc=17); current cc=17 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "scripts/run_pre1_qualification_case.py",
+      "function": "validate_context",
+      "cc": 28,
+      "provenance": "3cc3fd062b6fce37bba58f08fcf0e685ab054ed5",
+      "disposition": "Reviewed fail-closed source, artifact, runtime and environment bindings; existing qualification-runner regression fixtures. No Windows path patch change."
+    },
+    {
+      "file": "src/backend_stability.rs",
+      "function": "observe_backend_stability",
+      "cc": 18,
+      "provenance": "9886302e2a569c6a5832a5197977f91c4d2baac2",
+      "disposition": "Previously classified function (previous cc=18); current cc=18 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/backends/anthropic.rs",
+      "function": "invoke",
+      "cc": 16,
+      "provenance": "819813efd6815a5e963f8549b435e854878ec178",
+      "disposition": "Previously classified function (previous cc=16); current cc=16 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/backends/anthropic.rs",
+      "function": "to_anthropic_request",
+      "cc": 19,
+      "provenance": "819813efd6815a5e963f8549b435e854878ec178",
+      "disposition": "Previously classified function (previous cc=19); current cc=19 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/backends/openai_compat.rs",
+      "function": "handle_speech",
+      "cc": 17,
+      "provenance": "bd2cbbae3a330ca03b000497c24eb9f6922736c1",
+      "disposition": "Previously classified function (previous cc=17); current cc=17 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/backends/openai_compat.rs",
+      "function": "handle_task_inner",
+      "cc": 22,
+      "provenance": "bd2cbbae3a330ca03b000497c24eb9f6922736c1",
+      "disposition": "Previously classified function (previous cc=22); current cc=22 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/backends/openai_compat.rs",
+      "function": "handle_transcription",
+      "cc": 24,
+      "provenance": "bd2cbbae3a330ca03b000497c24eb9f6922736c1",
+      "disposition": "Previously classified function (previous cc=24); current cc=24 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "apply_saved_node",
+      "cc": 19,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=19); current cc=19 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "detect_backend_flavor",
+      "cc": 21,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=21); current cc=21 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "fetch_and_display_credits",
+      "cc": 20,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=20); current cc=20 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "main",
+      "cc": 51,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=42); current cc=51 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "parse_args",
+      "cc": 51,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=40); current cc=51 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_credits",
+      "cc": 38,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=38); current cc=38 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_doctor",
+      "cc": 31,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=31); current cc=31 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_healthcheck",
+      "cc": 30,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=25); current cc=30 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_mcp_gateway",
+      "cc": 80,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=80); current cc=80 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_operator",
+      "cc": 20,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=20); current cc=20 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_operator_dsr",
+      "cc": 32,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=32); current cc=32 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_operator_key",
+      "cc": 27,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=27); current cc=27 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_query",
+      "cc": 39,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=34); current cc=39 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_serve",
+      "cc": 152,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=158); current cc=152 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "run_service",
+      "cc": 42,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=39); current cc=42 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "supervisor_tunnel_environment",
+      "cc": 18,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Reviewed explicit tunnel override validation and native-transport opt-in checks; existing service-manager CLI tests. No Windows path patch change."
+    },
+    {
+      "file": "src/bin/iicp_node.rs",
+      "function": "task_handler",
+      "cc": 44,
+      "provenance": "811a21cea93afb8f31746eb725fb6f5ebf414214",
+      "disposition": "Previously classified function (previous cc=44); current cc=44 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/cli_completion.rs",
+      "function": "candidates",
+      "cc": 19,
+      "provenance": "f79b2417654799cf69a7a54cec454dacbe9603b4",
+      "disposition": "Reviewed static command/option choices and prefix filtering without network or activation effects; existing completion tests. No Windows path patch change."
+    },
+    {
+      "file": "src/client.rs",
+      "function": "discover",
+      "cc": 20,
+      "provenance": "b25291fb0c397391ebb061c693195452bfdeb9d0",
+      "disposition": "Previously classified function (previous cc=17); current cc=20 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/client.rs",
+      "function": "is_ssrf_safe",
+      "cc": 26,
+      "provenance": "b25291fb0c397391ebb061c693195452bfdeb9d0",
+      "disposition": "Previously classified function (previous cc=26); current cc=26 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/client.rs",
+      "function": "submit_internal",
+      "cc": 61,
+      "provenance": "b25291fb0c397391ebb061c693195452bfdeb9d0",
+      "disposition": "Previously classified submit function renamed by reviewed routing work; remains below unchanged max_cc. No Windows path patch change."
+    },
+    {
+      "file": "src/client.rs",
+      "function": "ticketed_candidates",
+      "cc": 29,
+      "provenance": "b25291fb0c397391ebb061c693195452bfdeb9d0",
+      "disposition": "Previously classified function (previous cc=22); current cc=29 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/dispatch_ticket_trust.rs",
+      "function": "verify_dispatch_ticket_v2",
+      "cc": 24,
+      "provenance": "61684d28ecef267302f25217e4abeaa51cb50a2b",
+      "disposition": "Previously classified function (previous cc=24); current cc=24 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/endpoint_security.rs",
+      "function": "ipv4_allowed",
+      "cc": 25,
+      "provenance": "49c179f954ec04ea24eb4a7a15d9380d928c8813",
+      "disposition": "Previously classified function (previous cc=25); current cc=25 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/iicp_tcp.rs",
+      "function": "cbor_to_json",
+      "cc": 16,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=16); current cc=16 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/iicp_tcp.rs",
+      "function": "handle_connection",
+      "cc": 23,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=17); current cc=23 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/iicp_tcp.rs",
+      "function": "on_call",
+      "cc": 32,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=32); current cc=32 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/local_directory_discovery.rs",
+      "function": "evaluate_shared_case",
+      "cc": 17,
+      "provenance": "bd029de642a4a300182af94096687374363e7a83",
+      "disposition": "Reviewed test-only deterministic fixture branching; shared local-discovery fixture cases, not another production policy engine."
+    },
+    {
+      "file": "src/local_directory_discovery.rs",
+      "function": "validate_descriptor",
+      "cc": 16,
+      "provenance": "bd029de642a4a300182af94096687374363e7a83",
+      "disposition": "Reviewed descriptor identity, role, expiry and signature prerequisites; existing local-discovery tests. This structural review is not a production-security qualification."
+    },
+    {
+      "file": "src/mcp_negotiation.rs",
+      "function": "evaluate_mcp_era",
+      "cc": 25,
+      "provenance": "26f16ec0b26b44c5e587a95fd520e5678ace940c",
+      "disposition": "Previously classified function (previous cc=25); current cc=25 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/nat_detection.rs",
+      "function": "detect_nat",
+      "cc": 33,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=33); current cc=33 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/nat_detection.rs",
+      "function": "is_non_public_ipv4",
+      "cc": 25,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=25); current cc=25 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/nat_detection.rs",
+      "function": "ranked_global_ipv6_candidates",
+      "cc": 16,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=16); current cc=16 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/nat_detection.rs",
+      "function": "try_open_v6_pinhole_for_endpoint",
+      "cc": 18,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=18); current cc=18 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/nat_detection.rs",
+      "function": "try_upnp_mapping",
+      "cc": 20,
+      "provenance": "00c1a87e02c417db71c25eca6df3c0a3978fdd02",
+      "disposition": "Previously classified function (previous cc=20); current cc=20 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/native_response_sequence.rs",
+      "function": "accept",
+      "cc": 17,
+      "provenance": "0559b53b54cf9be9909262a24db51d3b7397f618",
+      "disposition": "Previously classified function (previous cc=17); current cc=17 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/node.rs",
+      "function": "apply_nat_profile",
+      "cc": 18,
+      "provenance": "0c70d9d08db4f8d8c8d6e608f4f7890d15fad9b3",
+      "disposition": "Previously classified function (previous cc=18); current cc=18 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/node.rs",
+      "function": "build_register_payload",
+      "cc": 24,
+      "provenance": "0c70d9d08db4f8d8c8d6e608f4f7890d15fad9b3",
+      "disposition": "Previously classified function (previous cc=24); current cc=24 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/node.rs",
+      "function": "serve",
+      "cc": 104,
+      "provenance": "0c70d9d08db4f8d8c8d6e608f4f7890d15fad9b3",
+      "disposition": "Previously classified function (previous cc=96); current cc=104 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/node.rs",
+      "function": "task_endpoint",
+      "cc": 39,
+      "provenance": "0c70d9d08db4f8d8c8d6e608f4f7890d15fad9b3",
+      "disposition": "Previously classified function (previous cc=32); current cc=39 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/policy_data_handling.rs",
+      "function": "evaluate_policy_data_handling",
+      "cc": 30,
+      "provenance": "f031a3ee934184a2fd3578ecc9456aa5c1bf0b9f",
+      "disposition": "Previously classified function (previous cc=30); current cc=30 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/policy_detail_disclosure.rs",
+      "function": "evaluate_policy_detail_disclosure",
+      "cc": 20,
+      "provenance": "97492562707cc882c7dff360d81f569c732ac115",
+      "disposition": "Reviewed ordered authentication, revocation, disclosure permission and target/intent/digest binding checks; existing policy disclosure fixtures. No Windows path patch change."
+    },
+    {
+      "file": "src/proxy/mod.rs",
+      "function": "run_task",
+      "cc": 18,
+      "provenance": "42427385f26bd0bc2b74703614cf498b54142143",
+      "disposition": "Previously classified function (previous cc=16); current cc=18 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/relay_session.rs",
+      "function": "handle_relay_connection",
+      "cc": 18,
+      "provenance": "c15ac9f7918369af14505b0dc6fc3f7ed24002d3",
+      "disposition": "Previously classified function (previous cc=18); current cc=18 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/relay_worker_client.rs",
+      "function": "session",
+      "cc": 20,
+      "provenance": "c45f3a36eddddb958f9cee76e420b40c2dffb471",
+      "disposition": "Previously classified function (previous cc=20); current cc=20 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/runtime_health.rs",
+      "function": "classify_input",
+      "cc": 17,
+      "provenance": "1abbd62368c87c2538132ff567100ebac39b1651",
+      "disposition": "Previously classified function (previous cc=17); current cc=17 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/service_lifecycle_accounting.rs",
+      "function": "decide_lifecycle_accounting",
+      "cc": 37,
+      "provenance": "a76870d51a7441a1bfcf009d73ce559cbac445eb",
+      "disposition": "Previously classified function (previous cc=37); current cc=37 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/service_lifecycle_distributed.rs",
+      "function": "evaluate_distributed_lifecycle",
+      "cc": 31,
+      "provenance": "40e0249d41e75abaaf5f1db1aa099998a0edbc2a",
+      "disposition": "Previously classified function (previous cc=31); current cc=31 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/service_lifecycle_identity.rs",
+      "function": "evaluate_lifecycle_identity",
+      "cc": 19,
+      "provenance": "a1c88608b74a843eae494182177d89df77b60068",
+      "disposition": "Previously classified function (previous cc=19); current cc=19 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/tunnel.rs",
+      "function": "spawn_and_parse",
+      "cc": 21,
+      "provenance": "ac5b0738bad106a8f2f448828d70aa7af1b53b3e",
+      "disposition": "Previously classified function (previous cc=21); current cc=21 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/tunnel.rs",
+      "function": "watch_elastic_with_probe_and_dead_policy",
+      "cc": 22,
+      "provenance": "ac5b0738bad106a8f2f448828d70aa7af1b53b3e",
+      "disposition": "Previously classified function (previous cc=22); current cc=22 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "src/tunnel.rs",
+      "function": "with_temp_rate_limit_state",
+      "cc": 19,
+      "provenance": "ac5b0738bad106a8f2f448828d70aa7af1b53b3e",
+      "disposition": "Previously classified function (previous cc=19); current cc=19 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "tests/cip_arcp_fixture.rs",
+      "function": "cip",
+      "cc": 20,
+      "provenance": "0b4abe22ad7221e4f539290e4c169eed92939ca2",
+      "disposition": "Previously classified function (previous cc=20); current cc=20 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "tests/cip_arcp_fixture.rs",
+      "function": "evaluate",
+      "cc": 24,
+      "provenance": "0b4abe22ad7221e4f539290e4c169eed92939ca2",
+      "disposition": "Previously classified function (previous cc=24); current cc=24 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "tests/cip_arcp_fixture.rs",
+      "function": "schema_valid",
+      "cc": 18,
+      "provenance": "0b4abe22ad7221e4f539290e4c169eed92939ca2",
+      "disposition": "Previously classified function (previous cc=18); current cc=18 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    },
+    {
+      "file": "tests/service_lifecycle.rs",
+      "function": "task_scoped_authorizer_conceals_cross_principal_access",
+      "cc": 21,
+      "provenance": "99a754a9d49c29b32aa641edc5b4bad2e71cdfd0",
+      "disposition": "Previously classified function (previous cc=21); current cc=21 remains below unchanged max_cc=158; unchanged by Windows path patch."
+    }
+  ]
+}
