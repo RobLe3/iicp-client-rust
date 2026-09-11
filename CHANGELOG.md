@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Fixed — bounded Directory connection recovery
+
+- Retry dispatch-ticket requests only when the failure is positively classified
+  as connection establishment failure. The retry budget and delay are finite;
+  response timeouts and HTTP failures are never replayed. This tolerates a bad
+  path to one address of a multi-address Directory without weakening ticket
+  verification or policy-before-ranking behavior.
+
 ### Changed — Artifact-builder failure diagnostics
 
 - Capture bounded sanitized Cargo command and build-script failure context before
