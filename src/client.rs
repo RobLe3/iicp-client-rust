@@ -31,6 +31,35 @@ static INTENT_RE: LazyLock<Regex> =
 
 const MAX_TIMEOUT_MS: u64 = 120_000;
 const MAX_RETRIES: u32 = 3;
+const DIRECTORY_CONNECT_ATTEMPTS: u32 = 3;
+
+fn directory_connect_retry_delay(attempt: u32, is_connect_error: bool) -> Option<Duration> {
+    (is_connect_error && attempt + 1 < DIRECTORY_CONNECT_ATTEMPTS)
+        .then(|| Duration::from_millis(100 * u64::from(attempt + 1)))
+}
+
+#[cfg(test)]
+mod directory_connect_retry_tests {
+    use super::{directory_connect_retry_delay, DIRECTORY_CONNECT_ATTEMPTS};
+    use std::time::Duration;
+
+    #[test]
+    fn retries_only_connect_failures_with_a_finite_budget() {
+        assert_eq!(
+            directory_connect_retry_delay(0, true),
+            Some(Duration::from_millis(100))
+        );
+        assert_eq!(
+            directory_connect_retry_delay(1, true),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(
+            directory_connect_retry_delay(DIRECTORY_CONNECT_ATTEMPTS - 1, true),
+            None
+        );
+        assert_eq!(directory_connect_retry_delay(0, false), None);
+    }
+}
 
 enum TicketRouteError {
     LegacyRequired,
@@ -668,15 +697,31 @@ impl IicpClient {
                     .await
                     .map_err(TicketRouteError::Iicp)?
             } else {
-                let response = self
-                    .http
-                    .inner()
-                    .post(&url)
-                    .header("traceparent", traceparent)
-                    .json(&request)
-                    .send()
-                    .await
-                    .map_err(|e| TicketRouteError::Iicp(IicpError::Http(e)))?;
+                let response = {
+                    let mut attempt = 0;
+                    loop {
+                        match self
+                            .http
+                            .inner()
+                            .post(&url)
+                            .header("traceparent", traceparent)
+                            .json(&request)
+                            .send()
+                            .await
+                        {
+                            Ok(response) => break response,
+                            Err(error) => {
+                                let Some(delay) =
+                                    directory_connect_retry_delay(attempt, error.is_connect())
+                                else {
+                                    return Err(TicketRouteError::Iicp(IicpError::Http(error)));
+                                };
+                                tokio::time::sleep(delay).await;
+                                attempt += 1;
+                            }
+                        }
+                    }
+                };
                 let status = response.status().as_u16();
                 if matches!(status, 405 | 501) {
                     return Err(TicketRouteError::LegacyRequired);
