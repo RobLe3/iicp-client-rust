@@ -640,13 +640,7 @@ def rust_package_command(root, context, component, artifact_root, argv, env, val
     # Cargo can otherwise discover unrelated configs above the run workspace.
     if workspace.parent != home or installed.parent != workspace:
         raise ValueError("Rust package workspace layout differs")
-    for ancestor in (home, *home.parents):
-        for name in ("config", "config.toml"):
-            path = ancestor / ".cargo" / name
-            if path.exists() or path.is_symlink():
-                raise ValueError("Rust inherited Cargo configuration is forbidden")
-    if (cargo_home / "config").exists() or (cargo_home / "config.toml").exists():
-        raise ValueError("Rust inherited Cargo home configuration is forbidden")
+    reject_inherited_cargo_config(home, cargo_home)
     argv = [*argv[:3], "--offline", *argv[3:]]
     return argv, env, installed, {"value": value, "artifact": artifact, "vendor_artifact": vendor}
 
@@ -674,16 +668,30 @@ def extract_rust_prefix(artifact: Path, prefix: str, destination: Path) -> None:
         for row in archive:
             if not row.isfile() or not row.name.startswith(prefix):
                 continue
-            relative = row.name.removeprefix(prefix)
-            if Path(relative).is_absolute() or any(p in {"", ".", ".."} for p in relative.split("/")):
-                raise ValueError("Rust extraction path is unsafe")
-            path = destination / relative
-            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            safe_path(path.parent)
-            handle = archive.extractfile(row)
-            if handle is None:
-                raise ValueError("Rust extraction member is unavailable")
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700 if row.mode & 0o111 else 0o600)
-            with os.fdopen(fd, "wb") as output:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    output.write(chunk)
+            extract_rust_file(archive, row, prefix, destination)
+
+
+def extract_rust_file(archive, row, prefix, destination):
+    relative = row.name.removeprefix(prefix)
+    if Path(relative).is_absolute() or any(p in {"", ".", ".."} for p in relative.split("/")):
+        raise ValueError("Rust extraction path is unsafe")
+    path = destination / relative
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    safe_path(path.parent)
+    handle = archive.extractfile(row)
+    if handle is None:
+        raise ValueError("Rust extraction member is unavailable")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o700 if row.mode & 0o111 else 0o600)
+    with os.fdopen(fd, "wb") as output:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            output.write(chunk)
+
+
+def reject_inherited_cargo_config(home, cargo_home):
+    for ancestor in (home, *home.parents):
+        for name in ("config", "config.toml"):
+            path = ancestor / ".cargo" / name
+            if path.exists() or path.is_symlink():
+                raise ValueError("Rust inherited Cargo configuration is forbidden")
+    if (cargo_home / "config").exists() or (cargo_home / "config.toml").exists():
+        raise ValueError("Rust inherited Cargo home configuration is forbidden")
