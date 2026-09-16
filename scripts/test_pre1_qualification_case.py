@@ -87,6 +87,15 @@ class DriverContractTests(unittest.TestCase):
             )
         )
 
+    def test_rust_execution_refuses_zero_skipped_failed_and_duplicate_assertions(self):
+        good = "test exact ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;"
+        self.assertTrue(module.exact_assertion_passed(good, "exact"))
+        for output in ("", good.replace("1 passed", "0 passed"),
+                       good.replace("0 ignored", "1 ignored"),
+                       good.replace("0 failed", "1 failed"), good + "\n" + good):
+            with self.subTest(output=output):
+                self.assertFalse(module.exact_assertion_passed(output, "exact"))
+
     def test_every_scenario_has_one_unique_exact_assertion(self) -> None:
         self.assertEqual(set(module.SCENARIO_CASES), set(module.SCENARIO_COMMANDS))
         assertions = [row["assertion"] for row in module.SCENARIO_CASES.values()]
