@@ -17,6 +17,106 @@ import pre1_package_execution as adapter
 
 
 class PackageExecutionTests(unittest.TestCase):
+    def management_artifact(self):
+        self.workspace = self.home / "run/management"
+        self.workspace.mkdir(parents=True)
+        (self.root / "qualification").mkdir(exist_ok=True)
+        case = {"assertion": "test_fixture", "command": ["@cargo", "test", "--locked", "--test", "fixture", "test_fixture", "--", "--exact"]}
+        (self.root / "qualification/pre1-cases.json").write_text(json.dumps({
+            "schema": "iicp.pre1-component-case-map.v2", "component": "management",
+            "support": case, "scenarios": {}}))
+        (self.root / "tests/fixture.rs").write_text("#[test]\nfn test_fixture() { assert!(true); }\n")
+        subprocess.run(["git", "add", "."], cwd=self.root, check=True)
+        artifact = self.home / "iicp-management-core-0.11.0.crate"
+        files = {"Cargo.toml": b'[package]\nname = "iicp-management-core"\nversion = "0.11.0"\nautotests = false\n[lib]\npath = "src/lib.rs"\n',
+                 "Cargo.lock": b'unchanged lock', "src/lib.rs": b'pub fn frozen() {}',
+                 "contracts/test.json": b'{"frozen":true}'}
+        with tarfile.open(artifact, "w:gz") as archive:
+            for name, data in files.items():
+                row = tarfile.TarInfo(artifact.stem + "/" + name)
+                row.size = len(data)
+                archive.addfile(row, io.BytesIO(data))
+        return artifact
+
+    def test_management_manifest_bridge_requires_actual_candidate_and_retains_legacy(self):
+        source = '    let Some(path) = env::var_os("IICP_RELEASE_MANIFEST") else {\n        return;\n    };\n    let manifest: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();\nassert_eq!(manifest["authorizes_deployment"], false);' 
+        staged = adapter.management_assertions("tests/release_manifest.rs", source)
+        self.assertIn('component["source_commit"]', staged)
+        self.assertIn('expect("release manifest required")', staged)
+        self.assertIn('assert_eq!(manifest["authorizes_deployment"], false)', staged)
+        self.assertIn('"management_service", "directory_authority"', staged)
+        with self.assertRaisesRegex(ValueError, "fixture shape differs"):
+            adapter.management_assertions("tests/release_manifest.rs", "unexpected")
+
+    def test_management_consumer_keeps_frozen_source_and_lock(self):
+        artifact = self.management_artifact()
+        value = adapter.stage_management_consumer(self.root, artifact, self.workspace)
+        consumer = adapter.validate_management_consumer(self.root, artifact, self.workspace, value)
+        self.assertFalse(value["qualification_credit"])
+        self.assertEqual((self.workspace / "payload/src/lib.rs").read_bytes(), b'pub fn frozen() {}')
+        self.assertFalse((consumer / "src").exists())
+        self.assertEqual((consumer / "Cargo.lock").read_bytes(), b'unchanged lock')
+        self.assertIn('path = "../payload/src/lib.rs"', (consumer / "Cargo.toml").read_text())
+        self.assertIn('name = "fixture"', (consumer / "Cargo.toml").read_text())
+        self.assertEqual((consumer / "tests/fixture.rs").read_bytes(), (self.root / "tests/fixture.rs").read_bytes())
+
+    def test_management_rehashed_consumer_tamper_fails(self):
+        artifact = self.management_artifact()
+        value = adapter.stage_management_consumer(self.root, artifact, self.workspace)
+        (self.workspace / "consumer/tests/fixture.rs").write_text("weakened assertion")
+        value["consumer_sha256"] = adapter.digest(adapter.tree(self.workspace / "consumer"))
+        with self.assertRaisesRegex(ValueError, "reviewed fixtures changed"):
+            adapter.validate_management_consumer(self.root, artifact, self.workspace, value)
+
+    def test_management_runtime_tamper_and_extra_files_fail(self):
+        artifact = self.management_artifact()
+        value = adapter.stage_management_consumer(self.root, artifact, self.workspace)
+        (self.workspace / "payload/src/lib.rs").write_text("checkout fallback")
+        value["payload_sha256"] = adapter.digest(adapter.tree(self.workspace / "payload"))
+        with self.assertRaises(ValueError):
+            adapter.validate_management_consumer(self.root, artifact, self.workspace, value)
+
+    def test_management_untracked_or_unsafe_test_name_fails(self):
+        artifact = self.management_artifact()
+        mapping = self.root / "qualification/pre1-cases.json"
+        value = json.loads(mapping.read_text())
+        for name in ["../escape", "untracked"]:
+            value["support"]["command"][4] = name
+            mapping.write_text(json.dumps(value))
+            if (self.workspace / "payload").exists():
+                import shutil
+                shutil.rmtree(self.workspace / "payload")
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                adapter.stage_management_consumer(self.root, artifact, self.workspace)
+
+    def test_management_staging_refuses_nonempty_or_outside_home(self):
+        artifact = self.management_artifact()
+        (self.workspace / "preserved").write_text("user work")
+        with self.assertRaises(ValueError):
+            adapter.stage_management_consumer(self.root, artifact, self.workspace)
+        self.assertEqual((self.workspace / "preserved").read_text(), "user work")
+
+    def test_management_binding_is_context_bound_and_offline(self):
+        artifact = self.management_artifact()
+        adapter.stage_management_consumer(self.root, artifact, self.workspace)
+        (self.workspace / "vendor").mkdir()
+        (self.workspace / "vendor/dependency").write_text("locked dependency")
+        (self.workspace / ".cargo").mkdir()
+        config = ('[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
+                  '[source.vendored-sources]\ndirectory = ' + json.dumps(str(self.workspace / "vendor")) + '\n')
+        (self.workspace / ".cargo/config.toml").write_text(config)
+        installed = self.workspace / "consumer"
+        value = adapter.create_binding(self.root, self.workspace, installed, artifact,
+            "management", "rust-1.98.0", "macos-arm64", self.bindings)
+        context = {**self.context, "component": "management", "runtime": "rust-1.98.0"}
+        self.assertEqual(adapter.validate_binding(value, context, artifact, self.root), installed)
+        self.assertEqual(adapter.make_case_proof(value, context, "test_fixture", 0, "test-run")["schema"], "iicp.pre1-packaged-case-proof.v2")
+        with self.assertRaises(ValueError):
+            adapter.validate_binding(value, {**context, "target": "wrong"}, artifact, self.root)
+        (self.workspace / ".cargo/config.toml").write_text(config + '\n[build]\nrustc-wrapper = "fake"\n')
+        with self.assertRaisesRegex(ValueError, "offline Cargo configuration differs"):
+            adapter.validate_binding(value, context, artifact, self.root)
+
     def test_lifecycle_child_preserves_installed_import_environment(self):
         source = '    env = {**os.environ, "PYTHONPATH": str(Path(__file__).parents[1] / "src")}'
         bridged = adapter.packaged_assertions("tests/test_service_lifecycle.py", source)

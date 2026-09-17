@@ -299,6 +299,8 @@ def validate_immutable_bindings(bindings: dict) -> None:
 def create_binding(root: Path, workspace: Path, installed: Path, artifact: Path,
                    component: str, runtime: str, target: str, bindings: dict,
                    vendor_artifact: Path | None = None) -> dict:
+    if component == "management":
+        return create_management_binding(root, workspace, installed, artifact, runtime, target, bindings)
     if component == "client-rust":
         return create_rust_binding(root, workspace, installed, artifact, runtime, target, bindings, vendor_artifact)
     validate_immutable_bindings(bindings)
@@ -341,6 +343,8 @@ def validate_binding_context(value: dict, context: dict) -> None:
 
 def validate_binding(value: dict, context: dict, artifact: Path, root: Path,
                      vendor_artifact: Path | None = None) -> Path:
+    if context["component"] == "management":
+        return validate_management_binding(value, context, artifact, root)
     if context["component"] == "client-rust":
         return validate_rust_binding(value, context, artifact, root, vendor_artifact)
     validate_binding_identity(value)
@@ -375,6 +379,21 @@ def package_command(root: Path, context: dict, component_manifest: dict,
         raise ValueError("package execution binding pin differs")
     if context["component"] == "client-rust":
         return rust_package_command(root, context, component_manifest, artifact_root, argv, env, value)
+    if context["component"] == "management":
+        rows = [r for r in component_manifest["artifacts"] if r["kind"] == "crate"]
+        if len(rows) != 1:
+            raise ValueError("Management candidate crate is ambiguous")
+        artifact = safe_path(artifact_root / "management" / rows[0]["name"])
+        if file_digest(artifact) != rows[0]["sha256"]:
+            raise ValueError("Management candidate crate digest differs")
+        consumer = validate_management_binding(value, context, artifact, root)
+        home = safe_path(Path(env["HOME"]))
+        cargo_home = home / "rust-cargo-home"
+        cargo_home.mkdir(mode=0o700, exist_ok=True)
+        reject_inherited_cargo_config(home, safe_path(cargo_home))
+        env = {**env, "CARGO_HOME": str(cargo_home), "CARGO_NET_OFFLINE": "true", "CARGO_INCREMENTAL": "0"}
+        argv = [*argv[:3], "--offline", *argv[3:]]
+        return argv, env, consumer, {"value": value, "artifact": artifact, "vendor_artifact": None}
     kind = "wheel" if context["component"] == "client-python" else "npm-tarball"
     artifacts = [r for r in component_manifest["artifacts"] if r["kind"] == kind]
     if len(artifacts) != 1:
@@ -695,3 +714,168 @@ def reject_inherited_cargo_config(home, cargo_home):
                 raise ValueError("Rust inherited Cargo configuration is forbidden")
     if (cargo_home / "config").exists() or (cargo_home / "config.toml").exists():
         raise ValueError("Rust inherited Cargo home configuration is forbidden")
+
+
+def management_consumer_files(root: Path, payload: Path) -> dict[str, bytes]:
+    """Keep frozen runtime source separate from reviewed external assertions.
+
+    Cargo disables automatic tests in the published Management crate. A
+    separate consumer manifest names only the existing mapped integration
+    fixtures and points its library/binaries at the untouched crate source.
+    No dependency, lockfile, assertion or runtime source is rewritten.
+    """
+    root, payload = safe_path(root), safe_path(payload)
+    mapping = safe_path(root / "qualification/pre1-cases.json")
+    cases = json.loads(mapping.read_text())
+    if cases.get("component") != "management" or cases.get("schema") != "iicp.pre1-component-case-map.v2":
+        raise ValueError("Management consumer case map differs")
+    names = set()
+    for case in [cases["support"], *cases["scenarios"].values()]:
+        command = case["command"]
+        if "--test" in command:
+            name = command[command.index("--test") + 1]
+            if not isinstance(name, str) or re.fullmatch(r"[a-z][a-z0-9_]*", name) is None:
+                raise ValueError("Management consumer test name is unsafe")
+            names.add(name)
+    tracked = set(subprocess.check_output(["git", "ls-files", "-z", "--", "tests"], cwd=root).decode().split("\0"))
+    files = {}
+    for name in sorted(names):
+        path = f"tests/{name}.rs"
+        if path not in tracked:
+            raise ValueError("Management consumer assertion is not Git-bound")
+        source = safe_path(root / path).read_text()
+        files[path] = management_assertions(path, source).encode()
+    for name in tree(payload):
+        if not name.startswith(("src/", "examples/")) and name != "Cargo.toml":
+            files[name] = (payload / name).read_bytes()
+    manifest = (payload / "Cargo.toml").read_text()
+    for path in re.findall(r'^path = "([^"\n]+)"$', manifest, flags=re.M):
+        validate_rust_archive_name(path)
+        if not path.startswith(("src/", "examples/")):
+            raise ValueError("Management consumer manifest source path differs")
+    manifest = re.sub(r'^path = "((?:src|examples)/[^"\n]+)"$',
+                      lambda match: f'path = "../payload/{match[1]}"', manifest, flags=re.M)
+    for name in sorted(names):
+        manifest += f'\n[[test]]\nname = "{name}"\npath = "tests/{name}.rs"\n'
+    files["Cargo.toml"] = manifest.encode()
+    return files
+
+
+def management_assertions(name, source):
+    """Validate pre-1 builder metadata; retain the older publisher assertions."""
+    if name != "tests/release_manifest.rs":
+        return source
+    marker = '    let manifest: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();'
+    optional = '    let Some(path) = env::var_os("IICP_RELEASE_MANIFEST") else {\n        return;\n    };'
+    if source.count(marker) != 1 or source.count(optional) != 1:
+        raise ValueError("Management release fixture shape differs")
+    branch = '''
+    if manifest["schema"] == "iicp.pre1-management-release-manifest.v1" {
+        let candidate: Value = serde_json::from_str(&fs::read_to_string(
+            env::var_os("IICP_PRE1_CANDIDATE_MANIFEST").expect("candidate required")
+        ).unwrap()).unwrap();
+        let component = candidate["components"].as_array().unwrap().iter()
+            .find(|row| row["id"] == "management").unwrap();
+        assert_eq!(manifest["source_commit"], component["source_commit"]);
+        assert_eq!(manifest["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(manifest["version"], component["version"]);
+        assert_eq!(manifest["product"], "iicp-management-core");
+        assert_eq!(manifest["channel"], "developer-preview");
+        assert_eq!(manifest["non_authorizing"], true);
+        for flag in ["publication_authorized", "deployment_authorized", "management_service", "directory_authority"] {
+            assert_eq!(manifest[flag], false);
+        }
+        assert_eq!(manifest["binaries"], json!(["iicp-management", "iicp-management-controller", "iicp-management-conformance"]));
+        assert_eq!(manifest.as_object().unwrap().len(), 11);
+        return;
+    }
+'''
+    return source.replace(optional, '    let path = env::var_os("IICP_RELEASE_MANIFEST").expect("release manifest required");').replace(marker, marker + branch)
+
+
+def stage_management_consumer(root: Path, artifact: Path, workspace: Path) -> dict:
+    """Prepare only; the caller owns dependency acquisition and isolation."""
+    root, artifact, workspace = safe_path(root), safe_path(artifact), safe_path(workspace)
+    home = safe_path(Path(os.environ["HOME"]))
+    if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root) or any(workspace.iterdir()):
+        raise ValueError("Management consumer workspace is not empty and run-isolated")
+    expected = rust_archive_files(artifact, artifact.stem + "/")
+    extract_rust_prefix(artifact, artifact.stem + "/", workspace / "payload")
+    payload = workspace / "payload"
+    if tree(payload) != expected:
+        raise ValueError("Management extracted crate differs")
+    files = management_consumer_files(root, payload)
+    consumer = workspace / "consumer"
+    consumer.mkdir(mode=0o700)
+    for name, data in files.items():
+        path = consumer / name
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return {"schema": "iicp.pre1-management-consumer.v1",
+            "artifact_sha256": file_digest(artifact), "payload_sha256": digest(expected),
+            "consumer_sha256": digest(tree(consumer)),
+            "non_authorizing": True, "qualification_credit": False}
+
+
+def validate_management_consumer(root: Path, artifact: Path, workspace: Path, binding: dict) -> Path:
+    """Recheck artifact and reviewed assertions, even after a forged rehash."""
+    workspace = safe_path(workspace)
+    home = safe_path(Path(os.environ["HOME"]))
+    if workspace == home or not workspace.is_relative_to(home) or workspace.is_relative_to(root.resolve()):
+        raise ValueError("Management consumer workspace is not run-isolated")
+    payload = safe_path(workspace / "payload")
+    consumer = safe_path(workspace / "consumer")
+    expected = rust_archive_files(artifact, artifact.stem + "/")
+    actual = tree(consumer)
+    fixtures = {name: "sha256:" + hashlib.sha256(data).hexdigest()
+                for name, data in management_consumer_files(root, payload).items()}
+    if binding != {"schema": "iicp.pre1-management-consumer.v1",
+                   "artifact_sha256": file_digest(artifact), "payload_sha256": digest(expected),
+                   "consumer_sha256": digest(actual),
+                   "non_authorizing": True, "qualification_credit": False} or tree(payload) != expected or actual != fixtures:
+        raise ValueError("Management consumer artifact or reviewed fixtures changed")
+    return consumer
+
+
+def management_consumer_binding(artifact, workspace):
+    return {"schema": "iicp.pre1-management-consumer.v1",
+            "artifact_sha256": file_digest(artifact),
+            "payload_sha256": digest(rust_archive_files(artifact, artifact.stem + "/")),
+            "consumer_sha256": digest(tree(workspace / "consumer")),
+            "non_authorizing": True, "qualification_credit": False}
+
+
+def management_dependencies(workspace):
+    expected = ('[source.crates-io]\nreplace-with = "vendored-sources"\n\n'
+                '[source.vendored-sources]\ndirectory = ' + json.dumps(str(workspace / "vendor")) + '\n')
+    if tree(workspace / ".cargo") != {"config.toml": "sha256:" + hashlib.sha256(expected.encode()).hexdigest()}:
+        raise ValueError("Management offline Cargo configuration differs")
+    return rust_dependencies(workspace)
+
+
+def create_management_binding(root, workspace, installed, artifact, runtime, target, bindings):
+    validate_immutable_bindings(bindings)
+    staged = management_consumer_binding(artifact, workspace)
+    if safe_path(installed) != validate_management_consumer(root, artifact, workspace, staged):
+        raise ValueError("Management consumer path differs")
+    value = {"schema": SCHEMA, "component": "management", "runtime": runtime,
+        "target": target, "bindings": bindings, "workspace": str(workspace),
+        "installed_package": str(installed), "artifact_sha256": staged["artifact_sha256"],
+        "installed_payload_sha256": staged["payload_sha256"],
+        "fixtures_sha256": staged["consumer_sha256"],
+        "test_dependencies_sha256": digest(management_dependencies(workspace)),
+        "binding_sha256": None, "assertion_adapter": "canonical-runtime-verifier-and-cli.v1",
+        "non_authorizing": True, "qualification_credit": False}
+    value["binding_sha256"] = digest(value)
+    return value
+
+
+def validate_management_binding(value, context, artifact, root):
+    validate_binding_identity(value)
+    validate_binding_context(value, context)
+    workspace = safe_path(Path(value["workspace"]))
+    expected = create_management_binding(root, workspace, Path(value["installed_package"]),
+        artifact, context["runtime"], context["target"], {key: context[key] for key in BINDINGS})
+    if value != expected:
+        raise ValueError("Management package execution inputs changed")
+    return safe_path(workspace / "consumer")
