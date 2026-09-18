@@ -66,6 +66,9 @@ name = "systemd_watchdog_fixture"
 required-features = ["systemd-notify", "runtime-health-fault-injection"]
 
 [dependencies]
+# Security floor also applies when this crate is a downstream library dependency.
+# No extra TLS features are enabled; existing execution bindings remain unchanged.
+rustls = { version = "0.23.45", default-features = false }
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "stream"], default-features = false }
 regex = "1"
 serde = { version = "1.0", features = ["derive"] }

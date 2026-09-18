@@ -12,6 +12,9 @@ DENIED_EXACT = {
     ("internment", "0.8.7"),
     ("append-only-vec", "0.1.9"),
 }
+# RUSTSEC-2026-0285 / GHSA-2mjx-qc3c-rqvc. Keep the known affected
+# stable range out of rebuilt locks; a fresh RustSec audit is still required.
+DENIED_EXACT |= {("rustls", f"0.23.{patch}") for patch in range(13, 45)}
 DENIED_NAMES = {"proc-macro1", "proc-macro-en", "aovine", "arone", "aronenao", "tinymember"}
 ALLOWED_REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 
