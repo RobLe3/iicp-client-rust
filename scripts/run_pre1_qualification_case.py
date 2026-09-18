@@ -17,6 +17,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from pre1_harness_binding import harness_identity, validate_harness_source
 from pre1_environment_contract import validate_modern_environment
+from pre1_package_execution import package_command, validate_binding, make_case_proof, write_case_proof
 
 ROOT = Path(__file__).resolve().parents[1]
 COMPONENT = 'client-rust'
@@ -87,6 +88,7 @@ def description() -> dict:
         "network_policy": "isolated-fixtures-only",
         "evidence_policy": "digest-only",
         "artifact_consumption": "verified-candidate-root",
+        "case_proof_schema": "iicp.pre1-packaged-case-proof.v2",
         "source_commit_binding": True,
         "supported_environment_schemas": [
             "iicp.pre1-qualification-environment.v1",
@@ -499,10 +501,11 @@ def exact_assertion_is_listed(output: str, assertion: str) -> bool:
     return len(matches) == 1
 
 
-def verify_exact_assertion(argv: list[str], assertion: str, env: dict[str, str]) -> None:
+def verify_exact_assertion(argv: list[str], assertion: str, env: dict[str, str],
+                           cwd: Path = ROOT) -> None:
     probe = subprocess.run(
         [*argv, "--list"],
-        cwd=ROOT,
+        cwd=cwd,
         env=env,
         text=True,
         stdout=subprocess.PIPE,
@@ -511,6 +514,14 @@ def verify_exact_assertion(argv: list[str], assertion: str, env: dict[str, str])
     )
     if probe.returncode != 0 or not exact_assertion_is_listed(probe.stdout, assertion):
         raise ValueError("qualification exact assertion is unavailable on this target")
+
+
+
+def exact_assertion_passed(output: str, assertion: str) -> bool:
+    results = re.findall(r"test result: (\w+)\. (\d+) passed; (\d+) failed; (\d+) ignored;", output)
+    return (bool(results) and sum(int(row[1]) for row in results) == 1
+            and all(row[0] == "ok" and row[2:] == ("0", "0") for row in results)
+            and len(re.findall(r"^test " + re.escape(assertion) + r" \.\.\. ok$", output, re.M)) == 1)
 
 
 def main() -> int:
@@ -530,20 +541,31 @@ def main() -> int:
     if args.scenario is not None and args.scenario not in SCENARIO_COMMANDS:
         parser.error("scenario is not owned by this component")
     try:
-        runtime, runtime_row, manifest, _context = validate_context(
+        runtime, runtime_row, manifest, context = validate_context(
             args.cell, args.scenario
         )
         validate_runtime(runtime, runtime_row, manifest)
         case = SCENARIO_CASES[args.scenario] if args.scenario else SUPPORT_CASE
         template = case["command"]
         argv = expand_command(template, runtime_row)
+        component = next(row for row in manifest["components"] if row["id"] == COMPONENT)
         env = command_environment(runtime_row, runtime)
-        verify_exact_assertion(argv, case["assertion"], env)
-        result = subprocess.run(argv, cwd=ROOT, env=env, check=False)
+        env["RUSTC"] = runtime_row["programs"]["rustc"]
+        env["PATH"] = os.pathsep.join((str(Path(runtime_row["programs"]["rustc"]).parent), env.get("PATH", "")))
+        argv, env, workspace, proof = package_command(ROOT, context, component,
+            Path(os.environ["IICP_PRE1_ARTIFACT_ROOT"]), argv, env)
+        verify_exact_assertion(argv, case["assertion"], env, workspace)
+        result = subprocess.run(argv, cwd=workspace, env=env, check=False,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        print(result.stdout, end="")
+        validate_binding(proof["value"], context, proof["artifact"], ROOT, proof["vendor_artifact"])
+        exit_code = result.returncode if result.returncode else (0 if exact_assertion_passed(result.stdout, case["assertion"]) else 2)
+        write_case_proof(make_case_proof(proof["value"], context, case["assertion"],
+                                       exit_code, os.environ["IICP_PRE1_RUN_ID"]))
     except (KeyError, OSError, ValueError, json.JSONDecodeError, subprocess.CalledProcessError) as error:
         print(f"pre-1.0 {COMPONENT} case refused: {error}", file=sys.stderr)
         return 2
-    return result.returncode
+    return exit_code
 
 
 if __name__ == "__main__":
