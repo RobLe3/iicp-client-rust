@@ -36,6 +36,11 @@ class PreparedHomeTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 adapter.validate_workspace_boundary(workspace, self.case, installed, source)
 
+    def test_explicit_preparation_home_does_not_require_home(self):
+        with patch.dict(os.environ, {
+                "IICP_PRE1_PREPARED_PACKAGE_HOME": str(self.prepared)}, clear=True):
+            self.assertEqual(adapter.prepared_package_home(), self.prepared)
+
     def test_wrong_explicit_preparation_boundary_is_rejected(self):
         workspace = self.prepared / "workspace"
         installed = workspace / "payload"
