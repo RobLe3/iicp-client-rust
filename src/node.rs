@@ -198,6 +198,14 @@ async fn reregister(
     })
 }
 
+// Registration errors must never echo arbitrary Directory response fields.
+fn registration_token(data: &serde_json::Value) -> Result<&str> {
+    data["node_token"]
+        .as_str()
+        .or_else(|| data["token"].as_str())
+        .ok_or_else(|| IicpError::Node("no node_token in response".to_string()))
+}
+
 fn attach_current_node_token(payload: &mut serde_json::Value, token: &str) {
     if !token.is_empty() {
         // Always overwrite a token captured in an earlier payload. Long-running
@@ -2472,10 +2480,7 @@ impl IicpNode {
                 .await
                 .map_err(|e| IicpError::Node(e.to_string()))?
         };
-        let token = data["node_token"]
-            .as_str()
-            .or_else(|| data["token"].as_str())
-            .ok_or_else(|| IicpError::Node(format!("no node_token in response: {data}")))?;
+        let token = registration_token(&data)?;
         // BUG-5: stash the token so deregister()/heartbeat don't need it re-passed.
         *self.runtime_token.write().expect("poisoned") = token.to_string();
         // ADR-019: capture directory-issued HMAC key for subsequent signing.
@@ -4002,6 +4007,36 @@ mod reregister_tests {
         reregister, update_saved_identity_credentials,
     };
     use serde_json::json;
+
+    #[test]
+    fn registration_token_missing_never_discloses_response_fields() {
+        let marker = "SYNTHETIC_SECRET_DO_NOT_LOG_9ca1";
+        for body in [
+            json!({"private_detail": marker}),
+            json!({"node_token": {"secret": marker}}),
+            json!(null),
+        ] {
+            let error = super::registration_token(&body).unwrap_err().to_string();
+            assert_eq!(error, "node error: no node_token in response");
+            assert!(!error.contains(marker));
+        }
+    }
+
+    #[test]
+    fn registration_token_preserves_alias_precedence_and_existing_empty_behavior() {
+        assert_eq!(
+            super::registration_token(&json!({"node_token":"primary", "token":"alias"})).unwrap(),
+            "primary"
+        );
+        assert_eq!(
+            super::registration_token(&json!({"token":"alias"})).unwrap(),
+            "alias"
+        );
+        assert_eq!(
+            super::registration_token(&json!({"node_token":""})).unwrap(),
+            ""
+        );
+    }
 
     #[test]
     fn empty_startup_token_recovery_has_no_initial_delay() {
