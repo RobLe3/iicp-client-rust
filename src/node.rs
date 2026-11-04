@@ -198,6 +198,16 @@ async fn reregister(
     })
 }
 
+fn registration_failure(status: impl std::fmt::Display, data: &Value) -> IicpError {
+    let candidate = data
+        .get("error")
+        .and_then(|e| e.as_str().or_else(|| e.get("code").and_then(Value::as_str)));
+    let code = candidate
+        .filter(|code| matches!(*code, "IICP-E034" | "IICP-E035" | "IICP-E049" | "IICP-E050"));
+    let suffix = code.map(|code| format!(" ({code})")).unwrap_or_default();
+    IicpError::Node(format!("register failed: {status}{suffix}"))
+}
+
 // Registration errors must never echo arbitrary Directory response fields.
 fn registration_token(data: &serde_json::Value) -> Result<&str> {
     data["node_token"]
@@ -2448,7 +2458,7 @@ impl IicpNode {
                 })?;
             let client = crate::http::HttpClient::new(self.cfg.timeout_ms, None)?;
             let (status, data) = client
-                .post_restricted_json(
+                .post_restricted_registration_json(
                     &url,
                     &payload,
                     membership.expose(),
@@ -2458,7 +2468,7 @@ impl IicpNode {
                 )
                 .await?;
             if !(200..300).contains(&status) {
-                return Err(IicpError::Node(format!("register failed: {status}")));
+                return Err(registration_failure(status, &data));
             }
             crate::restricted_directory::validate_decision(&data, context, "registration")?;
             data
@@ -2471,10 +2481,9 @@ impl IicpNode {
                 .await
                 .map_err(|e| IicpError::Node(e.to_string()))?;
             if !resp.status().is_success() {
-                return Err(IicpError::Node(format!(
-                    "register failed: {}",
-                    resp.status()
-                )));
+                let status = resp.status();
+                let data = crate::http::registration_failure_data(resp).await;
+                return Err(registration_failure(status, &data));
             }
             resp.json()
                 .await
@@ -4496,5 +4505,39 @@ mod operator_wiring_tests {
             format!("{task_id}:{tokens}:::{nonce}:{response_hash}:{querying_node_id}"),
             "canonical must include querying_node_id at the end"
         );
+    }
+}
+
+#[cfg(test)]
+mod registration_failure_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn registration_failure_allowlists_both_shapes_without_details() {
+        for code in ["IICP-E034", "IICP-E035", "IICP-E049", "IICP-E050"] {
+            for data in [
+                json!({"error": code, "secret":"PRIVATE_MARKER"}),
+                json!({"error":{"code":code,"message":"PRIVATE_MARKER"}}),
+            ] {
+                let text = registration_failure(403, &data).to_string();
+                assert_eq!(text, format!("node error: register failed: 403 ({code})"));
+                assert!(!text.contains("PRIVATE_MARKER"));
+            }
+        }
+    }
+    #[test]
+    fn registration_failure_unknown_or_malformed_is_status_only() {
+        for data in [
+            Value::Null,
+            json!([]),
+            json!({"error":"IICP-E999"}),
+            json!({"error":{"code":"IICP-E050 PRIVATE_MARKER"}}),
+            json!({"error":{"code":5}}),
+        ] {
+            assert_eq!(
+                registration_failure(422, &data).to_string(),
+                "node error: register failed: 422"
+            );
+        }
     }
 }

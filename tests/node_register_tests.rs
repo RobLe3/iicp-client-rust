@@ -187,3 +187,64 @@ fn shared_e050_client_lifecycle_projects_current_tokens_and_rotated_endpoints() 
         assert_eq!(payload["endpoint"], scenario["requested_endpoint"]);
     }
 }
+
+#[tokio::test]
+async fn registration_errors_disclose_only_allowlisted_codes_in_both_modes() {
+    use iicp_client::{
+        runtime_config::SecretRef, IicpNode, NodeConfig, RestrictedDirectoryContext,
+    };
+    for restricted in [false, true] {
+        for (body, code) in [
+            (
+                r#"{"error":{"code":"IICP-E050","message":"PRIVATE_MARKER"}}"#,
+                Some("IICP-E050"),
+            ),
+            (
+                r#"{"error":"IICP-E034","message":"PRIVATE_MARKER"}"#,
+                Some("IICP-E034"),
+            ),
+            (r#"{"error":"PRIVATE_MARKER"}"#, None),
+            ("malformed PRIVATE_MARKER", None),
+        ] {
+            let mut server = mockito::Server::new_async().await;
+            let mut mock = server
+                .mock("POST", "/v1/register")
+                .with_status(403)
+                .with_body(body);
+            if restricted {
+                mock = mock
+                    .match_header("x-iicp-membership", "member-token")
+                    .match_header("x-iicp-subject-id", "node-a");
+            }
+            let mock = mock.create_async().await;
+            let path = protected_membership_file();
+            let mut cfg = NodeConfig::new(
+                "node-a",
+                "https://node.example/task",
+                "urn:iicp:intent:llm:chat:v1",
+            );
+            cfg.directory_url = server.url();
+            if restricted {
+                cfg.restricted_directory = Some(RestrictedDirectoryContext {
+                    domain_id: "domain-a".into(),
+                    authority_id: "did:iicp:test:directory-a".into(),
+                    subject_id: "node-a".into(),
+                    subject_kind: "node".into(),
+                    minimum_membership_generation: 7,
+                    membership_credential: SecretRef::File {
+                        path: path.display().to_string(),
+                    },
+                });
+            }
+            let error = IicpNode::new(cfg).register().await.unwrap_err().to_string();
+            assert!(error.contains("403"), "{error}");
+            assert!(!error.contains("PRIVATE_MARKER"), "{error}");
+            assert_eq!(error.contains("IICP-E"), code.is_some(), "{error}");
+            if let Some(code) = code {
+                assert!(error.contains(code), "{error}");
+            }
+            mock.assert_async().await;
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+}
