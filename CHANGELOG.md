@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Fixed — relay discovery candidate input validation
+
+- Reject missing/blank candidate identities and malformed or out-of-range relay
+  ports before ranking. Preserve the legacy absent-port default and valid
+  candidates. This is input validation, not authenticated relay eligibility.
+
 ### Fixed — relay-fallback availability reporting
 
 - Auto-elected fallback routes advertise unavailable until the existing relay
