@@ -4863,6 +4863,18 @@ fn direct_tunnel_fallback_reason(
     None
 }
 
+/// Validate an explicitly advertised port; preserve the legacy absent default.
+#[cfg(feature = "nat")]
+fn relay_candidate_port(node: &serde_json::Value) -> Option<u16> {
+    match node.get("relay_accept_port") {
+        None => Some(9485),
+        Some(value) => value
+            .as_u64()
+            .and_then(|port| u16::try_from(port).ok())
+            .filter(|port| *port != 0),
+    }
+}
+
 /// Query the directory for relay-capable peers and elect one deterministically.
 /// Used when NAT detection returns tier≥3 (CGNAT + no usable IPv6 path).
 /// Returns (relay_host, relay_port) or None if no relay-capable peer is found.
@@ -4904,7 +4916,10 @@ async fn auto_elect_relay(
                     n.get("relay_capable")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
-                        && (n.get("node_id").and_then(|v| v.as_str()) != Some(node_id))
+                        && n.get("node_id")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|id| !id.trim().is_empty() && id != node_id)
+                        && relay_candidate_port(n).is_some()
                         && n.get("endpoint")
                             .and_then(|v| v.as_str())
                             .is_some_and(|s| !s.is_empty())
@@ -4951,10 +4966,7 @@ async fn auto_elect_relay(
     if relay_host.is_empty() {
         return None;
     }
-    let relay_port = elected
-        .get("relay_accept_port")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(9485) as u16;
+    let relay_port = relay_candidate_port(elected)?;
     Some((relay_host.to_string(), relay_port))
 }
 
@@ -7870,5 +7882,109 @@ mod current_cooldown_contract_tests {
         ] {
             assert_eq!(public_fallback_retry_delay_hint(message), None, "{message}");
         }
+    }
+}
+
+#[cfg(all(test, feature = "nat"))]
+mod postcert_selector_validation_controls {
+    use super::*;
+    async fn elect(port: Option<serde_json::Value>, id: Option<&str>) -> Option<(String, u16)> {
+        let mut directory = mockito::Server::new_async().await;
+        let mut node = serde_json::json!({"endpoint":"https://relay.example","relay_capable":true});
+        if let Some(port) = port {
+            node["relay_accept_port"] = port;
+        }
+        if let Some(id) = id {
+            node["node_id"] = serde_json::json!(id);
+        }
+        let response = serde_json::json!({"nodes":[node]});
+        let mock = directory
+            .mock("GET", "/v1/discover")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(response.to_string())
+            .create_async()
+            .await;
+        let result =
+            auto_elect_relay(&directory.url(), "urn:iicp:intent:llm:chat:v1", "consumer").await;
+        mock.assert_async().await;
+        result
+    }
+    #[tokio::test]
+    async fn valid_candidate_positive_control() {
+        assert_eq!(
+            elect(Some(serde_json::json!(9485)), Some("relay")).await,
+            Some(("relay.example".into(), 9485))
+        );
+    }
+    #[tokio::test]
+    async fn zero_port_is_rejected() {
+        assert_eq!(elect(Some(serde_json::json!(0)), Some("relay")).await, None);
+    }
+    #[tokio::test]
+    async fn overflow_port_is_rejected() {
+        assert_eq!(
+            elect(Some(serde_json::json!(65537)), Some("relay")).await,
+            None
+        );
+    }
+    #[tokio::test]
+    async fn missing_identity_is_rejected() {
+        assert_eq!(elect(Some(serde_json::json!(9485)), None).await, None);
+    }
+    #[tokio::test]
+    async fn self_identity_negative_control() {
+        assert_eq!(
+            elect(Some(serde_json::json!(9485)), Some("consumer")).await,
+            None
+        );
+    }
+    #[tokio::test]
+    async fn legacy_absent_port_default_is_preserved() {
+        assert_eq!(
+            elect(None, Some("relay")).await,
+            Some(("relay.example".into(), 9485))
+        );
+    }
+    #[tokio::test]
+    async fn maximum_port_positive_control() {
+        assert_eq!(
+            elect(Some(serde_json::json!(65535)), Some("relay")).await,
+            Some(("relay.example".into(), 65535))
+        );
+    }
+    #[tokio::test]
+    async fn malformed_ports_and_blank_identity_are_rejected() {
+        for port in [
+            serde_json::json!(-1),
+            serde_json::json!("9485"),
+            serde_json::json!(null),
+            serde_json::json!(1.5),
+        ] {
+            assert_eq!(elect(Some(port), Some("relay")).await, None);
+        }
+        assert_eq!(elect(None, Some("   ")).await, None);
+    }
+    #[tokio::test]
+    async fn invalid_candidate_cannot_displace_valid_candidate_before_ranking() {
+        let mut directory = mockito::Server::new_async().await;
+        let body = serde_json::json!({"nodes":[
+            {"node_id":"invalid","endpoint":"https://bad.example","relay_capable":true,"relay_accept_port":65537,"load":0},
+            {"node_id":"valid","endpoint":"https://valid.example","relay_capable":true,"relay_accept_port":9485,"load":1}
+        ]});
+        let mock = directory
+            .mock("GET", "/v1/discover")
+            .match_query(mockito::Matcher::Any)
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(body.to_string())
+            .create_async()
+            .await;
+        assert_eq!(
+            auto_elect_relay(&directory.url(), "test", "consumer").await,
+            Some(("valid.example".into(), 9485))
+        );
+        mock.assert_async().await;
     }
 }
