@@ -4875,6 +4875,37 @@ fn relay_candidate_port(node: &serde_json::Value) -> Option<u16> {
     }
 }
 
+/// Extract only an HTTP endpoint authority, never credentials or a URL path.
+/// Keep IPv6 brackets because the worker composes a host:port socket address.
+#[cfg(feature = "nat")]
+fn relay_candidate_host(node: &serde_json::Value) -> Option<String> {
+    let endpoint = node.get("endpoint")?.as_str()?;
+    let authority = endpoint
+        .split_once("://")?
+        .1
+        .split(['/', '?', '#'])
+        .next()?;
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let url = reqwest::Url::parse(endpoint).ok()?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    let host = url.host_str()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some(if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    })
+}
+
 /// Query the directory for relay-capable peers and elect one deterministically.
 /// Used when NAT detection returns tier≥3 (CGNAT + no usable IPv6 path).
 /// Returns (relay_host, relay_port) or None if no relay-capable peer is found.
@@ -4920,9 +4951,7 @@ async fn auto_elect_relay(
                             .and_then(|v| v.as_str())
                             .is_some_and(|id| !id.trim().is_empty() && id != node_id)
                         && relay_candidate_port(n).is_some()
-                        && n.get("endpoint")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|s| !s.is_empty())
+                        && relay_candidate_host(n).is_some()
                 })
                 .collect()
         })
@@ -4940,32 +4969,7 @@ async fn auto_elect_relay(
         ((load * 1_000_000.0) as u64, hash_hex)
     };
     let elected = candidates.iter().min_by(|a, b| score(a).cmp(&score(b)))?;
-    let endpoint = elected
-        .get("endpoint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim_end_matches('/');
-    // Extract host from endpoint URL
-    let relay_host = if let Some(rest) = endpoint.strip_prefix("http://") {
-        rest.split('/')
-            .next()
-            .unwrap_or("")
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(rest)
-    } else if let Some(rest) = endpoint.strip_prefix("https://") {
-        rest.split('/')
-            .next()
-            .unwrap_or("")
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(rest)
-    } else {
-        endpoint.split('/').next().unwrap_or("")
-    };
-    if relay_host.is_empty() {
-        return None;
-    }
+    let relay_host = relay_candidate_host(elected)?;
     let relay_port = relay_candidate_port(elected)?;
     Some((relay_host.to_string(), relay_port))
 }
@@ -7986,5 +7990,96 @@ mod postcert_selector_validation_controls {
             Some(("valid.example".into(), 9485))
         );
         mock.assert_async().await;
+    }
+}
+
+#[cfg(all(test, feature = "nat"))]
+mod postcert_url_validation_controls {
+    async fn elect(endpoint: &str) -> Option<(String, u16)> {
+        let mut dir = mockito::Server::new_async().await;
+        let m=dir.mock("GET","/v1/discover").match_query(mockito::Matcher::Any).with_status(200).with_header("content-type","application/json").with_body(serde_json::json!({"nodes":[{"node_id":"relay","relay_capable":true,"endpoint":endpoint,"relay_accept_port":9485}]}).to_string()).create_async().await;
+        let x = super::auto_elect_relay(&dir.url(), "test", "consumer").await;
+        m.assert_async().await;
+        x
+    }
+    #[tokio::test]
+    async fn valid_explicit_http_port_control() {
+        assert_eq!(
+            elect("https://relay.example:443/path").await,
+            Some(("relay.example".into(), 9485))
+        );
+    }
+    #[tokio::test]
+    async fn path_is_not_part_of_host() {
+        assert_eq!(
+            elect("https://relay.example/path").await,
+            Some(("relay.example".into(), 9485))
+        );
+    }
+    #[tokio::test]
+    async fn ipv6_authority_retains_brackets() {
+        assert_eq!(elect("https://[::1]").await, Some(("[::1]".into(), 9485)));
+    }
+    #[tokio::test]
+    async fn query_and_fragment_are_not_part_of_host() {
+        assert_eq!(
+            elect("https://relay.example/path?q=x#fragment").await,
+            Some(("relay.example".into(), 9485))
+        );
+    }
+    #[tokio::test]
+    async fn ipv6_explicit_http_port_does_not_replace_native_port() {
+        assert_eq!(
+            elect("https://[::1]:443/path").await,
+            Some(("[::1]".into(), 9485))
+        );
+    }
+    #[tokio::test]
+    async fn malformed_relative_and_unsupported_schemes_are_rejected() {
+        for endpoint in ["relay.example/path", "ftp://relay.example", "https://", ""] {
+            assert_eq!(elect(endpoint).await, None);
+        }
+    }
+    #[tokio::test]
+    async fn userinfo_is_rejected() {
+        for endpoint in [
+            "https://user:secret@relay.example/path",
+            "https://user@relay.example",
+            "https://@relay.example",
+            "https://:@relay.example",
+        ] {
+            assert_eq!(elect(endpoint).await, None);
+        }
+    }
+    #[tokio::test]
+    async fn malformed_endpoint_cannot_displace_valid_candidate() {
+        let mut dir = mockito::Server::new_async().await;
+        let m=dir.mock("GET","/v1/discover").match_query(mockito::Matcher::Any).with_status(200).with_header("content-type","application/json").with_body(serde_json::json!({"nodes":[
+            {"node_id":"bad","relay_capable":true,"endpoint":"ftp://bad.example","load":0},
+            {"node_id":"valid","relay_capable":true,"endpoint":"https://valid.example/path","load":1}
+        ]}).to_string()).create_async().await;
+        assert_eq!(
+            super::auto_elect_relay(&dir.url(), "test", "consumer").await,
+            Some(("valid.example".into(), 9485))
+        );
+        m.assert_async().await;
+    }
+    #[tokio::test]
+    async fn plain_http_explicit_development_endpoint_stays_supported() {
+        assert_eq!(
+            elect("http://relay.example/path").await,
+            Some(("relay.example".into(), 9485))
+        );
+    }
+    #[tokio::test]
+    async fn extra_slash_empty_userinfo_and_empty_authorities_are_rejected() {
+        for endpoint in [
+            "https:///@relay.example",
+            "https:////@relay.example",
+            "https:///relay.example",
+            "https://?query",
+        ] {
+            assert_eq!(elect(endpoint).await, None);
+        }
     }
 }
