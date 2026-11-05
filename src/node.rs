@@ -143,6 +143,14 @@ struct RegistrationCredentials {
     node_hmac_key: Option<String>,
 }
 
+fn heartbeat_public_available(
+    runtime_available: bool,
+    relay_required: bool,
+    relay_bound: bool,
+) -> bool {
+    runtime_available && (!relay_required || relay_bound)
+}
+
 fn heartbeat_waits_before_first_tick(node_token: &str) -> bool {
     !node_token.is_empty()
 }
@@ -1887,6 +1895,9 @@ pub struct IicpNode {
     /// handshake.  A configured relay is not sufficient evidence: the session
     /// must be live before it can satisfy public-route recovery checks.
     runtime_relay_bound: Arc<AtomicBool>,
+    /// Startup routing selected relay fallback as the required public path.
+    /// An optional worker beside a direct/tunnel route does not set this gate.
+    relay_fallback_required: bool,
     /// #527 — endpoint registered at last register(); compared each heartbeat
     /// tick so a rotated endpoint triggers a live re-registration (the new URL
     /// is accepted via the IICP-E050 token path, current_node_token #529).
@@ -1950,6 +1961,7 @@ impl IicpNode {
             endpoint_override: Arc::new(std::sync::RwLock::new(None)),
             runtime_available: Arc::new(AtomicBool::new(true)),
             runtime_relay_bound: Arc::new(AtomicBool::new(false)),
+            relay_fallback_required: false,
             registered_endpoint: Arc::new(std::sync::RwLock::new(String::new())),
             cx_public_key,
             cx_private_key,
@@ -2158,6 +2170,12 @@ impl IicpNode {
     /// `self.cfg.relay_worker_endpoint` to start the outbound relay session.
     pub fn set_relay_worker_endpoint(&mut self, endpoint: String) {
         self.cfg.relay_worker_endpoint = Some(endpoint);
+    }
+
+    /// Mark whether startup routing depends on the relay fallback. Call after
+    /// route selection, before serving. Configuration alone is not route evidence.
+    pub fn set_relay_fallback_required(&mut self, required: bool) {
+        self.relay_fallback_required = required;
     }
 
     /// Explicitly enable the experimental native binary listener and advertise
@@ -2559,7 +2577,11 @@ impl IicpNode {
 
     /// Send a single heartbeat to the directory.
     pub async fn heartbeat(&self, node_token: &str) -> Result<()> {
-        let public_available = self.runtime_available.load(Ordering::Relaxed);
+        let public_available = heartbeat_public_available(
+            self.runtime_available.load(Ordering::Relaxed),
+            self.relay_fallback_required,
+            self.runtime_relay_bound.load(Ordering::Relaxed),
+        );
         let mut body = json!({
             "node_id": self.cfg.node_id,
             "node_token": node_token,
@@ -2891,6 +2913,7 @@ impl IicpNode {
             let hb_runtime_hmac_key = Arc::clone(&self.runtime_hmac_key);
             let hb_runtime_available = Arc::clone(&self.runtime_available);
             let hb_runtime_relay_bound = Arc::clone(&self.runtime_relay_bound);
+            let hb_relay_fallback_required = self.relay_fallback_required;
             let hb_recovery_grace = crate::recovery::env_grace_checks();
             let hb_recovery_check_every = crate::recovery::env_check_every_heartbeats();
             let hb_recovery_supervised = crate::recovery::supervised_recovery_enabled();
@@ -2981,15 +3004,21 @@ impl IicpNode {
                         None
                     };
                     // Build the heartbeat payload with optional health_models.
+                    // Keep the runtime gate for endpoint rotation unchanged.
                     let public_available = hb_runtime_available.load(Ordering::Relaxed);
+                    let advertised_available = heartbeat_public_available(
+                        public_available,
+                        hb_relay_fallback_required,
+                        hb_runtime_relay_bound.load(Ordering::Relaxed),
+                    );
                     let mut hb_body = json!({
                         "node_id": &node_id,
                         "node_token": &token,
-                        "status": if public_available { "available" } else { "recovering" },
+                        "status": if advertised_available { "available" } else { "recovering" },
                         // Explicit availability boolean — see heartbeat() above.
                         // Lets the directory restore a briefly-dormant node on the
                         // next beat, even on directory builds older than v1.10.17.
-                        "available": public_available,
+                        "available": advertised_available,
                         // Live capacity after availability shaping (ADR-006).
                         "max_concurrent": avail.effective_max_concurrent(max_c),
                         // Task outcome metrics — only sent when non-zero to
@@ -4538,6 +4567,122 @@ mod registration_failure_tests {
                 registration_failure(422, &data).to_string(),
                 "node error: register failed: 422"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fallback_availability_tests {
+    use super::*;
+
+    #[test]
+    fn fallback_availability_preserves_runtime_and_optional_routes() {
+        for runtime in [false, true] {
+            for required in [false, true] {
+                for bound in [false, true] {
+                    assert_eq!(
+                        heartbeat_public_available(runtime, required, bound),
+                        runtime && (!required || bound)
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fallback_heartbeat_tracks_bind_disconnect_rebind_without_changing_local_gate() {
+        let mut directory = mockito::Server::new_async().await;
+        let mut cfg = NodeConfig::new("fallback-test", "http://127.0.0.1:9484", "test");
+        cfg.directory_url = directory.url();
+        cfg.relay_worker_endpoint = Some("127.0.0.1:9485".into());
+        let mut node = IicpNode::new(cfg);
+        node.set_relay_fallback_required(true);
+        for bound in [false, true, false, true] {
+            node.runtime_relay_bound.store(bound, Ordering::Relaxed);
+            let expected = directory
+                .mock("POST", "/v1/heartbeat")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "available": bound,
+                    "status": if bound { "available" } else { "recovering" }
+                })))
+                .with_status(200)
+                .with_body("{\"ok\":true}")
+                .create_async()
+                .await;
+            node.heartbeat("test-token").await.unwrap();
+            expected.assert_async().await;
+            expected.remove_async().await;
+            assert!(node.runtime_available.load(Ordering::Relaxed));
+        }
+    }
+
+    #[tokio::test]
+    async fn optional_unbound_worker_does_not_disable_direct_or_tunnel_heartbeat() {
+        let mut directory = mockito::Server::new_async().await;
+        let mut cfg = NodeConfig::new("direct-test", "https://direct.example", "test");
+        cfg.directory_url = directory.url();
+        cfg.relay_worker_endpoint = Some("127.0.0.1:9485".into());
+        let node = IicpNode::new(cfg);
+        let expected = directory
+            .mock("POST", "/v1/heartbeat")
+            .match_body(mockito::Matcher::PartialJson(
+                json!({"available":true,"status":"available"}),
+            ))
+            .with_status(200)
+            .with_body("{\"ok\":true}")
+            .expect(2)
+            .create_async()
+            .await;
+        node.heartbeat("test-token").await.unwrap();
+        node.set_endpoint("https://verified-tunnel.example".into());
+        node.heartbeat("test-token").await.unwrap();
+        expected.assert_async().await;
+    }
+    #[tokio::test]
+    async fn fallback_background_heartbeat_uses_binding_and_runtime_gates() {
+        // Inject state, not a claimed native relay handshake. Exercise the real
+        // serve-loop sender against a bounded local Directory response.
+        for (required, bound, runtime, expected_available) in [
+            (true, false, true, false),
+            (true, true, true, true),
+            (true, true, false, false),
+            (false, false, true, true),
+        ] {
+            let mut directory = mockito::Server::new_async().await;
+            let expected = directory
+                .mock("POST", "/v1/heartbeat")
+                .match_body(mockito::Matcher::PartialJson(json!({
+                    "available": expected_available,
+                    "status": if expected_available { "available" } else { "recovering" }
+                })))
+                .with_status(200)
+                .with_body("{\"ok\":true}")
+                .create_async()
+                .await;
+            let mut cfg = NodeConfig::new("background-test", "http://127.0.0.1:9484", "test");
+            cfg.directory_url = directory.url();
+            let mut node = IicpNode::new(cfg);
+            node.set_relay_fallback_required(required);
+            node.runtime_relay_bound.store(bound, Ordering::Relaxed);
+            node.runtime_available.store(runtime, Ordering::Relaxed);
+            let server = tokio::spawn(async move {
+                node.serve(
+                    |_| async { Ok(json!({})) },
+                    "127.0.0.1:0",
+                    Some(String::new()),
+                )
+                .await
+            });
+            let observed = tokio::time::timeout(Duration::from_secs(5), async {
+                while !expected.matched_async().await {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            server.abort();
+            let _ = server.await;
+            observed.expect("background heartbeat must emit within bounded startup window");
+            expected.assert_async().await;
         }
     }
 }
