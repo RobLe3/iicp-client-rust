@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Fixed — relay-fallback availability reporting
+
+- Auto-elected fallback routes advertise unavailable until the existing relay
+  session reports a successful bind, and become unavailable again after disconnect.
+  Local serving remains independent. A successful tunnel supersedes fallback
+  dependency; direct routes with an optional worker keep their existing behavior.
+  This does not establish relay eligibility or independent interoperability and
+  does not change the frozen qualification candidate. Explicit relay-only
+  configurations outside auto-election retain their existing behavior.
+
 ### Fixed — bounded Directory connection recovery
 
 - Retry dispatch-ticket requests only when the failure is positively classified

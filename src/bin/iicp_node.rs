@@ -4065,6 +4065,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // Held for the serve lifetime; Drop/close() tears the child down.
     let mut tunnel: Option<iicp_client::tunnel::QuickTunnel> = None;
     let mut tunnel_public_fallback_required = false;
+    let mut relay_fallback_selected = false;
     let mut quick_tunnel_attempted = false;
     let mut last_tunnel_start_error: Option<String> = None;
     #[cfg(feature = "nat")]
@@ -4401,6 +4402,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                         {
                             opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
                             node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                            relay_fallback_selected = true;
                             eprintln!(
                                 "[iicp-node] auto-elected relay (last resort): {relay_host}:{relay_port}"
                             );
@@ -4487,6 +4489,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                     {
                         opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
                         node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
+                        relay_fallback_selected = true;
                         eprintln!(
                             "[iicp-node] auto-elected relay (last resort): {relay_host}:{relay_port}"
                         );
@@ -4499,6 +4502,12 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             }
         }
     }
+    // Selection is not binding. Only gate the route that actually requires
+    // fallback; preserve an established tunnel or an optional direct worker.
+    node.set_relay_fallback_required(relay_fallback_requires_binding(
+        relay_fallback_selected,
+        tunnel.is_some(),
+    ));
     if tunnel_public_fallback_required
         && tunnel.is_none()
         && opts.relay_worker_endpoint.is_empty()
@@ -4813,6 +4822,10 @@ fn endpoint_is_local_or_private(endpoint: &str) -> bool {
 
 fn endpoint_is_bracketed_ipv6(endpoint: &str) -> bool {
     endpoint.contains("://[")
+}
+
+fn relay_fallback_requires_binding(selected_fallback: bool, established_tunnel: bool) -> bool {
+    selected_fallback && !established_tunnel
 }
 
 #[cfg(feature = "nat")]
@@ -6731,6 +6744,14 @@ fn apply_tunnel_profile(_node: &mut iicp_client::node::IicpNode, _url: &str) {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_fallback_binding_gate_tracks_selection_not_tunnel_attempts() {
+        assert!(super::relay_fallback_requires_binding(true, false));
+        assert!(!super::relay_fallback_requires_binding(true, true));
+        assert!(!super::relay_fallback_requires_binding(false, false));
+        assert!(!super::relay_fallback_requires_binding(false, true));
+    }
+
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
