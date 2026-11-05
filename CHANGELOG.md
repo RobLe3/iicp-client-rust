@@ -2,6 +2,15 @@
 
 ## [Unreleased]
 
+### Fixed — relay endpoint authority parsing
+
+- Parse HTTP(S) endpoint authorities without paths, queries or userinfo leaking
+  into the worker host; retain bracketed IPv6 socket addresses and the separate
+  advertised native port. Reject malformed candidates before ranking. This does
+  not establish authenticated relay eligibility or native reachability.
+  Schemeless endpoints and credential-bearing authorities, including empty
+  userinfo delimiters, are rejected.
+
 ### Fixed — relay discovery candidate input validation
 
 - Reject missing/blank candidate identities and malformed or out-of-range relay
