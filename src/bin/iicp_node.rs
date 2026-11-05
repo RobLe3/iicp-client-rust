@@ -143,6 +143,8 @@ fn should_exit_for_unrecovered_public_fallback(policy: TunnelDeadPolicy, supervi
 
 fn public_fallback_retry_delay_hint(error: &str) -> Option<Duration> {
     for marker in [
+        "pausing tunnel creation for ",
+        "accountless Quick Tunnel creation delayed for ",
         "paused for ",
         "paced for ",
         "held by another local IICP node for ",
@@ -150,15 +152,17 @@ fn public_fallback_retry_delay_hint(error: &str) -> Option<Duration> {
         let Some(after) = error.split(marker).nth(1) else {
             continue;
         };
-        let seconds = after
+        let digits = after.bytes().take_while(u8::is_ascii_digit).count();
+        let suffix = after.get(digits..)?.strip_prefix('s')?;
+        if suffix
             .chars()
-            .take_while(|c| c.is_ascii_digit())
-            .collect::<String>()
-            .parse::<u64>()
-            .ok()?;
-        if seconds > 0 {
-            return Some(Duration::from_secs(seconds));
+            .next()
+            .is_some_and(|c| !c.is_whitespace() && c != ';')
+        {
+            return None;
         }
+        let seconds = after[..digits].parse::<u64>().ok()?;
+        return (seconds > 0).then(|| Duration::from_secs(seconds));
     }
     None
 }
@@ -7807,4 +7811,43 @@ fn saved_receipt_profile_applies_only_without_override() {
     };
     apply_saved_node(&mut explicit_empty, &saved);
     assert_eq!(explicit_empty.receipt_profiles, Some(Vec::new()));
+}
+
+#[cfg(test)]
+mod current_cooldown_contract_tests {
+    use super::*;
+    #[test]
+    fn current_producer_cooldown_forms_are_consumed() {
+        for (message, seconds) in [
+            ("paused for 60s; retained context", 60),
+            ("paced for 60s\tretained context", 60),
+            ("cloudflared exited; accountless Quick Tunnel rate limit detected — pausing tunnel creation for 60s", 60),
+            ("accountless Quick Tunnel creation delayed for 119s by shared Quick Tunnel pacing", 119),
+            ("accountless Quick Tunnel creation delayed for 599s by Cloudflare rate-limit cooldown", 599),
+            ("accountless Quick Tunnel creation delayed for 17s by another local IICP node holds the create lease", 17),
+            ("accountless Quick Tunnel creation paused for 599s after Cloudflare rate limiting", 599),
+            ("accountless Quick Tunnel creation paced for 119s to avoid Cloudflare rate limits", 119),
+            ("held by another local IICP node for 17s", 17),
+        ] {
+            assert_eq!(public_fallback_retry_delay_hint(message), Some(Duration::from_secs(seconds)), "{message}");
+        }
+    }
+    #[test]
+    fn invalid_cooldown_durations_are_rejected() {
+        for message in [
+            "unrecognized error",
+            "pausing tunnel creation for 60garbage; paced for 10s",
+            "paused for 60garbage",
+            "paused for 60.5s",
+            "paused for 60",
+            "paused for 60swrong",
+            "pausing tunnel creation for 0s; paced for 10s",
+            "paused for 0s",
+            "paced for -1s",
+            "accountless Quick Tunnel creation delayed for unknown seconds",
+            "pausing tunnel creation for 18446744073709551616s",
+        ] {
+            assert_eq!(public_fallback_retry_delay_hint(message), None, "{message}");
+        }
+    }
 }
