@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Prepare maintained TLS, trust-store, async and transport dependency pins with stronger source security floors. Existing feature, protocol and authority boundaries are unchanged; no publication or new qualification credit is granted.
+
+
 ### Fixed — relay endpoint authority parsing
 
 - Parse HTTP(S) endpoint authorities without paths, queries or userinfo leaking
