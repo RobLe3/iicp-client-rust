@@ -351,8 +351,8 @@ fn print_help() {
          \x20 --no-auto-detect-nat       disable NAT detection (overrides IICP_AUTO_DETECT_NAT)\n\
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
-         \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server for CGNAT/tier-4 operators\n\
-         \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: use a tunnel when direct IPv4/IPv6/pinhole reachability is unavailable or unverified, then relay; --no-tunnel disables tunnel fallback. Dead policy: IICP_TUNNEL_DEAD_POLICY=auto|retry|exit|log-only; generated services set IICP_SUPERVISED=1\n\
+         \x20 --relay-capable            IICP_RELAY_CAPABLE — enable experimental local relay listener; not proof of public reachability\n\
+         \x20 --tunnel / --no-tunnel      IICP_TUNNEL — #520 rung 5: zero-account Cloudflare Quick Tunnel (own public endpoint). Default auto: use a tunnel when direct IPv4/IPv6/pinhole reachability is unavailable or unverified. Automatic relay selection requires verified worker-route evidence; --no-tunnel disables tunnel fallback. Dead policy: IICP_TUNNEL_DEAD_POLICY=auto|retry|exit|log-only; generated services set IICP_SUPERVISED=1\n\
          \x20 IICP_ENABLE_EXPERIMENTAL_NATIVE_TCP=1 mounts and advertises the plaintext native TCP draft for direct development endpoints only. It is disabled by default and excluded from stable and production claims.\n\
          \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — TCP port for relay accept server (default 9485).\n\
          \x20                            Public relays should set IICP_RELAY_REQUIRE_BIND_TICKET=1 and\n\
@@ -471,7 +471,7 @@ fn print_serve_help() {
          \x20 --external-ip-probe-url U  IICP_EXTERNAL_IP_PROBE_URL — fallback IPv4 probe\n\
          \x20 --tunnel / --no-tunnel     IICP_TUNNEL — auto Cloudflare Quick Tunnel fallback when direct reachability fails\n\
          \x20 --relay-worker-endpoint EP IICP_RELAY_WORKER_ENDPOINT — relay host:port for CGNAT nodes\n\
-         \x20 --relay-capable            IICP_RELAY_CAPABLE — advertise as relay server\n\
+         \x20 --relay-capable            IICP_RELAY_CAPABLE — enable experimental local relay listener\n\
          \x20 --relay-accept-port PORT   IICP_RELAY_ACCEPT_PORT — relay accept TCP port (default 9485)\n\
          \x20 --with-proxy               IICP_WITH_PROXY — also run the compat proxy gateway (loopback 9483)\n\
          \x20 --log-dir DIR              IICP_LOG_DIR (default ~/.iicp/logs/)\n\
@@ -4065,7 +4065,6 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // Held for the serve lifetime; Drop/close() tears the child down.
     let mut tunnel: Option<iicp_client::tunnel::QuickTunnel> = None;
     let mut tunnel_public_fallback_required = false;
-    let mut relay_fallback_selected = false;
     let mut quick_tunnel_attempted = false;
     let mut last_tunnel_start_error: Option<String> = None;
     #[cfg(feature = "nat")]
@@ -4301,8 +4300,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     }
 
     // ADR-041 / #343 — optional NAT auto-detection prior to register.
-    // When tier≥3 (CGNAT + no IPv6 path) and no relay configured, auto-elect
-    // a relay from the directory so the node can register via relay.
+    // Treat a relay as a public route only through the existing explicit worker
+    // configuration until a verified discovery profile is available.
     #[cfg(not(feature = "nat"))]
     if opts.auto_detect_nat {
         eprintln!(
@@ -4364,8 +4363,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
         // Tunnel-FIRST, relay = last resort (maintainer 2026-06-13 choreography:
         // tunnel → relay → gossip). A Quick Tunnel gives the node its OWN public endpoint
         // — more autonomous than a third-party relay (no relay metadata/#510, one less hop);
-        // rotation mitigated by #538. --no-tunnel / IICP_TUNNEL=0 opts out → relay-first.
-        // Escalation order from the pure, unit-tested planner (tested order == used order).
+        // rotation mitigated by #538. --no-tunnel / IICP_TUNNEL=0 opts out.
+        // Preserve the fallback order. The relay rung cannot elect a peer until
+        // IICP#59 defines how to verify the native worker route.
         for step in plan_reachability(
             profile.tier,
             !opts.relay_worker_endpoint.is_empty(),
@@ -4394,20 +4394,9 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 "relay" => {
                     if relay_worker_fallback_allowed(opts.relay_capable) {
                         eprintln!(
-                            "[iicp-node] NAT tier={}: no tunnel — auto-electing a relay from directory (last resort)…",
+                            "[iicp-node] NAT tier={}: no tunnel and no verified relay worker route.",
                             profile.tier
                         );
-                        if let Some((relay_host, relay_port)) =
-                            auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
-                        {
-                            opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
-                            node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
-                            relay_fallback_selected = true;
-                            eprintln!(
-                                "[iicp-node] auto-elected relay (last resort): {relay_host}:{relay_port}"
-                            );
-                            break;
-                        }
                     } else {
                         eprintln!(
                             "[iicp-node] NAT tier={}: no tunnel for relay-capable node — not falling back through another relay; supervisor will retry the public route.",
@@ -4418,7 +4407,7 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
                 }
                 "gossip" => {
                     eprintln!(
-                        "[iicp-node] NAT tier={}: no tunnel and no relay-capable peers. \
+                        "[iicp-node] NAT tier={}: no tunnel and no verified relay worker route. \
                          Set IICP_RELAY_WORKER_ENDPOINT=<host>:<port> to specify a relay.",
                         profile.tier
                     );
@@ -4482,18 +4471,8 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             if tunnel.is_none() && opts.relay_worker_endpoint.is_empty() {
                 if relay_worker_fallback_allowed(opts.relay_capable) {
                     eprintln!(
-                        "[iicp-node] no tunnel available — auto-electing a relay from directory (last resort)…"
+                        "[iicp-node] no tunnel available and no verified relay worker route."
                     );
-                    if let Some((relay_host, relay_port)) =
-                        auto_elect_relay(&opts.directory_url, &opts.intent, &opts.node_id).await
-                    {
-                        opts.relay_worker_endpoint = format!("{relay_host}:{relay_port}");
-                        node.set_relay_worker_endpoint(opts.relay_worker_endpoint.clone());
-                        relay_fallback_selected = true;
-                        eprintln!(
-                            "[iicp-node] auto-elected relay (last resort): {relay_host}:{relay_port}"
-                        );
-                    }
                 } else {
                     eprintln!(
                         "[iicp-node] no tunnel available for relay-capable node — not falling back through another relay; supervisor will retry the public route."
@@ -4502,12 +4481,6 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
             }
         }
     }
-    // Selection is not binding. Only gate the route that actually requires
-    // fallback; preserve an established tunnel or an optional direct worker.
-    node.set_relay_fallback_required(relay_fallback_requires_binding(
-        relay_fallback_selected,
-        tunnel.is_some(),
-    ));
     if tunnel_public_fallback_required
         && tunnel.is_none()
         && opts.relay_worker_endpoint.is_empty()
@@ -4599,8 +4572,11 @@ async fn run_serve(mut opts: ServeOpts) -> Result<(), String> {
     // NAT-4 guard: if the endpoint is non-routable (localhost/private) and no relay
     // is configured, registration will always fail with 422. Skip it early and print
     // a clear diagnostic instead of a confusing "422 Unprocessable Entity" error.
-    let endpoint_is_local = endpoint_is_local_or_private(&opts.public_endpoint);
-    if endpoint_is_local && opts.relay_worker_endpoint.is_empty() && !opts.skip_registration {
+    if should_skip_unroutable_registration(
+        &opts.public_endpoint,
+        &opts.relay_worker_endpoint,
+        opts.skip_registration,
+    ) {
         eprintln!(
             "[iicp-node] no routable endpoint detected and no relay configured — \
              skipping directory registration. This node will accept direct connections \
@@ -4820,12 +4796,16 @@ fn endpoint_is_local_or_private(endpoint: &str) -> bool {
         || ep.contains("://[fd")
 }
 
-fn endpoint_is_bracketed_ipv6(endpoint: &str) -> bool {
-    endpoint.contains("://[")
+fn should_skip_unroutable_registration(
+    endpoint: &str,
+    configured_worker: &str,
+    already_skipping: bool,
+) -> bool {
+    endpoint_is_local_or_private(endpoint) && configured_worker.is_empty() && !already_skipping
 }
 
-fn relay_fallback_requires_binding(selected_fallback: bool, established_tunnel: bool) -> bool {
-    selected_fallback && !established_tunnel
+fn endpoint_is_bracketed_ipv6(endpoint: &str) -> bool {
+    endpoint.contains("://[")
 }
 
 #[cfg(feature = "nat")]
@@ -4861,129 +4841,6 @@ fn direct_tunnel_fallback_reason(
     }
 
     None
-}
-
-/// Validate an explicitly advertised port; preserve the legacy absent default.
-#[cfg(feature = "nat")]
-fn relay_candidate_port(node: &serde_json::Value) -> Option<u16> {
-    match node.get("relay_accept_port") {
-        None => Some(9485),
-        Some(value) => value
-            .as_u64()
-            .and_then(|port| u16::try_from(port).ok())
-            .filter(|port| *port != 0),
-    }
-}
-
-/// Extract only an HTTP endpoint authority, never credentials or a URL path.
-/// Keep IPv6 brackets because the worker composes a host:port socket address.
-#[cfg(feature = "nat")]
-fn relay_candidate_host(node: &serde_json::Value) -> Option<String> {
-    let endpoint = node.get("endpoint")?.as_str()?;
-    let authority = endpoint
-        .split_once("://")?
-        .1
-        .split(['/', '?', '#'])
-        .next()?;
-    if authority.is_empty() || authority.contains('@') {
-        return None;
-    }
-    let url = reqwest::Url::parse(endpoint).ok()?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-    {
-        return None;
-    }
-    let host = url.host_str()?;
-    if host.is_empty() {
-        return None;
-    }
-    Some(if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]")
-    } else {
-        host.to_string()
-    })
-}
-
-/// Query the directory for relay-capable peers and elect one deterministically.
-/// Used when NAT detection returns tier≥3 (CGNAT + no usable IPv6 path).
-/// Returns (relay_host, relay_port) or None if no relay-capable peer is found.
-/// Only called from the nat-gated tier≥3 path, so gate the definition too —
-/// otherwise it is dead code in default-feature builds (CI clippy -D warnings).
-#[cfg(feature = "nat")]
-async fn auto_elect_relay(
-    directory_url: &str,
-    intent: &str,
-    node_id: &str,
-) -> Option<(String, u16)> {
-    use sha2::{Digest, Sha256};
-    let url = format!(
-        "{}/v1/discover?intent={}&relay_capable=true",
-        directory_url.trim_end_matches('/'),
-        urlencoding_simple(intent)
-    );
-    let client = reqwest::Client::new();
-    let Ok(resp) = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(5))
-        .send()
-        .await
-    else {
-        return None;
-    };
-    if !resp.status().is_success() {
-        return None;
-    }
-    let Ok(data) = resp.json::<serde_json::Value>().await else {
-        return None;
-    };
-    let candidates: Vec<&serde_json::Value> = data
-        .get("nodes")
-        .and_then(|n| n.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter(|n| {
-                    n.get("relay_capable")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                        && n.get("node_id")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|id| !id.trim().is_empty() && id != node_id)
-                        && relay_candidate_port(n).is_some()
-                        && relay_candidate_host(n).is_some()
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    if candidates.is_empty() {
-        return None;
-    }
-    let score = |node: &&serde_json::Value| -> (u64, String) {
-        let load = node.get("load").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let nid = node.get("node_id").and_then(|v| v.as_str()).unwrap_or("");
-        let hash_input = format!("{node_id}:{nid}");
-        let mut hasher = Sha256::new();
-        hasher.update(hash_input.as_bytes());
-        let hash_hex = format!("{:x}", hasher.finalize());
-        ((load * 1_000_000.0) as u64, hash_hex)
-    };
-    let elected = candidates.iter().min_by(|a, b| score(a).cmp(&score(b)))?;
-    let relay_host = relay_candidate_host(elected)?;
-    let relay_port = relay_candidate_port(elected)?;
-    Some((relay_host.to_string(), relay_port))
-}
-
-#[cfg(feature = "nat")]
-fn urlencoding_simple(s: &str) -> String {
-    s.chars()
-        .flat_map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' | ':' | '/' => {
-                vec![c]
-            }
-            _ => format!("%{:02X}", c as u8).chars().collect::<Vec<_>>(),
-        })
-        .collect()
 }
 
 /// `iicp-node operator rename <name>` (#460) — change the public, mutable display_name over
@@ -6760,14 +6617,6 @@ fn apply_tunnel_profile(_node: &mut iicp_client::node::IicpNode, _url: &str) {}
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn relay_fallback_binding_gate_tracks_selection_not_tunnel_attempts() {
-        assert!(super::relay_fallback_requires_binding(true, false));
-        assert!(!super::relay_fallback_requires_binding(true, true));
-        assert!(!super::relay_fallback_requires_binding(false, false));
-        assert!(!super::relay_fallback_requires_binding(false, true));
-    }
-
     use super::*;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
@@ -6958,6 +6807,25 @@ mod tests {
         assert_eq!(options.tunnel, Some(false));
         assert!(options.relay_worker_endpoint.is_empty());
         assert!(options.external_ip_probe_url.is_empty());
+    }
+
+    #[test]
+    fn no_verified_route_keeps_private_listener_out_of_registration() {
+        assert!(should_skip_unroutable_registration(
+            "http://127.0.0.1:9484",
+            "",
+            false
+        ));
+        assert!(!should_skip_unroutable_registration(
+            "http://127.0.0.1:9484",
+            "relay.example:9485",
+            false
+        ));
+        assert!(!should_skip_unroutable_registration(
+            "https://node.example",
+            "",
+            false
+        ));
     }
 
     // Reachability escalation order (tunnel-FIRST, relay = last resort; maintainer 2026-06-13).
@@ -7885,201 +7753,6 @@ mod current_cooldown_contract_tests {
             "pausing tunnel creation for 18446744073709551616s",
         ] {
             assert_eq!(public_fallback_retry_delay_hint(message), None, "{message}");
-        }
-    }
-}
-
-#[cfg(all(test, feature = "nat"))]
-mod postcert_selector_validation_controls {
-    use super::*;
-    async fn elect(port: Option<serde_json::Value>, id: Option<&str>) -> Option<(String, u16)> {
-        let mut directory = mockito::Server::new_async().await;
-        let mut node = serde_json::json!({"endpoint":"https://relay.example","relay_capable":true});
-        if let Some(port) = port {
-            node["relay_accept_port"] = port;
-        }
-        if let Some(id) = id {
-            node["node_id"] = serde_json::json!(id);
-        }
-        let response = serde_json::json!({"nodes":[node]});
-        let mock = directory
-            .mock("GET", "/v1/discover")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(response.to_string())
-            .create_async()
-            .await;
-        let result =
-            auto_elect_relay(&directory.url(), "urn:iicp:intent:llm:chat:v1", "consumer").await;
-        mock.assert_async().await;
-        result
-    }
-    #[tokio::test]
-    async fn valid_candidate_positive_control() {
-        assert_eq!(
-            elect(Some(serde_json::json!(9485)), Some("relay")).await,
-            Some(("relay.example".into(), 9485))
-        );
-    }
-    #[tokio::test]
-    async fn zero_port_is_rejected() {
-        assert_eq!(elect(Some(serde_json::json!(0)), Some("relay")).await, None);
-    }
-    #[tokio::test]
-    async fn overflow_port_is_rejected() {
-        assert_eq!(
-            elect(Some(serde_json::json!(65537)), Some("relay")).await,
-            None
-        );
-    }
-    #[tokio::test]
-    async fn missing_identity_is_rejected() {
-        assert_eq!(elect(Some(serde_json::json!(9485)), None).await, None);
-    }
-    #[tokio::test]
-    async fn self_identity_negative_control() {
-        assert_eq!(
-            elect(Some(serde_json::json!(9485)), Some("consumer")).await,
-            None
-        );
-    }
-    #[tokio::test]
-    async fn legacy_absent_port_default_is_preserved() {
-        assert_eq!(
-            elect(None, Some("relay")).await,
-            Some(("relay.example".into(), 9485))
-        );
-    }
-    #[tokio::test]
-    async fn maximum_port_positive_control() {
-        assert_eq!(
-            elect(Some(serde_json::json!(65535)), Some("relay")).await,
-            Some(("relay.example".into(), 65535))
-        );
-    }
-    #[tokio::test]
-    async fn malformed_ports_and_blank_identity_are_rejected() {
-        for port in [
-            serde_json::json!(-1),
-            serde_json::json!("9485"),
-            serde_json::json!(null),
-            serde_json::json!(1.5),
-        ] {
-            assert_eq!(elect(Some(port), Some("relay")).await, None);
-        }
-        assert_eq!(elect(None, Some("   ")).await, None);
-    }
-    #[tokio::test]
-    async fn invalid_candidate_cannot_displace_valid_candidate_before_ranking() {
-        let mut directory = mockito::Server::new_async().await;
-        let body = serde_json::json!({"nodes":[
-            {"node_id":"invalid","endpoint":"https://bad.example","relay_capable":true,"relay_accept_port":65537,"load":0},
-            {"node_id":"valid","endpoint":"https://valid.example","relay_capable":true,"relay_accept_port":9485,"load":1}
-        ]});
-        let mock = directory
-            .mock("GET", "/v1/discover")
-            .match_query(mockito::Matcher::Any)
-            .with_status(200)
-            .with_header("content-type", "application/json")
-            .with_body(body.to_string())
-            .create_async()
-            .await;
-        assert_eq!(
-            auto_elect_relay(&directory.url(), "test", "consumer").await,
-            Some(("valid.example".into(), 9485))
-        );
-        mock.assert_async().await;
-    }
-}
-
-#[cfg(all(test, feature = "nat"))]
-mod postcert_url_validation_controls {
-    async fn elect(endpoint: &str) -> Option<(String, u16)> {
-        let mut dir = mockito::Server::new_async().await;
-        let m=dir.mock("GET","/v1/discover").match_query(mockito::Matcher::Any).with_status(200).with_header("content-type","application/json").with_body(serde_json::json!({"nodes":[{"node_id":"relay","relay_capable":true,"endpoint":endpoint,"relay_accept_port":9485}]}).to_string()).create_async().await;
-        let x = super::auto_elect_relay(&dir.url(), "test", "consumer").await;
-        m.assert_async().await;
-        x
-    }
-    #[tokio::test]
-    async fn valid_explicit_http_port_control() {
-        assert_eq!(
-            elect("https://relay.example:443/path").await,
-            Some(("relay.example".into(), 9485))
-        );
-    }
-    #[tokio::test]
-    async fn path_is_not_part_of_host() {
-        assert_eq!(
-            elect("https://relay.example/path").await,
-            Some(("relay.example".into(), 9485))
-        );
-    }
-    #[tokio::test]
-    async fn ipv6_authority_retains_brackets() {
-        assert_eq!(elect("https://[::1]").await, Some(("[::1]".into(), 9485)));
-    }
-    #[tokio::test]
-    async fn query_and_fragment_are_not_part_of_host() {
-        assert_eq!(
-            elect("https://relay.example/path?q=x#fragment").await,
-            Some(("relay.example".into(), 9485))
-        );
-    }
-    #[tokio::test]
-    async fn ipv6_explicit_http_port_does_not_replace_native_port() {
-        assert_eq!(
-            elect("https://[::1]:443/path").await,
-            Some(("[::1]".into(), 9485))
-        );
-    }
-    #[tokio::test]
-    async fn malformed_relative_and_unsupported_schemes_are_rejected() {
-        for endpoint in ["relay.example/path", "ftp://relay.example", "https://", ""] {
-            assert_eq!(elect(endpoint).await, None);
-        }
-    }
-    #[tokio::test]
-    async fn userinfo_is_rejected() {
-        for endpoint in [
-            "https://user:secret@relay.example/path",
-            "https://user@relay.example",
-            "https://@relay.example",
-            "https://:@relay.example",
-        ] {
-            assert_eq!(elect(endpoint).await, None);
-        }
-    }
-    #[tokio::test]
-    async fn malformed_endpoint_cannot_displace_valid_candidate() {
-        let mut dir = mockito::Server::new_async().await;
-        let m=dir.mock("GET","/v1/discover").match_query(mockito::Matcher::Any).with_status(200).with_header("content-type","application/json").with_body(serde_json::json!({"nodes":[
-            {"node_id":"bad","relay_capable":true,"endpoint":"ftp://bad.example","load":0},
-            {"node_id":"valid","relay_capable":true,"endpoint":"https://valid.example/path","load":1}
-        ]}).to_string()).create_async().await;
-        assert_eq!(
-            super::auto_elect_relay(&dir.url(), "test", "consumer").await,
-            Some(("valid.example".into(), 9485))
-        );
-        m.assert_async().await;
-    }
-    #[tokio::test]
-    async fn plain_http_explicit_development_endpoint_stays_supported() {
-        assert_eq!(
-            elect("http://relay.example/path").await,
-            Some(("relay.example".into(), 9485))
-        );
-    }
-    #[tokio::test]
-    async fn extra_slash_empty_userinfo_and_empty_authorities_are_rejected() {
-        for endpoint in [
-            "https:///@relay.example",
-            "https:////@relay.example",
-            "https:///relay.example",
-            "https://?query",
-        ] {
-            assert_eq!(elect(endpoint).await, None);
         }
     }
 }

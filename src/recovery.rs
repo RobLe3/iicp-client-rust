@@ -151,6 +151,20 @@ pub fn classify(
     }
 }
 
+/// An inconclusive registry read cannot extend a streak of confirmed absence.
+/// Independently observed loss of the public route is still a confirmed failure.
+pub(crate) fn consecutive_failure_count(
+    previous: u32,
+    public_available: bool,
+    directory_presence: DirectoryPresence,
+) -> u32 {
+    if !public_available || directory_presence == DirectoryPresence::Absent {
+        previous.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 pub async fn registry_node_presence(
     http: &Client,
     directory_url: &str,
@@ -260,6 +274,65 @@ mod tests {
     }
 
     #[test]
+    fn inconclusive_registry_read_breaks_consecutive_absence() {
+        let grace = DEFAULT_RECOVERY_GRACE_CHECKS;
+        let mut consecutive = 0;
+        for presence in [
+            DirectoryPresence::Absent,
+            DirectoryPresence::Unknown,
+            DirectoryPresence::Absent,
+            DirectoryPresence::Unknown,
+            DirectoryPresence::Absent,
+        ] {
+            consecutive = consecutive_failure_count(consecutive, true, presence);
+            let expected = if presence == DirectoryPresence::Absent {
+                (
+                    1,
+                    RecoveryState::DirectoryAbsent,
+                    RecoveryAction::Reregister,
+                )
+            } else {
+                (0, RecoveryState::Unknown, RecoveryAction::None)
+            };
+            let (state, action) = classify(true, true, presence, consecutive, grace, false);
+            assert_eq!((consecutive, state, action), expected);
+        }
+    }
+
+    #[test]
+    fn confirmed_route_loss_retains_cooldown_then_supervised_restart_signal() {
+        let grace = DEFAULT_RECOVERY_GRACE_CHECKS;
+        let mut consecutive = 0;
+        // The registry can be inconclusive while an independent local route
+        // signal already confirms unavailability.
+        let presence = DirectoryPresence::Unknown;
+        for expected in 1..=grace {
+            consecutive = consecutive_failure_count(consecutive, false, presence);
+            assert_eq!(consecutive, expected);
+            let (state, action) = classify(true, false, presence, consecutive, grace, false);
+            if expected < grace {
+                assert_eq!(
+                    (state, action),
+                    (RecoveryState::LimitedReach, RecoveryAction::WaitCooldown)
+                );
+            } else {
+                assert_eq!(
+                    (state, action),
+                    (
+                        RecoveryState::RestartRecommended,
+                        RecoveryAction::RestartSelf
+                    )
+                );
+                assert_eq!(RECOVERY_EXIT_CODE, 76);
+            }
+        }
+        assert_eq!(
+            consecutive_failure_count(consecutive, true, DirectoryPresence::Present),
+            0
+        );
+    }
+
+    #[test]
     fn unavailable_public_route_waits_then_restarts_when_supervised_by_caller() {
         assert_eq!(
             classify(true, false, DirectoryPresence::Absent, 1, 3, false),
@@ -272,6 +345,48 @@ mod tests {
                 RecoveryAction::RestartSelf
             )
         );
+    }
+
+    #[tokio::test]
+    async fn registry_status_distinguishes_missing_node_from_inconclusive_lookup() {
+        let mut server = mockito::Server::new_async().await;
+        let http = Client::new();
+        let mut streak = 0;
+        for (status, expected_presence, expected_streak) in [
+            (404, DirectoryPresence::Absent, 1),
+            (503, DirectoryPresence::Unknown, 0),
+            (404, DirectoryPresence::Absent, 1),
+            (404, DirectoryPresence::Absent, 2),
+            (200, DirectoryPresence::Present, 0),
+        ] {
+            let mock = server
+                .mock("GET", "/v1/registry/nodes/b30aee67")
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(if status == 200 {
+                    r#"{"node_id_prefix":"b30aee67","status_summary":{"state":"ready"}}"#
+                } else {
+                    r#"{"error":"synthetic fixture"}"#
+                })
+                .create_async()
+                .await;
+            let observation = registry_route_status(
+                &http,
+                &server.url(),
+                "b30aee67-9089-4337-806e-b560428cf97a",
+                Duration::from_secs(2),
+            )
+            .await;
+            mock.assert_async().await;
+            mock.remove_async().await;
+
+            assert_eq!(observation.presence, expected_presence, "HTTP {status}");
+            let available =
+                effective_public_route_available(true, observation.route_needs_promotion, false);
+            assert!(available, "fixture's local route stays usable");
+            streak = consecutive_failure_count(streak, available, observation.presence);
+            assert_eq!(streak, expected_streak, "HTTP {status}");
+        }
     }
 
     #[test]

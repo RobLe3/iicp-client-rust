@@ -2,6 +2,13 @@
 
 ## [Unreleased]
 
+### Fixed — unverified relay discovery
+
+- Do not auto-elect a native relay from HTTP(S) endpoint metadata or advertise
+  relay capability from local listener configuration alone. Explicit
+  experimental worker configuration keeps its existing bind checks. Verified
+  automatic selection awaits the evidence profile in IICP#59.
+
 - Prepare maintained TLS, trust-store, async and transport dependency pins with stronger source security floors. Existing feature, protocol and authority boundaries are unchanged; no publication or new qualification credit is granted.
 
 

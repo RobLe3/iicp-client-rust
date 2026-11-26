@@ -788,21 +788,25 @@ async fn test_register_legacy_capabilities_folds_into_models() {
     _m.assert_async().await;
 }
 
-/// WQ-066 (0.7.45) — relay_capable=true must appear in the register payload so
-/// the directory can surface it in /v1/discover. Pre-fix: the Rust SDK wired
-/// relay_capable to the serve() relay server but never included it in the
-/// registration JSON → the directory always saw relay_capable=false.
+/// #175 — enabling a local listener does not prove a usable public worker
+/// route. The real registration request must not advertise relay capability.
 #[tokio::test]
-async fn test_register_payload_includes_relay_capable() {
-    use mockito::{Matcher, Server};
-
-    let mut server = Server::new_async().await;
-    let _m = server
+async fn test_register_payload_omits_unverified_relay_listener() {
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
         .mock("POST", "/v1/register")
-        .match_body(Matcher::PartialJson(json!({
-            "relay_capable": true,
-            "relay_accept_port": 9490
-        })))
+        .match_request(|request| {
+            request
+                .body()
+                .ok()
+                .and_then(|body| serde_json::from_slice::<Value>(body).ok())
+                .is_some_and(|payload| {
+                    payload["node_id"] == "n-r"
+                        && payload["endpoint"] == "https://relay.example.com:9484"
+                        && payload.get("relay_capable").is_none()
+                        && payload.get("relay_accept_port").is_none()
+                })
+        })
         .with_status(201)
         .with_header("content-type", "application/json")
         .with_body(json!({ "node_token": "tok-r", "node_id": "n-r" }).to_string())
@@ -821,7 +825,7 @@ async fn test_register_payload_includes_relay_capable() {
     cfg.relay_accept_port = 9490;
     let node = IicpNode::new(cfg);
     node.register().await.unwrap();
-    _m.assert_async().await;
+    mock.assert_async().await;
 }
 
 // ── #494 — health_models heartbeat reporting ──────────────────────────────────
