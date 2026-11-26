@@ -14,7 +14,6 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 
 const GOSSIP_INTERVAL: Duration = Duration::from_secs(30);
 const PEER_EXPIRY: Duration = Duration::from_secs(90);
@@ -119,7 +118,9 @@ impl std::fmt::Debug for PeerAdmissionMode {
 }
 
 pub struct PeerManagerOpts {
+    /// Retained for source compatibility; does not authorize relay advertisement.
     pub relay_capable: bool,
+    /// Retained for source compatibility; does not verify a worker route.
     pub relay_accept_port: u16,
     pub admission: PeerAdmissionMode,
 }
@@ -140,8 +141,6 @@ pub struct PeerManager {
     node_token: String,
     own_id: Mutex<String>,
     own_endpoint: Mutex<String>,
-    own_relay_capable: bool,
-    own_relay_accept_port: u16,
     admission: PeerAdmissionMode,
     minimum_generation: AtomicU64,
     peers: Mutex<HashMap<String, PeerInfo>>,
@@ -169,8 +168,6 @@ impl PeerManager {
             node_token: node_token.into(),
             own_id: Mutex::new(String::new()),
             own_endpoint: Mutex::new(String::new()),
-            own_relay_capable: opts.relay_capable,
-            own_relay_accept_port: opts.relay_accept_port,
             admission: opts.admission,
             minimum_generation: AtomicU64::new(minimum_generation),
             peers: Mutex::new(HashMap::new()),
@@ -339,67 +336,21 @@ impl PeerManager {
         Ok(())
     }
 
-    /// R3: return relay-capable peers for relay election.
+    /// Return peers with verified native worker routes, not relay advertisements.
+    ///
+    /// The current peer exchange carries no authenticated, fresh worker-route
+    /// evidence. Keep automatic discovery unavailable until IICP#59 defines
+    /// how to verify that evidence.
     pub fn get_relay_candidates(&self) -> Vec<PeerInfo> {
         self.prune();
-        self.peers
-            .lock()
-            .expect("peers lock")
-            .values()
-            .filter(|p| p.relay_capable && !p.endpoint.is_empty())
-            .cloned()
-            .collect()
+        Vec::new()
     }
 
-    /// R3: deterministic relay election — rank by load, tiebreak by SHA-256.
-    ///
-    /// Scores each relay-capable peer by `(relay_load, sha256(worker_id:peer_id))`
-    /// and returns the minimum, matching the Python/TypeScript algorithm.
-    pub fn elect_relay(&self, worker_id: &str) -> Option<ElectedRelay> {
-        let candidates = self.get_relay_candidates();
-        if candidates.is_empty() {
-            return None;
-        }
-        let score = |peer: &PeerInfo| -> (u64, String) {
-            // Encode load as fixed-point to make it Ord-comparable
-            let load_fp = (peer.relay_load * 1_000_000.0) as u64;
-            let hash_input = format!("{}:{}", worker_id, peer.node_id);
-            let mut hasher = Sha256::new();
-            hasher.update(hash_input.as_bytes());
-            let hash_hex = format!("{:x}", hasher.finalize());
-            (load_fp, hash_hex)
-        };
-        let elected = candidates
-            .into_iter()
-            .min_by(|a, b| score(a).cmp(&score(b)))
-            .expect("non-empty");
-        // Derive relay host from endpoint URL (same host, relay_accept_port)
-        let relay_host = Self::extract_host(&elected.endpoint);
-        let relay_port = elected.relay_accept_port;
-        Some(ElectedRelay {
-            relay_host,
-            relay_port,
-            peer: elected,
-        })
-    }
-
-    fn extract_host(endpoint: &str) -> String {
-        // Strip scheme and path, return just the hostname.
-        let without_scheme = if let Some(rest) = endpoint.strip_prefix("http://") {
-            rest
-        } else if let Some(rest) = endpoint.strip_prefix("https://") {
-            rest
-        } else {
-            endpoint
-        };
-        // Remove any path after hostname:port
-        let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
-        // Remove port if present
-        if let Some(h) = host_port.rsplit_once(':') {
-            h.0.to_string()
-        } else {
-            host_port.to_string()
-        }
+    /// Elect a verified native worker route. With no supported proof source,
+    /// election fails closed instead of deriving a socket from an HTTP URL.
+    pub fn elect_relay(&self, _worker_id: &str) -> Option<ElectedRelay> {
+        self.prune();
+        None
     }
 
     /// Drop peers not contacted within the expiry window. Returns count pruned.
@@ -574,8 +525,8 @@ impl PeerManager {
         let mut own = serde_json::json!({
             "node_id": node_id,
             "endpoint": endpoint,
-            "relay_capable": self.own_relay_capable,
-            "relay_accept_port": self.own_relay_accept_port,
+            // Listening locally does not establish an externally usable worker route.
+            "relay_capable": false,
             "relay_load": 0.0,
         });
         if let PeerAdmissionMode::Restricted(restricted) = &self.admission {
@@ -929,19 +880,6 @@ mod tests {
         m
     }
 
-    fn pm_with_relays() -> PeerManager {
-        let m = PeerManager::new("https://dir.example/api", "");
-        *m.own_id.lock().unwrap() = "self".into();
-        m.merge_peers(&[
-            json!({"node_id": "relay-a", "endpoint": "http://relay-a:8020",
-                   "relay_capable": true, "relay_accept_port": 9485, "relay_load": 0.2}),
-            json!({"node_id": "relay-b", "endpoint": "http://relay-b:8020",
-                   "relay_capable": true, "relay_accept_port": 9486, "relay_load": 0.1}),
-            json!({"node_id": "non-relay", "endpoint": "http://nr:8020", "relay_capable": false}),
-        ]);
-        m
-    }
-
     #[test]
     fn merge_adds_and_dedups_and_skips_self() {
         let m = pm("");
@@ -1035,7 +973,8 @@ mod tests {
             ),
             1
         );
-        assert_eq!(m.get_relay_candidates().len(), 1);
+        assert!(m.relay_target("did:iicp:test:node-a").is_some());
+        assert!(m.get_relay_candidates().is_empty());
         assert_eq!(m.update_minimum_generation(8), 1);
         assert!(m.relay_target("did:iicp:test:node-a").is_none());
         assert!(m.get_relay_candidates().is_empty());
@@ -1128,41 +1067,26 @@ mod tests {
     }
 
     #[test]
-    fn get_relay_candidates_excludes_non_relay() {
-        let m = pm_with_relays();
-        let ids: Vec<_> = m
-            .get_relay_candidates()
-            .into_iter()
-            .map(|p| p.node_id)
-            .collect();
-        assert!(!ids.contains(&"non-relay".to_string()));
-        assert!(ids.contains(&"relay-a".to_string()));
-        assert!(ids.contains(&"relay-b".to_string()));
+    fn https_task_endpoint_does_not_make_a_native_relay_electable() {
+        let m = pm("");
+        m.merge_peers(&[json!({
+            "node_id": "relay-a", "endpoint": "https://relay-a.example/health",
+            "relay_capable": true, "relay_accept_port": 9485, "relay_load": 0.0,
+        })]);
+        assert!(m.relay_target("relay-a").is_some());
+        assert!(m.get_relay_candidates().is_empty());
+        assert!(m.elect_relay("worker").is_none());
     }
 
     #[test]
-    fn elect_relay_prefers_lower_load() {
-        let m = pm_with_relays();
-        let elected = m.elect_relay("worker-001").expect("should elect relay");
-        // relay-b load=0.1 < relay-a load=0.2 → relay-b always wins
-        assert_eq!(elected.peer.node_id, "relay-b");
-        assert!(elected.peer.relay_capable);
-    }
-
-    #[test]
-    fn elect_relay_is_deterministic() {
-        let m = pm_with_relays();
-        let e1 = m.elect_relay("worker-xyz").unwrap();
-        let e2 = m.elect_relay("worker-xyz").unwrap();
-        assert_eq!(e1.peer.node_id, e2.peer.node_id);
-    }
-
-    #[test]
-    fn elect_relay_derives_host_port() {
-        let m = pm_with_relays();
-        let elected = m.elect_relay("worker-001").unwrap();
-        assert!(!elected.relay_host.is_empty());
-        assert_eq!(elected.relay_port, elected.peer.relay_accept_port);
+    fn recent_peer_contact_does_not_verify_self_reported_relay_capability() {
+        let m = pm("");
+        m.merge_peers(&[json!({
+            "node_id": "relay-a", "endpoint": "http://relay-a.example:8020",
+            "relay_capable": true, "relay_accept_port": 9485,
+        })]);
+        assert!(m.relay_target("relay-a").unwrap().relay_capable);
+        assert!(m.elect_relay("worker").is_none());
     }
 
     #[test]
@@ -1175,12 +1099,20 @@ mod tests {
     }
 
     #[test]
-    fn extract_host_variants() {
-        assert_eq!(PeerManager::extract_host("http://relay-a:8020"), "relay-a");
-        assert_eq!(
-            PeerManager::extract_host("https://relay.example.com:9485/"),
-            "relay.example.com"
+    fn local_listener_is_not_advertised_as_verified_through_gossip() {
+        let manager = PeerManager::with_opts(
+            "https://dir.example/api",
+            "",
+            PeerManagerOpts {
+                relay_capable: true,
+                relay_accept_port: 9490,
+                ..PeerManagerOpts::default()
+            },
         );
-        assert_eq!(PeerManager::extract_host("relay.host"), "relay.host");
+        let peer = manager
+            .own_peer_value("self".into(), "https://node.example".into())
+            .unwrap();
+        assert_eq!(peer["relay_capable"], false);
+        assert!(peer.get("relay_accept_port").is_none());
     }
 }

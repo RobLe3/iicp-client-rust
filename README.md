@@ -518,14 +518,14 @@ iicp-client = { version = "0.7", features = ["nat", "iicp-tcp"] }
 | **1a** | Home router with UPnP, no CGNAT | Port-forward via UPnP → register WAN IP |
 | **1b** | CGNAT + IPv6 + AddPinhole works | Registers IPv6 with firewall rule |
 | **1c** | CGNAT + IPv6 + AddPinhole fails (FRITZ!Box error 606) | Registers IPv6 + logs guidance |
-| **3** | CGNAT + no usable IPv6 | Opens a Quick Tunnel if available → otherwise auto-elects relay |
+| **3** | CGNAT + no usable IPv6 | Opens a Quick Tunnel if available; otherwise no automatic public route |
 | **4** | Nothing worked | Serves locally with operator guidance |
 
 ### Environment-specific behaviour
 
 **Docker bridge (`-p 8020:8020`)** — UPnP is skipped (reaches Docker NAT, not home router).
 The official image includes `cloudflared`, so without a public endpoint it first tries a
-zero-account Quick Tunnel, then relay. The image also sets `IICP_SUPERVISED=1`, so
+zero-account Quick Tunnel. The image also sets `IICP_SUPERVISED=1`, so
 with Docker restart policy enabled a confirmed tunnel-dead state exits visibly and lets
 Docker restart the node. For stable direct hosting, set `IICP_PUBLIC_ENDPOINT`:
 ```bash
@@ -535,32 +535,30 @@ docker run --restart unless-stopped \
            -p 8020:8020 my-iicp-node
 ```
 
-**CGNAT + no IPv6 → Quick Tunnel, then relay:**
-```
-[iicp-node] NAT tier=3: opening Quick Tunnel...
-[iicp-node] no tunnel available — auto-electing relay from directory...
-[iicp-node] auto-elected relay: relay.example.com:9485
-```
+**CGNAT without usable IPv6:** if no public route can be verified, the SDK
+does not advertise a private endpoint or choose a relay from discovery metadata.
 
 ### Running a relay-capable node (relay operator)
 
 ```rust
 use iicp_client::{IicpNode, NodeConfig};
 
-let node = IicpNode::new(NodeConfig {
-    endpoint         : "http://relay.example.com:8020".into(),
-    intent           : "urn:iicp:intent:llm:chat:v1".into(),
-    relay_capable    : true,   // accept RELAY_BIND on TCP 9485 (requires iicp-tcp)
-    relay_accept_port: 9485,
-    enable_mesh      : true,   // advertise relay_capable=true in gossip
-    ..Default::default()
-});
+let mut config = NodeConfig::new("relay", "https://relay.example.com",
+                                 "urn:iicp:intent:llm:chat:v1");
+config.relay_capable = true; // enable the experimental listener (requires iicp-tcp)
+config.relay_accept_port = 9485;
+let node = IicpNode::new(config);
 ```
 
 Relay workers request short-lived directory-signed bind tickets when they have a saved node
 token. Relay operators can enforce them with `IICP_RELAY_REQUIRE_BIND_TICKET=1` and the
 directory's Ed25519 verification key in `IICP_RELAY_BIND_TICKET_PUBLIC_KEY`. Keep strict mode
 enabled on public relays; unsigned compatibility mode is intended only for staged migration.
+
+Automatic relay election is unavailable until the SDK can verify a fresh native
+worker endpoint. Reachable HTTP(S) health or task endpoints and a local relay
+listener do not supply that proof. Explicit experimental worker configuration
+and its existing bind checks are unchanged.
 
 ### Opt-out / override
 
@@ -575,7 +573,7 @@ IICP_TUNNEL_DEAD_POLICY=auto             # auto|retry|exit|log-only (unrecoverab
 IICP_SUPERVISED=1                        # set by generated services/Docker so supervisors can restart
 IICP_AUTO_UPDATE=1                       # hourly provider self-update; set 0 to disable
 IICP_AUTO_UPDATE_INTERVAL_S=3600         # update cadence in seconds; minimum 300
-IICP_RELAY_WORKER_ENDPOINT=host:9485    # specific relay instead of auto-elect
+IICP_RELAY_WORKER_ENDPOINT=host:9485    # explicitly configured experimental relay
 ```
 
 When several nodes on one host wake or recover together, they share a local creation

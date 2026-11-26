@@ -2419,10 +2419,8 @@ impl IicpNode {
         if let Some(cx_public_key) = &self.cx_public_key {
             payload["cx_public_key"] = json!(cx_public_key);
         }
-        if self.cfg.relay_capable {
-            payload["relay_capable"] = json!(true);
-            payload["relay_accept_port"] = json!(self.cfg.relay_accept_port);
-        }
+        // A local relay listener does not prove an externally usable worker route.
+        // Advertise neither relay capability nor a worker port without that proof.
         if let Some(b) = &self.cfg.backend {
             payload["backend"] = json!(b);
         }
@@ -3925,6 +3923,17 @@ mod capability_tests {
             filter_public_backend_models(vec![model.clone()], &[], Some("openai_compat")),
             vec![model]
         );
+    }
+
+    #[test]
+    fn register_does_not_advertise_an_unverified_relay_listener() {
+        let mut config = NodeConfig::new("relay", "https://node.example", CHAT);
+        config.relay_capable = true;
+        config.relay_accept_port = 9490;
+        let node = IicpNode::new(config);
+        let payload = node.register_payload_for_test();
+        assert!(payload.get("relay_capable").is_none());
+        assert!(payload.get("relay_accept_port").is_none());
     }
 
     #[test]
