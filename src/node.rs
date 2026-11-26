@@ -3195,19 +3195,11 @@ impl IicpNode {
                                         route_needs_promotion,
                                         relay_bound_now,
                                     );
-                                if !effective_public_route
-                                    || matches!(
-                                        presence,
-                                        crate::recovery::DirectoryPresence::Absent
-                                    )
-                                {
-                                    recovery_failures = recovery_failures.saturating_add(1);
-                                } else if matches!(
+                                recovery_failures = crate::recovery::consecutive_failure_count(
+                                    recovery_failures,
+                                    effective_public_route,
                                     presence,
-                                    crate::recovery::DirectoryPresence::Present
-                                ) {
-                                    recovery_failures = 0;
-                                }
+                                );
 
                                 let backend_attention = backend_stability
                                     .as_ref()

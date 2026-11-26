@@ -151,6 +151,20 @@ pub fn classify(
     }
 }
 
+/// An inconclusive registry read cannot extend a streak of confirmed absence.
+/// Independently observed loss of the public route is still a confirmed failure.
+pub(crate) fn consecutive_failure_count(
+    previous: u32,
+    public_available: bool,
+    directory_presence: DirectoryPresence,
+) -> u32 {
+    if !public_available || directory_presence == DirectoryPresence::Absent {
+        previous.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 pub async fn registry_node_presence(
     http: &Client,
     directory_url: &str,
@@ -256,6 +270,65 @@ mod tests {
         assert_eq!(
             classify(true, true, DirectoryPresence::Absent, 3, 3, false),
             (RecoveryState::RouteMismatch, RecoveryAction::RestartSelf)
+        );
+    }
+
+    #[test]
+    fn inconclusive_registry_read_breaks_consecutive_absence() {
+        let grace = DEFAULT_RECOVERY_GRACE_CHECKS;
+        let mut consecutive = 0;
+        for presence in [
+            DirectoryPresence::Absent,
+            DirectoryPresence::Unknown,
+            DirectoryPresence::Absent,
+            DirectoryPresence::Unknown,
+            DirectoryPresence::Absent,
+        ] {
+            consecutive = consecutive_failure_count(consecutive, true, presence);
+            let expected = if presence == DirectoryPresence::Absent {
+                (
+                    1,
+                    RecoveryState::DirectoryAbsent,
+                    RecoveryAction::Reregister,
+                )
+            } else {
+                (0, RecoveryState::Unknown, RecoveryAction::None)
+            };
+            let (state, action) = classify(true, true, presence, consecutive, grace, false);
+            assert_eq!((consecutive, state, action), expected);
+        }
+    }
+
+    #[test]
+    fn confirmed_route_loss_retains_cooldown_then_supervised_restart_signal() {
+        let grace = DEFAULT_RECOVERY_GRACE_CHECKS;
+        let mut consecutive = 0;
+        // The registry can be inconclusive while an independent local route
+        // signal already confirms unavailability.
+        let presence = DirectoryPresence::Unknown;
+        for expected in 1..=grace {
+            consecutive = consecutive_failure_count(consecutive, false, presence);
+            assert_eq!(consecutive, expected);
+            let (state, action) = classify(true, false, presence, consecutive, grace, false);
+            if expected < grace {
+                assert_eq!(
+                    (state, action),
+                    (RecoveryState::LimitedReach, RecoveryAction::WaitCooldown)
+                );
+            } else {
+                assert_eq!(
+                    (state, action),
+                    (
+                        RecoveryState::RestartRecommended,
+                        RecoveryAction::RestartSelf
+                    )
+                );
+                assert_eq!(RECOVERY_EXIT_CODE, 76);
+            }
+        }
+        assert_eq!(
+            consecutive_failure_count(consecutive, true, DirectoryPresence::Present),
+            0
         );
     }
 
