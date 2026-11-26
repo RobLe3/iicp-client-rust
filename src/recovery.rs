@@ -426,6 +426,45 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_relay_binding_resets_route_promotion_recovery_grace() {
+        let grace = DEFAULT_RECOVERY_GRACE_CHECKS;
+        let mut streak = 0;
+        let presence = DirectoryPresence::Present;
+
+        // An unverified direct route is still the registry's last observation.
+        // Before the relay binds, the worker must stay within its recovery grace.
+        for expected_streak in 1..grace {
+            let available = effective_public_route_available(true, true, false);
+            streak = consecutive_failure_count(streak, available, presence);
+            assert_eq!(streak, expected_streak);
+            assert_eq!(
+                classify(true, available, presence, streak, grace, false),
+                (RecoveryState::LimitedReach, RecoveryAction::WaitCooldown)
+            );
+        }
+
+        // A completed bind restores the route before grace expires, even
+        // though the Directory has not yet updated its direct-route evidence.
+        let available = effective_public_route_available(true, true, true);
+        streak = consecutive_failure_count(streak, available, presence);
+        assert_eq!(streak, 0);
+        assert_eq!(
+            classify(true, available, presence, streak, grace, false),
+            (RecoveryState::Healthy, RecoveryAction::None)
+        );
+
+        // Later loss of the bind must start a new grace window, not use the
+        // old streak to recommend an immediate supervised restart.
+        let available = effective_public_route_available(true, true, false);
+        streak = consecutive_failure_count(streak, available, presence);
+        assert_eq!(streak, 1);
+        assert_eq!(
+            classify(true, available, presence, streak, grace, false),
+            (RecoveryState::LimitedReach, RecoveryAction::WaitCooldown)
+        );
+    }
+
+    #[test]
     fn bound_relay_prevents_self_attested_ipv6_from_triggering_restart() {
         assert!(!effective_public_route_available(true, true, false));
         assert!(effective_public_route_available(true, true, true));
