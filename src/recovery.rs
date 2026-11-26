@@ -347,6 +347,48 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn registry_status_distinguishes_missing_node_from_inconclusive_lookup() {
+        let mut server = mockito::Server::new_async().await;
+        let http = Client::new();
+        let mut streak = 0;
+        for (status, expected_presence, expected_streak) in [
+            (404, DirectoryPresence::Absent, 1),
+            (503, DirectoryPresence::Unknown, 0),
+            (404, DirectoryPresence::Absent, 1),
+            (404, DirectoryPresence::Absent, 2),
+            (200, DirectoryPresence::Present, 0),
+        ] {
+            let mock = server
+                .mock("GET", "/v1/registry/nodes/b30aee67")
+                .with_status(status)
+                .with_header("content-type", "application/json")
+                .with_body(if status == 200 {
+                    r#"{"node_id_prefix":"b30aee67","status_summary":{"state":"ready"}}"#
+                } else {
+                    r#"{"error":"synthetic fixture"}"#
+                })
+                .create_async()
+                .await;
+            let observation = registry_route_status(
+                &http,
+                &server.url(),
+                "b30aee67-9089-4337-806e-b560428cf97a",
+                Duration::from_secs(2),
+            )
+            .await;
+            mock.assert_async().await;
+            mock.remove_async().await;
+
+            assert_eq!(observation.presence, expected_presence, "HTTP {status}");
+            let available =
+                effective_public_route_available(true, observation.route_needs_promotion, false);
+            assert!(available, "fixture's local route stays usable");
+            streak = consecutive_failure_count(streak, available, observation.presence);
+            assert_eq!(streak, expected_streak, "HTTP {status}");
+        }
+    }
+
     #[test]
     fn direct_ipv6_self_attested_registry_status_needs_route_promotion() {
         let status = serde_json::json!({
